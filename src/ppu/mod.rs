@@ -520,6 +520,26 @@ impl Ppu {
         (self.ppustatus & STATUS_VBLANK) != 0
     }
 
+    /// True if the sprite 0 hit flag (PPUSTATUS bit 6) is set.
+    /// Set by [`Ppu::render_sprites`] when sprite 0 overlaps an opaque
+    /// background pixel; cleared at the prerender scanline by
+    /// [`Ppu::step`] (and at the start of [`Ppu::render_sprites`]).
+    /// Not cleared by PPUSTATUS reads (only VBlank is).
+    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
+    pub fn sprite_zero_hit(&self) -> bool {
+        (self.ppustatus & STATUS_SPRITE_ZERO) != 0
+    }
+
+    /// True if the sprite overflow flag (PPUSTATUS bit 5) is set.
+    /// Set by [`Ppu::render_sprites`] when more than 8 sprites are in
+    /// range on any scanline; cleared at the prerender scanline by
+    /// [`Ppu::step`] (and at the start of [`Ppu::render_sprites`]).
+    /// Not cleared by PPUSTATUS reads.
+    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
+    pub fn sprite_overflow(&self) -> bool {
+        (self.ppustatus & STATUS_OVERFLOW) != 0
+    }
+
     // =================================================================
     //  Scanline / cycle stepper (M10)
     // =================================================================
@@ -1460,5 +1480,87 @@ mod tests {
         // v should have t's coarse X (20) and nt (0b01).
         assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 20);
         assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b01 << 10);
+    }
+
+    // ---- M11: PPUSTATUS flag behaviours -------------------------------
+
+    #[test]
+    fn ppustatus_read_does_not_clear_sprite_zero_hit() {
+        let mut ppu = Ppu::new();
+        ppu.set_sprite_zero_hit(true);
+        assert!(ppu.sprite_zero_hit());
+        let _ = ppu.read_status();
+        assert!(
+            ppu.sprite_zero_hit(),
+            "sprite 0 hit survives PPUSTATUS read"
+        );
+    }
+
+    #[test]
+    fn ppustatus_read_does_not_clear_sprite_overflow() {
+        let mut ppu = Ppu::new();
+        ppu.set_sprite_overflow(true);
+        assert!(ppu.sprite_overflow());
+        let _ = ppu.read_status();
+        assert!(
+            ppu.sprite_overflow(),
+            "sprite overflow survives PPUSTATUS read"
+        );
+    }
+
+    #[test]
+    fn ppustatus_read_clears_only_vblank() {
+        let mut ppu = Ppu::new();
+        ppu.set_vblank(true);
+        ppu.set_sprite_zero_hit(true);
+        ppu.set_sprite_overflow(true);
+        let r = ppu.read_status();
+        // All three flags visible in the returned byte.
+        assert_eq!(r & 0b1110_0000, 0b1110_0000);
+        // Only VBlank cleared; the other two persist.
+        assert!(!ppu.in_vblank());
+        assert!(ppu.sprite_zero_hit());
+        assert!(ppu.sprite_overflow());
+    }
+
+    #[test]
+    fn prerender_clears_sprite_zero_hit_and_overflow() {
+        let mut ppu = Ppu::new();
+        ppu.set_sprite_zero_hit(true);
+        ppu.set_sprite_overflow(true);
+        ppu.set_vblank(true);
+        // Advance to prerender scanline 261, cycle 1.
+        let target: u32 = (SCANLINE_PRERENDER as u32) * (CYCLES_PER_SCANLINE as u32) + 1;
+        for _ in 0..target {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), SCANLINE_PRERENDER);
+        assert_eq!(ppu.cycle(), 1);
+        assert!(!ppu.in_vblank(), "VBlank cleared at prerender");
+        assert!(!ppu.sprite_zero_hit(), "sprite 0 hit cleared at prerender");
+        assert!(
+            !ppu.sprite_overflow(),
+            "sprite overflow cleared at prerender"
+        );
+    }
+
+    #[test]
+    fn sprite_zero_hit_accessor_reflects_flag() {
+        let mut ppu = Ppu::new();
+        assert!(!ppu.sprite_zero_hit());
+        ppu.set_sprite_zero_hit(true);
+        assert!(ppu.sprite_zero_hit());
+        ppu.set_sprite_zero_hit(false);
+        assert!(!ppu.sprite_zero_hit());
+    }
+
+    #[test]
+    fn sprite_overflow_accessor_reflects_flag() {
+        let mut ppu = Ppu::new();
+        assert!(!ppu.sprite_overflow());
+        ppu.set_sprite_overflow(true);
+        assert!(ppu.sprite_overflow());
+        ppu.set_sprite_overflow(false);
+        assert!(!ppu.sprite_overflow());
     }
 }

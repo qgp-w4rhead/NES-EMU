@@ -85,8 +85,19 @@ const SPRITE_COUNT: usize = 64;
 const SPRITE_HEIGHT: u16 = 8;
 /// Sprite width in pixels.
 const SPRITE_WIDTH: u16 = 8;
-/// OAM Y value at or above which a sprite is hidden ($EF-$FF = 239-255).
+/// OAM Y value at or above which a sprite is hidden ($EF-$FE = 239-254).
+/// Values `$EF-$FE` are out of range but do not halt sprite evaluation;
+/// only `$FF` halts evaluation (see [`Ppu::render_sprites`]).
 const OAM_Y_HIDDEN: u8 = 0xEF;
+/// OAM Y value that halts sprite evaluation ($FF). On real hardware the
+/// sprite evaluation unit stops scanning OAM when it encounters a sprite
+/// with Y = `$FF`; sprites after it are never checked. This is the
+/// hardware-accurate "sprite overflow bug" behaviour — see
+/// https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow.
+const OAM_Y_HALT: u8 = 0xFF;
+/// Sprite 0 hit is not triggered at x = 255 (hardware quirk).
+/// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
+const SPRITE_ZERO_HIT_MAX_X: u16 = 255;
 
 /// NES 2C02 (NTSC) reference palette — 64 entries × RGB.
 ///
@@ -341,8 +352,18 @@ impl Ppu {
     ///   from the sprite's Y coordinate before writing it here").
     /// - At most 8 sprites are rendered per scanline (the first 8 in OAM
     ///   order); if a 9th would be in range, the sprite-overflow flag
-    ///   (PPUSTATUS bit 5) is set. The hardware-accurate overflow bug is
-    ///   deferred to M11.
+    ///   (PPUSTATUS bit 5) is set. Sprite evaluation halts when a sprite
+    ///   with Y = `$FF` is encountered (hardware-accurate behaviour —
+    ///   sprites after a `$FF` entry are never checked).
+    /// - **Sprite zero hit** (M11): when sprite 0 (OAM index 0) is
+    ///   rendered and its pixel is opaque, and the background pixel at
+    ///   the same position is also opaque, the sprite-0-hit flag
+    ///   (PPUSTATUS bit 6) is set. The hit is not triggered at x = 255
+    ///   or in the clipped left 8 pixels. The priority bit (attribute
+    ///   bit 5) does **not** affect hit detection — the hit triggers
+    ///   even if sprite 0 is behind the background. The flag is set once
+    ///   per frame (first hit) and cleared at the prerender scanline by
+    ///   [`Ppu::step`].
     /// - Sprite-to-sprite priority: lower OAM index = in front. The
     ///   first non-transparent sprite (scanning OAM 0 → 63) claims each
     ///   pixel; no lower-priority sprite can override it.
@@ -358,18 +379,22 @@ impl Ppu {
     ///
     /// See: https://www.nesdev.org/wiki/PPU_OAM
     /// See: https://www.nesdev.org/wiki/PPU_rendering#Sprites
+    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
     pub fn render_sprites(&mut self, chr_read: impl Fn(u16) -> u8) {
+        // Clear the per-frame status flags at the start of the frame. On
+        // real hardware this happens at the prerender scanline (M10);
+        // without scanline-locked rendering we clear them here so the
+        // flags reflect the current frame rather than sticking from a
+        // prior frame. This must happen even when sprites are disabled
+        // (a prior frame may have set a flag that needs clearing).
+        self.set_sprite_overflow(false);
+        self.set_sprite_zero_hit(false);
+
         let sprites_enabled = (self.ppumask & MASK_SHOW_SPRITES) != 0;
         if !sprites_enabled {
             return;
         }
         let sprites_left_enabled = (self.ppumask & MASK_SHOW_SPRITES_LEFT) != 0;
-
-        // Clear the sprite-overflow flag at the start of the frame. On real
-        // hardware this happens at the prerender scanline (M10); without
-        // scanline timing we clear it here so the flag reflects the current
-        // frame's sprite count rather than sticking from a prior frame.
-        self.set_sprite_overflow(false);
 
         // Sprite pattern table base: $0000 or $1000 (PPUCTRL bit 3).
         let sprite_table: u16 = if (self.ppuctrl & CTRL_SPRITE_PATTERN_1000) != 0 {
@@ -383,14 +408,28 @@ impl Ppu {
         let mut selected: [(usize, u8, u8, u8, u8); MAX_SPRITES_PER_SCANLINE] =
             [(0, 0, 0, 0, 0); MAX_SPRITES_PER_SCANLINE];
         let mut overflow_this_frame = false;
+        // Sprite 0 hit is set once per frame (first opaque overlap).
+        let mut sprite_zero_hit_set = false;
 
         for scanline in 0..SCREEN_HEIGHT as u16 {
             // ---- Sprite evaluation: find first 8 sprites in range. ----
+            //
+            // Hardware-accurate behaviour: evaluation halts when a sprite
+            // with Y = `$FF` is encountered. Sprites with Y = `$EF-$FE`
+            // are out of range but do NOT halt evaluation — only `$FF`
+            // does. See:
+            // https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
             let mut count = 0usize;
             for i in 0..SPRITE_COUNT {
                 let oam_idx = i * 4;
                 let y = self.oam[oam_idx];
+                if y == OAM_Y_HALT {
+                    // $FF halts sprite evaluation — no further sprites
+                    // are checked on this scanline.
+                    break;
+                }
                 if y >= OAM_Y_HIDDEN {
+                    // $EF-$FE: out of range, but evaluation continues.
                     continue;
                 }
                 // Visible on scanlines (y+1)..=(y+8). With y < 0xEF there
@@ -425,7 +464,7 @@ impl Ppu {
                 // Find the first non-transparent sprite (lowest OAM index
                 // = highest priority). It claims the pixel; no later
                 // sprite can override it.
-                for &(_oam_i, y, tile, attr, sx) in selected.iter().take(count) {
+                for &(oam_i, y, tile, attr, sx) in selected.iter().take(count) {
                     let sx = sx as u16;
                     if px < sx || px >= sx + SPRITE_WIDTH {
                         continue;
@@ -456,13 +495,37 @@ impl Ppu {
                         continue;
                     }
 
-                    // This sprite claims the pixel.
                     let col_idx = row_base + px as usize;
+                    let bg_opaque = self.bg_pattern[col_idx] != 0;
+
+                    // ---- Sprite 0 hit detection (M11) ----
+                    //
+                    // The hit triggers when sprite 0 (OAM index 0) has an
+                    // opaque pixel AND the background pixel at the same
+                    // position is opaque. The priority bit does NOT
+                    // affect hit detection — the hit triggers even if
+                    // sprite 0 is behind the background. The hit is not
+                    // triggered at x = 255 or in the clipped left 8
+                    // pixels (clipping is handled above for sprites and
+                    // in render_background for the background).
+                    //
+                    // See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
+                    if !sprite_zero_hit_set && oam_i == 0 && px < SPRITE_ZERO_HIT_MAX_X && bg_opaque
+                    {
+                        self.set_sprite_zero_hit(true);
+                        sprite_zero_hit_set = true;
+                    }
+
+                    // ---- Background priority ----
+                    //
+                    // If the sprite is "behind background" (attr bit 5)
+                    // and the background is opaque here, the sprite is
+                    // hidden — the pixel keeps its background value. No
+                    // lower-priority sprite may override. The sprite 0
+                    // hit (above) still triggered because both pixels
+                    // are opaque, regardless of priority.
                     let behind_bg = (attr & ATTR_PRIORITY_BEHIND) != 0;
-                    if behind_bg && self.bg_pattern[col_idx] != 0 {
-                        // Background is opaque here → sprite hidden. The
-                        // pixel keeps its background value. No lower
-                        // sprite may override.
+                    if behind_bg && bg_opaque {
                         break;
                     }
 
