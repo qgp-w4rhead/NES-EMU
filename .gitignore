@@ -1,0 +1,10 @@
+
+# Added by nes-emulator-engineer co-agent runner
+.devin/config.local.json
+secrets.local
+.agent/_cycles/
+agent-log.md
+secrets.local.example
+.agent/pause
+.agent/daemon.pid
+.agent/journal.md
