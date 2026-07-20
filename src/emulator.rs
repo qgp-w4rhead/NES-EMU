@@ -133,6 +133,11 @@ impl EmulatorState {
             let dma_cycles = self.bus.take_dma_stall_cycles();
             cpu_cycles = cpu_cycles.saturating_add(dma_cycles);
 
+            // Advance the APU by the total CPU cycles this iteration
+            // (instruction + DMA stall). The APU runs at CPU clock / 2.
+            // Frame-counter clocking (quarter/half-frame) lands in M16.
+            self.bus.step_apu(step_cycles + dma_cycles);
+
             // Advance the PPU by 3× the total CPU cycles this iteration
             // (instruction + DMA stall), maintaining the 1:3 CPU:PPU clock
             // ratio. Step in chunks of at most one scanline (341 cycles)

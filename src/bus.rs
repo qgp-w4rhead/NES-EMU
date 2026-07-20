@@ -26,6 +26,7 @@
 
 #![allow(dead_code)]
 
+use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
 use crate::ppu::Ppu;
@@ -75,6 +76,11 @@ pub struct Bus {
     /// indexed by `addr - 0x4000`. Replaced by real APU routing in M14/M16.
     apu_open_bus: [u8; APU_IO_REG_COUNT],
 
+    /// The APU (Audio Processing Unit). Pulse channels 1 & 2 landed in M14;
+    /// triangle, noise, DMC, and the frame counter follow in M15/M16.
+    /// See: https://www.nesdev.org/wiki/APU
+    apu: Apu,
+
     /// The two NES standard controllers, polled via `$4016`/`$4017`.
     /// Introduced in M13. See: https://www.nesdev.org/wiki/Controller_port
     joypad: Joypad,
@@ -97,6 +103,7 @@ impl Bus {
             ram: [0u8; RAM_SIZE],
             ppu: Ppu::new(),
             apu_open_bus: [0u8; APU_IO_REG_COUNT],
+            apu: Apu::new(),
             joypad: Joypad::new(),
             cartridge: None,
             dma_stall_cycles: 0,
@@ -158,6 +165,23 @@ impl Bus {
     /// uses this to feed SDL2 keyboard events into the controller state.
     pub fn joypad_mut(&mut self) -> &mut Joypad {
         &mut self.joypad
+    }
+
+    /// Borrow the APU.
+    pub fn apu(&self) -> &Apu {
+        &self.apu
+    }
+
+    /// Mutably borrow the APU.
+    pub fn apu_mut(&mut self) -> &mut Apu {
+        &mut self.apu
+    }
+
+    /// Advance the APU by `cpu_cycles` CPU cycles. The APU runs at half the
+    /// CPU clock, so the pulse channel timers tick once every 2 CPU cycles.
+    /// Frame-counter clocking (quarter/half-frame) is added in M16.
+    pub fn step_apu(&mut self, cpu_cycles: u32) {
+        self.apu.step(cpu_cycles);
     }
 
     /// Render the background layer into the PPU framebuffer.
@@ -250,14 +274,20 @@ impl Bus {
             // $2000-$3FFF: PPU registers (mirrored every 8 bytes).
             0x2000..=0x3FFF => self.ppu_read(addr & PPU_REG_MASK),
 
-            // $4000-$4013: APU registers (open-bus latch until M14).
-            0x4000..=0x4013 => self.apu_read(addr - APU_IO_BASE),
+            // $4000-$4007: pulse channel registers (M14). Write-only on real
+            // hardware; reads return the open-bus latch (last written value).
+            0x4000..=0x4007 => self.apu_read(addr - APU_IO_BASE),
+
+            // $4008-$4013: APU registers (open-bus latch until M15/M16).
+            0x4008..=0x4013 => self.apu_read(addr - APU_IO_BASE),
 
             // $4014: OAMDMA — write-only; reads return open bus.
             0x4014 => self.apu_read(0x14),
 
-            // $4015: APU status (open-bus latch until M14).
-            0x4015 => self.apu_read(0x15),
+            // $4015: APU status — bits 0,1 reflect pulse length counters;
+            // bits 5-7 come from the open-bus latch (unused / IRQ flags land
+            // in M16). Bits 2-4 are 0 until triangle/noise/DMC (M15/M16).
+            0x4015 => self.apu_status_read(),
 
             // $4016: controller 1 + open-bus bits 1-7.
             0x4016 => self.joypad_read(0, 0x16),
@@ -283,13 +313,27 @@ impl Bus {
 
             0x2000..=0x3FFF => self.ppu_write(addr & PPU_REG_MASK, value),
 
-            0x4000..=0x4013 => self.apu_write(addr - APU_IO_BASE, value),
+            // $4000-$4007: pulse channel registers (M14). Routed to the APU
+            // pulse channels; also latched on the open bus so reads return
+            // the last written value (matching real open-bus behavior).
+            0x4000..=0x4007 => {
+                let offset = addr - APU_IO_BASE;
+                self.apu_pulse_write(offset, value);
+                self.apu_open_bus[offset as usize] = value;
+            }
+
+            // $4008-$4013: APU registers (open-bus latch until M15/M16).
+            0x4008..=0x4013 => self.apu_write(addr - APU_IO_BASE, value),
 
             // $4014: OAMDMA — triggers 256-byte DMA from CPU page to OAM.
             0x4014 => self.oam_dma(value),
 
-            // $4015: APU status (open-bus latch until M14).
-            0x4015 => self.apu_write(0x15, value),
+            // $4015: APU status — enables/disables the pulse channels (bits
+            // 0,1). Other bits latched on the open bus until M15/M16.
+            0x4015 => {
+                self.apu_open_bus[0x15] = value;
+                self.apu.write_status(value);
+            }
 
             // $4016: controller strobe (bit 0). Also latched on the open
             // bus so subsequent reads see the last written value in bits
@@ -435,6 +479,26 @@ impl Bus {
     /// `offset` is `addr - 0x4000`, in `0..=0x17`.
     fn apu_read(&self, offset: u16) -> u8 {
         self.apu_open_bus[offset as usize]
+    }
+
+    /// Write to a pulse channel register. `offset` is `addr - 0x4000` in
+    /// `0..=7`: offsets 0-3 → pulse 1, offsets 4-7 → pulse 2.
+    fn apu_pulse_write(&mut self, offset: u16, value: u8) {
+        if offset < 4 {
+            self.apu.pulse1_mut().write_register(offset as u8, value);
+        } else {
+            self.apu
+                .pulse2_mut()
+                .write_register((offset - 4) as u8, value);
+        }
+    }
+
+    /// Read the `$4015` APU status register. Bits 0,1 come from the APU
+    /// (pulse length-counter status); bits 5-7 come from the open-bus
+    /// latch (bit 5 unused, bits 6,7 are IRQ flags handled in M16). Bits
+    /// 2-4 are 0 until triangle/noise/DMC land in M15/M16.
+    fn apu_status_read(&self) -> u8 {
+        (self.apu.read_status() & 0x1F) | (self.apu_open_bus[0x15] & 0xE0)
     }
 
     /// Read a controller register (`$4016` for controller 1, `$4017` for
@@ -601,11 +665,21 @@ mod tests {
     #[test]
     fn apu_io_register_round_trip() {
         let mut bus = Bus::new();
+        // $4000 is a pulse register (M14): writes latch the open bus, and
+        // reads return that latch (the register itself is write-only).
         bus.write(0x4000, 0x12);
         assert_eq!(bus.read(0x4000), 0x12);
-        bus.write(0x4015, 0x0F); // $4015 = APU status.
-        assert_eq!(bus.read(0x4015), 0x0F);
-        bus.write(0x4017, 0xC0); // $4017 = frame counter.
+        // $4015 is the APU status register (M14): bits 0,1 reflect pulse
+        // length-counter status; bits 5-7 come from the open-bus latch.
+        // With no length loaded, bits 0,1 read 0; the upper bits preserve
+        // the last write.
+        bus.write(0x4015, 0x0F); // enable pulse 1+2 (bits 0,1); latch 0x0F.
+        assert_eq!(bus.read(0x4015), 0x00); // no length loaded → bits 0,1 = 0
+                                            // Loading a length into pulse 1 sets bit 0.
+        bus.write(0x4003, 0x00); // length index 0 → length = 10
+        assert_eq!(bus.read(0x4015) & 0x01, 0x01);
+        // $4017 stays open-bus until the frame counter lands in M16.
+        bus.write(0x4017, 0xC0);
         assert_eq!(bus.read(0x4017), 0xC0);
     }
 

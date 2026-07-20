@@ -5,6 +5,7 @@
 //! tests (under `tests/`) and the binary entry point (`src/main.rs`) can
 //! share the same modules.
 
+pub mod apu;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
