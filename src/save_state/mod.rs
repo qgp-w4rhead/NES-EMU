@@ -102,7 +102,11 @@ use crate::ppu::Ppu;
 ///   deserialise, but the EmulatorState's region is not part of the
 ///   serialised `SaveState` (it is derived from the cartridge hint /
 ///   config at load time), so the version bump is conservative.
-pub const SAVE_STATE_VERSION: u32 = 3;
+/// - `4` — M33: `Cpu` gained a `halted: bool` field (KIL/JAM opcodes).
+///   The field is `bool` and serialises at the end of the `Cpu` struct,
+///   so the bincode layout changes (existing v3 save states will fail the
+///   version check and report a clean `VersionMismatch` error).
+pub const SAVE_STATE_VERSION: u32 = 4;
 
 /// Errors that can occur during save state serialisation or deserialisation.
 #[derive(Debug)]

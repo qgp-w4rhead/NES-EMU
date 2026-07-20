@@ -75,12 +75,14 @@ fn disassembler_branch_backward_wraps() {
 }
 
 #[test]
-fn disassembler_unknown_opcode_one_byte() {
-    let bus = bus_with_prog(&[0xD3]); // unofficial
+fn disassembler_unofficial_opcode_decodes_correctly() {
+    // M33: all 256 opcodes are now mapped (151 official + 105 unofficial).
+    // 0xD3 was previously `???` (1 byte); it is now DCP (ind),Y (2 bytes).
+    let bus = bus_with_prog(&[0xD3, 0x10]);
     let instr = disassemble_at(&bus, PC0);
-    assert_eq!(instr.len, 1);
-    assert_eq!(instr.text, "???");
-    assert_eq!(instr.next_pc, PC0 + 1);
+    assert_eq!(instr.len, 2);
+    assert_eq!(instr.text, "DCP ($10),Y");
+    assert_eq!(instr.next_pc, PC0 + 2);
 }
 
 #[test]

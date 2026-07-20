@@ -837,10 +837,16 @@ impl Cpu {
             // ---- NOP ----------------------------------------------------
             0xEA => 2,
 
-            // Unknown / unofficial opcodes are not implemented in Tier 1.
-            // Treat as a 2-cycle NOP rather than panicking (the hot loop
-            // must never panic). M6+ may surface this as a loadable error.
-            _ => 2,
+            // Unofficial / illegal opcodes (M33). Dispatch to the
+            // unofficial-opcode module, which implements all 105 commonly
+            // used unofficial opcodes (NOP variants, LAX, SAX, DCP, ISC,
+            // SLO, RLA, SRE, RRA, ANC, ALR, ARR, AXS, XAA, TAS, AHX, SHX,
+            // SHY, LAS, KIL). Any byte not matching an official or
+            // unofficial opcode falls through to a 2-cycle NOP inside
+            // `execute_unofficial` so the hot loop never panics.
+            //
+            // See: https://www.nesdev.org/wiki/CPU_unofficial_opcodes
+            opcode => self.execute_unofficial(bus, opcode),
         }
     }
 
@@ -865,7 +871,7 @@ impl Cpu {
     /// addressing-mode helper (`am_absolute_x_rmw` / `am_zero_page_x_dr`)
     /// before this method is called, so the side-effect fires at the
     /// correct cycle.
-    fn rmw<F>(&mut self, bus: &mut Bus, op: Operand, f: F)
+    pub(crate) fn rmw<F>(&mut self, bus: &mut Bus, op: Operand, f: F)
     where
         F: FnOnce(&mut Self, u8) -> u8,
     {
@@ -877,54 +883,54 @@ impl Cpu {
 
     // ---- load / store / transfer handlers ----------------------------
 
-    fn lda(&mut self, v: u8) {
+    pub(crate) fn lda(&mut self, v: u8) {
         self.a = v;
         self.set_nz(v);
     }
-    fn ldx(&mut self, v: u8) {
+    pub(crate) fn ldx(&mut self, v: u8) {
         self.x = v;
         self.set_nz(v);
     }
-    fn ldy(&mut self, v: u8) {
+    pub(crate) fn ldy(&mut self, v: u8) {
         self.y = v;
         self.set_nz(v);
     }
-    fn tax(&mut self) {
+    pub(crate) fn tax(&mut self) {
         self.x = self.a;
         self.set_nz(self.x);
     }
-    fn tay(&mut self) {
+    pub(crate) fn tay(&mut self) {
         self.y = self.a;
         self.set_nz(self.y);
     }
-    fn txa(&mut self) {
+    pub(crate) fn txa(&mut self) {
         self.a = self.x;
         self.set_nz(self.a);
     }
-    fn tya(&mut self) {
+    pub(crate) fn tya(&mut self) {
         self.a = self.y;
         self.set_nz(self.a);
     }
-    fn tsx(&mut self) {
+    pub(crate) fn tsx(&mut self) {
         self.x = self.sp;
         self.set_nz(self.x);
     }
     /// TXS — transfer X to SP. Does NOT update flags.
-    fn set_sp_from_x(&mut self) {
+    pub(crate) fn set_sp_from_x(&mut self) {
         self.sp = self.x;
     }
 
     // ---- logic handlers ---------------------------------------------
 
-    fn and(&mut self, v: u8) {
+    pub(crate) fn and(&mut self, v: u8) {
         self.a &= v;
         self.set_nz(self.a);
     }
-    fn ora(&mut self, v: u8) {
+    pub(crate) fn ora(&mut self, v: u8) {
         self.a |= v;
         self.set_nz(self.a);
     }
-    fn eor(&mut self, v: u8) {
+    pub(crate) fn eor(&mut self, v: u8) {
         self.a ^= v;
         self.set_nz(self.a);
     }
@@ -933,7 +939,7 @@ impl Cpu {
     /// M; V = bit 6 of M. A is unchanged.
     ///
     /// See: https://www.nesdev.org/wiki/CPU_instructions#BIT
-    fn bit(&mut self, m: u8) {
+    pub(crate) fn bit(&mut self, m: u8) {
         let result = self.a & m;
         self.set_zero(result == 0);
         self.set_negative((m & 0x80) != 0);
@@ -946,7 +952,7 @@ impl Cpu {
     /// always binary addition. Overflow flag is set on signed overflow.
     ///
     /// See: https://www.nesdev.org/wiki/CPU_instructions#ADC
-    fn adc(&mut self, m: u8) {
+    pub(crate) fn adc(&mut self, m: u8) {
         let a = self.a as u16;
         let m = m as u16;
         let c = u16::from(self.carry());
@@ -965,7 +971,7 @@ impl Cpu {
     /// the ADC overflow/carry logic. Carry is set when no borrow occurred.
     ///
     /// See: https://www.nesdev.org/wiki/CPU_instructions#SBC
-    fn sbc(&mut self, m: u8) {
+    pub(crate) fn sbc(&mut self, m: u8) {
         let a = self.a as u16;
         let m = (!m) as u16;
         let c = u16::from(self.carry());
@@ -981,7 +987,7 @@ impl Cpu {
 
     /// CMP/CPX/CPY — compare register `r` against `m`. Sets C (r >= m),
     /// Z (r == m), and N (bit 7 of r-m). The register is not modified.
-    fn cmp(&mut self, r: u8, m: u8) {
+    pub(crate) fn cmp(&mut self, r: u8, m: u8) {
         let diff = r.wrapping_sub(m);
         self.set_carry(r >= m);
         self.set_nz(diff);
@@ -990,35 +996,35 @@ impl Cpu {
     // ---- shifts / rotates / inc / dec value transforms --------------
 
     /// ASL — arithmetic shift left. C = old bit 7; result = (v << 1) & 0xFF.
-    fn asl_value(&mut self, v: u8) -> u8 {
+    pub(crate) fn asl_value(&mut self, v: u8) -> u8 {
         self.set_carry((v & 0x80) != 0);
         v << 1
     }
     /// LSR — logical shift right. C = old bit 0; result = v >> 1.
-    fn lsr_value(&mut self, v: u8) -> u8 {
+    pub(crate) fn lsr_value(&mut self, v: u8) -> u8 {
         self.set_carry((v & 0x01) != 0);
         v >> 1
     }
     /// ROL — rotate left through carry. C = old bit 7; bit 0 = old C.
-    fn rol_value(&mut self, v: u8) -> u8 {
+    pub(crate) fn rol_value(&mut self, v: u8) -> u8 {
         let new_c = (v & 0x80) != 0;
         let result = (v << 1) | u8::from(self.carry());
         self.set_carry(new_c);
         result
     }
     /// ROR — rotate right through carry. C = old bit 0; bit 7 = old C.
-    fn ror_value(&mut self, v: u8) -> u8 {
+    pub(crate) fn ror_value(&mut self, v: u8) -> u8 {
         let new_c = (v & 0x01) != 0;
         let result = (v >> 1) | (u8::from(self.carry()) << 7);
         self.set_carry(new_c);
         result
     }
     /// INC — increment a memory value (wrapping).
-    fn inc_value(&mut self, v: u8) -> u8 {
+    pub(crate) fn inc_value(&mut self, v: u8) -> u8 {
         v.wrapping_add(1)
     }
     /// DEC — decrement a memory value (wrapping).
-    fn dec_value(&mut self, v: u8) -> u8 {
+    pub(crate) fn dec_value(&mut self, v: u8) -> u8 {
         v.wrapping_sub(1)
     }
 

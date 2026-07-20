@@ -338,10 +338,10 @@ fn load_state_rejects_empty_data() {
 }
 
 #[test]
-fn save_state_version_is_three() {
-    // M32 bumped the version: the Ppu and Apu structs gained a `region`
-    // field, which changes the bincode layout.
-    assert_eq!(SAVE_STATE_VERSION, 3);
+fn save_state_version_is_four() {
+    // M33 bumped the version: the Cpu struct gained a `halted: bool` field
+    // (KIL/JAM unofficial opcodes), which changes the bincode layout.
+    assert_eq!(SAVE_STATE_VERSION, 4);
 }
 
 // ---- No-cartridge save/restore -----------------------------------------

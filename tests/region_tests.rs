@@ -420,8 +420,9 @@ fn config_default_region_is_auto() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn save_state_version_is_three() {
-    assert_eq!(SAVE_STATE_VERSION, 3);
+fn save_state_version_is_four() {
+    // M33 bumped the version: Cpu gained a `halted: bool` field.
+    assert_eq!(SAVE_STATE_VERSION, 4);
 }
 
 #[test]

@@ -259,6 +259,139 @@ static OPCODES: [OpcodeEntry; 256] = {
     t[0x9A] = op("TXS", AddrMode::Implied);
     t[0x98] = op("TYA", AddrMode::Implied);
 
+    // ---- Unofficial opcodes (M33) ------------------------------------
+    // NOP variants. Implied NOPs (1-byte).
+    t[0x1A] = op("NOP", AddrMode::Implied);
+    t[0x3A] = op("NOP", AddrMode::Implied);
+    t[0x5A] = op("NOP", AddrMode::Implied);
+    t[0x7A] = op("NOP", AddrMode::Implied);
+    t[0xDA] = op("NOP", AddrMode::Implied);
+    t[0xFA] = op("NOP", AddrMode::Implied);
+    // Immediate NOPs (2-byte, "NOP #imm").
+    t[0x80] = op("NOP", AddrMode::Immediate);
+    t[0x82] = op("NOP", AddrMode::Immediate);
+    t[0x89] = op("NOP", AddrMode::Immediate);
+    t[0xC2] = op("NOP", AddrMode::Immediate);
+    t[0xE2] = op("NOP", AddrMode::Immediate);
+    // Zero-page NOPs (2-byte).
+    t[0x04] = op("NOP", AddrMode::ZeroPage);
+    t[0x44] = op("NOP", AddrMode::ZeroPage);
+    t[0x64] = op("NOP", AddrMode::ZeroPage);
+    // Zero-page,X NOPs (2-byte).
+    t[0x14] = op("NOP", AddrMode::ZeroPageX);
+    t[0x34] = op("NOP", AddrMode::ZeroPageX);
+    t[0x54] = op("NOP", AddrMode::ZeroPageX);
+    t[0x74] = op("NOP", AddrMode::ZeroPageX);
+    t[0xD4] = op("NOP", AddrMode::ZeroPageX);
+    t[0xF4] = op("NOP", AddrMode::ZeroPageX);
+    // Absolute NOP (3-byte).
+    t[0x0C] = op("NOP", AddrMode::Absolute);
+    // Absolute,X NOPs (3-byte).
+    t[0x1C] = op("NOP", AddrMode::AbsoluteX);
+    t[0x3C] = op("NOP", AddrMode::AbsoluteX);
+    t[0x5C] = op("NOP", AddrMode::AbsoluteX);
+    t[0x7C] = op("NOP", AddrMode::AbsoluteX);
+    t[0xDC] = op("NOP", AddrMode::AbsoluteX);
+    t[0xFC] = op("NOP", AddrMode::AbsoluteX);
+
+    // LAX (load A and X).
+    t[0xA7] = op("LAX", AddrMode::ZeroPage);
+    t[0xB7] = op("LAX", AddrMode::ZeroPageY);
+    t[0xAF] = op("LAX", AddrMode::Absolute);
+    t[0xBF] = op("LAX", AddrMode::AbsoluteY);
+    t[0xA3] = op("LAX", AddrMode::IndirectX);
+    t[0xB3] = op("LAX", AddrMode::IndirectY);
+
+    // SAX (store A & X).
+    t[0x87] = op("SAX", AddrMode::ZeroPage);
+    t[0x97] = op("SAX", AddrMode::ZeroPageY);
+    t[0x8F] = op("SAX", AddrMode::Absolute);
+    t[0x83] = op("SAX", AddrMode::IndirectX);
+
+    // DCP (DEC then CMP).
+    t[0xC7] = op("DCP", AddrMode::ZeroPage);
+    t[0xD7] = op("DCP", AddrMode::ZeroPageX);
+    t[0xCF] = op("DCP", AddrMode::Absolute);
+    t[0xDF] = op("DCP", AddrMode::AbsoluteX);
+    t[0xDB] = op("DCP", AddrMode::AbsoluteY);
+    t[0xC3] = op("DCP", AddrMode::IndirectX);
+    t[0xD3] = op("DCP", AddrMode::IndirectY);
+
+    // ISC (INC then SBC).
+    t[0xE7] = op("ISC", AddrMode::ZeroPage);
+    t[0xF7] = op("ISC", AddrMode::ZeroPageX);
+    t[0xEF] = op("ISC", AddrMode::Absolute);
+    t[0xFF] = op("ISC", AddrMode::AbsoluteX);
+    t[0xFB] = op("ISC", AddrMode::AbsoluteY);
+    t[0xE3] = op("ISC", AddrMode::IndirectX);
+    t[0xF3] = op("ISC", AddrMode::IndirectY);
+
+    // SLO (ASL then ORA).
+    t[0x07] = op("SLO", AddrMode::ZeroPage);
+    t[0x17] = op("SLO", AddrMode::ZeroPageX);
+    t[0x0F] = op("SLO", AddrMode::Absolute);
+    t[0x1F] = op("SLO", AddrMode::AbsoluteX);
+    t[0x1B] = op("SLO", AddrMode::AbsoluteY);
+    t[0x03] = op("SLO", AddrMode::IndirectX);
+    t[0x13] = op("SLO", AddrMode::IndirectY);
+
+    // RLA (ROL then AND).
+    t[0x27] = op("RLA", AddrMode::ZeroPage);
+    t[0x37] = op("RLA", AddrMode::ZeroPageX);
+    t[0x2F] = op("RLA", AddrMode::Absolute);
+    t[0x3F] = op("RLA", AddrMode::AbsoluteX);
+    t[0x3B] = op("RLA", AddrMode::AbsoluteY);
+    t[0x23] = op("RLA", AddrMode::IndirectX);
+    t[0x33] = op("RLA", AddrMode::IndirectY);
+
+    // SRE (LSR then EOR).
+    t[0x47] = op("SRE", AddrMode::ZeroPage);
+    t[0x57] = op("SRE", AddrMode::ZeroPageX);
+    t[0x4F] = op("SRE", AddrMode::Absolute);
+    t[0x5F] = op("SRE", AddrMode::AbsoluteX);
+    t[0x5B] = op("SRE", AddrMode::AbsoluteY);
+    t[0x43] = op("SRE", AddrMode::IndirectX);
+    t[0x53] = op("SRE", AddrMode::IndirectY);
+
+    // RRA (ROR then ADC).
+    t[0x67] = op("RRA", AddrMode::ZeroPage);
+    t[0x77] = op("RRA", AddrMode::ZeroPageX);
+    t[0x6F] = op("RRA", AddrMode::Absolute);
+    t[0x7F] = op("RRA", AddrMode::AbsoluteX);
+    t[0x7B] = op("RRA", AddrMode::AbsoluteY);
+    t[0x63] = op("RRA", AddrMode::IndirectX);
+    t[0x73] = op("RRA", AddrMode::IndirectY);
+
+    // Immediate combined ops.
+    t[0x0B] = op("ANC", AddrMode::Immediate);
+    t[0x2B] = op("ANC", AddrMode::Immediate);
+    t[0x4B] = op("ALR", AddrMode::Immediate);
+    t[0x6B] = op("ARR", AddrMode::Immediate);
+    t[0xCB] = op("AXS", AddrMode::Immediate);
+    t[0x8B] = op("XAA", AddrMode::Immediate);
+
+    // Unstable indexed stores.
+    t[0x9B] = op("TAS", AddrMode::AbsoluteY);
+    t[0x9F] = op("AHX", AddrMode::AbsoluteY);
+    t[0x93] = op("AHX", AddrMode::IndirectY);
+    t[0x9E] = op("SHX", AddrMode::AbsoluteY);
+    t[0x9C] = op("SHY", AddrMode::AbsoluteX);
+    t[0xBB] = op("LAS", AddrMode::AbsoluteY);
+
+    // KIL / JAM / HLT (1-byte, halts the CPU).
+    t[0x02] = op("KIL", AddrMode::Implied);
+    t[0x12] = op("KIL", AddrMode::Implied);
+    t[0x22] = op("KIL", AddrMode::Implied);
+    t[0x32] = op("KIL", AddrMode::Implied);
+    t[0x42] = op("KIL", AddrMode::Implied);
+    t[0x52] = op("KIL", AddrMode::Implied);
+    t[0x62] = op("KIL", AddrMode::Implied);
+    t[0x72] = op("KIL", AddrMode::Implied);
+    t[0x92] = op("KIL", AddrMode::Implied);
+    t[0xB2] = op("KIL", AddrMode::Implied);
+    t[0xD2] = op("KIL", AddrMode::Implied);
+    t[0xF2] = op("KIL", AddrMode::Implied);
+
     t
 };
 

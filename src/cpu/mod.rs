@@ -42,6 +42,9 @@ use crate::bus::Bus;
 
 pub mod addressing;
 pub mod opcodes;
+pub mod unofficial;
+pub mod unofficial_rmw;
+pub mod unofficial_special;
 
 pub use addressing::{AddrMode, Operand};
 
@@ -92,6 +95,15 @@ pub struct Cpu {
     /// counter, mapper IRQ, or a test harness) and serviced at the start of
     /// the next [`Cpu::step`] only when the I flag is clear.
     pub irq_pending: bool,
+    /// Whether the CPU has been halted by a KIL/JAM unofficial opcode
+    /// (M33). When `true`, [`Cpu::step`] is a no-op that returns 1 cycle
+    /// without advancing PC — the CPU is frozen and only a RESET (or an
+    /// external overwrite of this flag) can revive it. The PPU/APU keep
+    /// running because the emulator main loop still consumes the returned
+    /// cycle and advances them.
+    ///
+    /// See: https://www.nesdev.org/wiki/CPU_unofficial_opcodes#KIL
+    pub halted: bool,
 }
 
 impl Cpu {
@@ -112,6 +124,7 @@ impl Cpu {
             status: flags::U | flags::I,
             nmi_pending: false,
             irq_pending: false,
+            halted: false,
         }
     }
 
@@ -283,6 +296,13 @@ impl Cpu {
     /// See: https://www.nesdev.org/6502.txt — cycle counts per opcode.
     /// See: https://www.nesdev.org/wiki/CPU_interrupts
     pub fn step(&mut self, bus: &mut Bus) -> u8 {
+        // KIL/JAM halt (M33): the CPU is frozen. Return 1 cycle so the
+        // emulator main loop still advances the PPU/APU, but do not fetch
+        // or execute anything. Only RESET (or an external flag clear)
+        // revives the CPU.
+        if self.halted {
+            return 1;
+        }
         // NMI is non-maskable and always wins over IRQ.
         if self.nmi_pending {
             self.nmi_pending = false;
@@ -297,6 +317,18 @@ impl Cpu {
         }
         let opcode = self.fetch_byte(bus);
         self.execute(bus, opcode)
+    }
+
+    /// Whether the CPU has been halted by a KIL/JAM unofficial opcode.
+    /// See [`Cpu::halted`].
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    /// Set or clear the halted flag. Used by KIL opcodes and by external
+    /// reset logic to revive a jammed CPU.
+    pub fn set_halted(&mut self, v: bool) {
+        self.halted = v;
     }
 }
 
@@ -357,6 +389,8 @@ impl Cpu {
         self.set_interrupt_disable(true);
         self.status |= flags::U;
         self.pc = self.read_vector(bus, vectors::RESET);
+        // M33: revive from KIL/JAM halt on RESET.
+        self.halted = false;
     }
 
     /// Shared body of NMI and IRQ: push PC (high then low), push status
