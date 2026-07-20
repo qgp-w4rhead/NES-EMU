@@ -16,6 +16,7 @@ use sdl2::keyboard::Keycode;
 
 use nes_emu::cartridge::Cartridge;
 use nes_emu::emulator::EmulatorState;
+use nes_emu::input::handle_key;
 use nes_emu::video::{Video, DEFAULT_SCALE};
 
 /// Application entry point. Returns a process exit code so that SDL2 or
@@ -77,7 +78,8 @@ fn run() -> Result<(), String> {
 
     'running: loop {
         // Drain all pending events each frame; ESC, window-close, and the
-        // conventional 'Q' key all terminate the loop.
+        // conventional 'Q' key all terminate the loop. NES controller
+        // buttons are wired to the joypad via `handle_key` (M13).
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -89,6 +91,12 @@ fn run() -> Result<(), String> {
                     keycode: Some(Keycode::Q),
                     ..
                 } => break 'running,
+                Event::KeyDown {
+                    keycode: Some(k), ..
+                } => handle_key(emulator.bus_mut().joypad_mut(), k, true),
+                Event::KeyUp {
+                    keycode: Some(k), ..
+                } => handle_key(emulator.bus_mut().joypad_mut(), k, false),
                 _ => {}
             }
         }

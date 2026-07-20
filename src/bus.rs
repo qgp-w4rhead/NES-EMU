@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 use crate::cartridge::Cartridge;
+use crate::joypad::Joypad;
 use crate::ppu::Ppu;
 
 /// Size of the CPU internal RAM in bytes (2 KB).
@@ -74,6 +75,10 @@ pub struct Bus {
     /// indexed by `addr - 0x4000`. Replaced by real APU routing in M14/M16.
     apu_open_bus: [u8; APU_IO_REG_COUNT],
 
+    /// The two NES standard controllers, polled via `$4016`/`$4017`.
+    /// Introduced in M13. See: https://www.nesdev.org/wiki/Controller_port
+    joypad: Joypad,
+
     /// Loaded cartridge, if any. When `None`, cartridge space reads return
     /// open bus (`0x00`) and writes are ignored.
     cartridge: Option<Cartridge>,
@@ -92,6 +97,7 @@ impl Bus {
             ram: [0u8; RAM_SIZE],
             ppu: Ppu::new(),
             apu_open_bus: [0u8; APU_IO_REG_COUNT],
+            joypad: Joypad::new(),
             cartridge: None,
             dma_stall_cycles: 0,
         }
@@ -141,6 +147,17 @@ impl Bus {
     /// Mutably borrow the PPU.
     pub fn ppu_mut(&mut self) -> &mut Ppu {
         &mut self.ppu
+    }
+
+    /// Borrow the joypad (controllers 1 and 2).
+    pub fn joypad(&self) -> &Joypad {
+        &self.joypad
+    }
+
+    /// Mutably borrow the joypad. The host input layer (M13 `src/input.rs`)
+    /// uses this to feed SDL2 keyboard events into the controller state.
+    pub fn joypad_mut(&mut self) -> &mut Joypad {
+        &mut self.joypad
     }
 
     /// Render the background layer into the PPU framebuffer.
@@ -242,8 +259,14 @@ impl Bus {
             // $4015: APU status (open-bus latch until M14).
             0x4015 => self.apu_read(0x15),
 
-            // $4016-$4017: I/O (joypad / APU frame counter).
-            0x4016..=0x4017 => self.apu_read(addr - APU_IO_BASE),
+            // $4016: controller 1 + open-bus bits 1-7.
+            0x4016 => self.joypad_read(0, 0x16),
+
+            // $4017: controller 2 + open-bus bits 1-7 (APU frame-counter
+            // IRQ flag at bit 6 lands in M14/M16; until then the open-bus
+            // latch preserves the last write for the existing round-trip
+            // test).
+            0x4017 => self.joypad_read(1, 0x17),
 
             // $4018-$401F: APU / I/O test mode — disabled, reads as open bus.
             0x4018..=0x401F => 0x00,
@@ -265,7 +288,19 @@ impl Bus {
             // $4014: OAMDMA — triggers 256-byte DMA from CPU page to OAM.
             0x4014 => self.oam_dma(value),
 
-            0x4015..=0x4017 => self.apu_write(addr - APU_IO_BASE, value),
+            // $4015: APU status (open-bus latch until M14).
+            0x4015 => self.apu_write(0x15, value),
+
+            // $4016: controller strobe (bit 0). Also latched on the open
+            // bus so subsequent reads see the last written value in bits
+            // 1-7.
+            0x4016 => {
+                self.apu_write(0x16, value);
+                self.joypad.write_strobe(value);
+            }
+
+            // $4017: APU frame counter (open-bus latch until M14/M16).
+            0x4017 => self.apu_write(0x17, value),
 
             // $4018-$401F: disabled test region — ignore writes.
             0x4018..=0x401F => {}
@@ -400,6 +435,22 @@ impl Bus {
     /// `offset` is `addr - 0x4000`, in `0..=0x17`.
     fn apu_read(&self, offset: u16) -> u8 {
         self.apu_open_bus[offset as usize]
+    }
+
+    /// Read a controller register (`$4016` for controller 1, `$4017` for
+    /// controller 2). Bit 0 is the next button bit from the joypad shift
+    /// register; bits 1-7 come from the open-bus latch (the last value
+    /// written to the register), matching the behavior of a retail NES
+    /// without expansion-port peripherals.
+    ///
+    /// `latch_offset` is the open-bus index (`0x16` or `0x17`).
+    ///
+    /// See: https://www.nesdev.org/wiki/Controller_port#Reading
+    fn joypad_read(&mut self, controller: usize, latch_offset: u16) -> u8 {
+        let button_bit = self.joypad.read(controller) & 1;
+        let open_bus = self.apu_open_bus[latch_offset as usize];
+        // Bit 0 from the joypad; bits 1-7 from the open-bus latch.
+        button_bit | (open_bus & 0xFE)
     }
 
     /// Write to the APU / I/O register file (open-bus latch until M14/M16).
