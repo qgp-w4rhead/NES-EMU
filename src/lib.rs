@@ -19,4 +19,6 @@ pub mod joypad;
 pub mod mappers;
 pub mod ppu;
 pub mod save_state;
+pub mod screenshot;
+pub mod ui_hotkeys;
 pub mod video;

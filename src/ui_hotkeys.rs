@@ -1,0 +1,179 @@
+//! M29 UI hotkey dispatcher — pause/reset/fast-forward/screenshot/fullscreen.
+//!
+//! Centralizes the M29 control-feature key handling so `src/main.rs` stays
+//! under the 400-line file-size limit. The dispatcher owns the fast-forward
+//! flag and a screenshot counter (for unique filenames); it does *not* own
+//! any SDL2 state — the `Video` and `EmulatorState` are borrowed per call.
+//!
+//! # Hotkeys
+//!
+//! | Key            | Action                                                  |
+//! |----------------|---------------------------------------------------------|
+//! | `Ctrl+R`       | Soft reset (CPU RESET sequence; PPU/APU keep state).   |
+//! | `F9`           | Screenshot → `screenshot-<unix_ms>-<n>.png` in CWD.    |
+//! | `Alt+Enter`    | Toggle fullscreen (desktop mode, integer-scaled).      |
+//! | `Tab`          | Toggle fast-forward (run 4 frames per vsync tick).     |
+//!
+//! F1/F2/F3 (debugger) and F4/F6/F8 (viewers) are handled by the M27/M28
+//! dispatchers and are *not* routed through this module.
+//!
+//! See: https://www.nesdev.org/wiki/CPU_interrupts#RESET (soft reset)
+//! See: https://wiki.libsdl.org/SDL2/SDL_SetWindowFullscreen (fullscreen)
+
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sdl2::keyboard::{Keycode, Mod};
+
+use crate::emulator::EmulatorState;
+use crate::screenshot;
+use crate::video::Video;
+
+/// Number of emulator frames to run per vsync tick while fast-forward is
+/// active. 4× keeps audio roughly in sync (we still push samples each
+/// tick) while making the game visibly faster.
+pub const FAST_FORWARD_FRAMES: u32 = 4;
+
+/// Default directory for screenshot files (the current working directory).
+pub const DEFAULT_SCREENSHOT_DIR: &str = ".";
+
+/// Bundle of M29 UI control state. Held by the main loop; [`UiHotkeys::handle_key`]
+/// dispatches key events to the appropriate action.
+pub struct UiHotkeys {
+    /// Fast-forward flag — when `true`, the main loop runs
+    /// [`FAST_FORWARD_FRAMES`] frames per vsync tick instead of one.
+    fast_forward: bool,
+    /// Monotonic screenshot counter so successive screenshots get unique
+    /// filenames even within the same millisecond.
+    screenshot_counter: u64,
+    /// Directory where screenshot PNGs are written.
+    screenshot_dir: PathBuf,
+}
+
+impl Default for UiHotkeys {
+    fn default() -> Self {
+        Self::new(PathBuf::from(DEFAULT_SCREENSHOT_DIR))
+    }
+}
+
+impl UiHotkeys {
+    /// Construct a dispatcher with the given screenshot output directory.
+    pub fn new(screenshot_dir: PathBuf) -> Self {
+        Self {
+            fast_forward: false,
+            screenshot_counter: 0,
+            screenshot_dir,
+        }
+    }
+
+    /// Is fast-forward currently active?
+    pub fn fast_forward(&self) -> bool {
+        self.fast_forward
+    }
+
+    /// Handle a key-down event. Returns `true` if the key was consumed by
+    /// a UI hotkey (and should *not* be forwarded to the joypad or debug
+    /// dispatchers), `false` if it should be routed as usual.
+    ///
+    /// `keymod` is the SDL2 keyboard modifier bitmask at the time of the
+    /// event. Modifier guards are strict: `Ctrl+R` requires Ctrl held
+    /// *and* Alt *not* held (so `Ctrl+Alt+R` falls through); `Alt+Enter`
+    /// requires Alt *and* not Ctrl. This keeps the bare keys (`R`,
+    /// `Return`) routable to the joypad if a user binds them in
+    /// `config.toml`. `Tab` is reserved unconditionally for
+    /// fast-forward — do not bind NES buttons to it in `config.toml`.
+    pub fn handle_key(
+        &mut self,
+        emulator: &mut EmulatorState,
+        video: &mut Video,
+        key: Keycode,
+        keymod: Mod,
+    ) -> bool {
+        let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
+        let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+        match key {
+            // Ctrl+R (no Alt): soft reset. The 6502 RESET sequence
+            // reloads PC from $FFFC/$FFFD, sets SP=$FD, sets the I flag.
+            // PPU/APU/mapper keep their current state.
+            Keycode::R if ctrl && !alt => {
+                emulator.soft_reset();
+                eprintln!("nes-emu: soft reset (CPU RESET sequence)");
+                true
+            }
+            // F9: screenshot to PNG in the configured directory.
+            Keycode::F9 => {
+                self.save_screenshot(emulator);
+                true
+            }
+            // Alt+Enter (no Ctrl): toggle fullscreen (desktop mode). The
+            // next `Video::present` recomputes the integer-scaled dst
+            // rect against the new desktop size.
+            Keycode::Return if alt && !ctrl => {
+                match video.toggle_fullscreen() {
+                    Ok(()) => {
+                        let state = if video.is_fullscreen() { "ON" } else { "OFF" };
+                        eprintln!("nes-emu: fullscreen {state}");
+                    }
+                    Err(e) => eprintln!("nes-emu: could not toggle fullscreen: {e}"),
+                }
+                true
+            }
+            // Tab: toggle fast-forward. The main loop reads
+            // `fast_forward()` each tick and runs `FAST_FORWARD_FRAMES`
+            // frames instead of one when it is on. `Tab` is reserved
+            // unconditionally — do not bind NES buttons to it in
+            // `config.toml`.
+            Keycode::Tab => {
+                self.fast_forward = !self.fast_forward;
+                let state = if self.fast_forward { "ON" } else { "OFF" };
+                eprintln!("nes-emu: fast-forward {state}");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Write the current framebuffer to a PNG file named
+    /// `screenshot-<unix_ms>-<counter>.png` in `screenshot_dir`. Errors
+    /// are reported to stderr and do not crash the emulator.
+    fn save_screenshot(&mut self, emulator: &EmulatorState) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let n = self.screenshot_counter;
+        self.screenshot_counter = self.screenshot_counter.wrapping_add(1);
+
+        let path = self
+            .screenshot_dir
+            .join(format!("screenshot-{now_ms}-{n}.png"));
+
+        let fb = emulator.framebuffer();
+        match screenshot::encode_to_path(
+            fb,
+            crate::video::NES_WIDTH,
+            crate::video::NES_HEIGHT,
+            &path,
+        ) {
+            Ok(()) => eprintln!("nes-emu: screenshot saved → {}", path.display()),
+            Err(e) => eprintln!("nes-emu: screenshot failed: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_fast_forward_off() {
+        let u = UiHotkeys::default();
+        assert!(!u.fast_forward());
+    }
+
+    #[test]
+    fn screenshot_counter_starts_at_zero() {
+        let u = UiHotkeys::default();
+        assert_eq!(u.screenshot_counter, 0);
+    }
+}

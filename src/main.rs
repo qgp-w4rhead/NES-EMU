@@ -1,15 +1,11 @@
 //! NES emulator entry point.
 //!
-//! Milestone 12 scope: load an iNES ROM from `--rom <path>`, build the
-//! `EmulatorState`, and run a frame-locked main loop that steps the
-//! emulator one NTSC frame per vsync and presents the PPU framebuffer via
-//! SDL2.
-//!
-//! Milestone 22 added: configurable key bindings + gamepad support. The
-//! bindings are loaded from `config.toml` (in the CWD by default, or
-//! `--config <path>`). On first run, a default `config.toml` is written so
-//! the user has a template to edit. Both keyboard and gamepad events are
-//! routed through `InputMapper` and applied to the joypad simultaneously.
+//! Loads an iNES ROM from `--rom <path>`, builds the `EmulatorState`, and
+//! runs a frame-locked main loop that steps the emulator one NTSC frame
+//! per vsync and presents the PPU framebuffer via SDL2. Key bindings and
+//! gamepad mappings come from `config.toml` (M22). Debug hotkeys (M27/M28)
+//! and UI controls (M29: Ctrl+R reset, F9 screenshot, Alt+Enter
+//! fullscreen, Tab fast-forward) are dispatched before joypad routing.
 //!
 //! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
 //! See: https://www.nesdev.org/wiki/Cycle_reference — ~29,830 CPU cycles
@@ -27,9 +23,10 @@ use nes_emu::audio::AudioOutput;
 use nes_emu::battery;
 use nes_emu::cartridge::Cartridge;
 use nes_emu::config::Config;
-use nes_emu::debug::{print_debug_overlay, CpuDebugger, DebugHotkeys};
+use nes_emu::debug::{handle_debugger_key, print_debug_overlay, CpuDebugger, DebugHotkeys};
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::InputMapper;
+use nes_emu::ui_hotkeys::UiHotkeys;
 use nes_emu::video::Video;
 
 /// Application entry point. Returns a process exit code so that SDL2 or
@@ -97,46 +94,6 @@ fn resolve_config_path(explicit: Option<&str>) -> PathBuf {
     match explicit {
         Some(p) => PathBuf::from(p),
         None => PathBuf::from("config.toml"),
-    }
-}
-
-/// Handle M27 debugger hotkeys (F1/F2/F3). Returns `true` if consumed.
-fn handle_debugger_key(debugger: &mut CpuDebugger, key: Keycode) -> bool {
-    match key {
-        Keycode::F1 => {
-            debugger.toggle_pause();
-            let state = if debugger.is_paused() {
-                "paused"
-            } else {
-                "resumed"
-            };
-            eprintln!("nes-emu: debugger {state}");
-            true
-        }
-        Keycode::F2 => {
-            if debugger.is_paused() {
-                debugger.request_step();
-            } else {
-                eprintln!("nes-emu: F2 single-step ignored (debugger not paused; press F1 first)");
-            }
-            true
-        }
-        Keycode::F3 => {
-            debugger.toggle_run_to_breakpoint();
-            let state = if debugger.run_to_breakpoint() {
-                "ON"
-            } else {
-                "OFF"
-            };
-            eprintln!("nes-emu: run-to-breakpoint {state}");
-            if debugger.run_to_breakpoint() && debugger.breakpoints().is_empty() {
-                eprintln!(
-                    "nes-emu: no breakpoints set — add some via the debugger API to use run-to-breakpoint"
-                );
-            }
-            true
-        }
-        _ => false,
     }
 }
 
@@ -246,6 +203,9 @@ fn run() -> Result<(), String> {
     // M28 debug viewers: F4 PPU viewer, F6 memory dump, F8 trace logger,
     // PageUp/PageDown navigate, `[`/`]` switch CPU/PPU region.
     let mut debug_hotkeys = DebugHotkeys::default();
+    // M29 UI controls: Ctrl+R reset, F9 screenshot, Alt+Enter fullscreen,
+    // Tab fast-forward.
+    let mut ui_hotkeys = UiHotkeys::default();
 
     'running: loop {
         // Drain all pending events each frame; ESC / Q / window-close
@@ -262,13 +222,16 @@ fn run() -> Result<(), String> {
                     ..
                 } => break 'running,
                 Event::KeyDown {
-                    keycode: Some(k), ..
+                    keycode: Some(k),
+                    keymod,
+                    ..
                 } => {
-                    // Intercept debugger + viewer hotkeys (M27/M28)
-                    // before routing to the joypad. Short-circuit: if
-                    // the M27 debugger consumes the key, the M28
-                    // dispatcher is not consulted (and vice versa).
-                    let consumed = handle_debugger_key(&mut debugger, k)
+                    // Intercept UI + debugger + viewer hotkeys
+                    // (M27/M28/M29) before routing to the joypad.
+                    // Short-circuit: the first dispatcher that consumes
+                    // the key wins; the rest are not consulted.
+                    let consumed = ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
+                        || handle_debugger_key(&mut debugger, k)
                         || debug_hotkeys.handle_key(emulator.bus(), k);
                     if !consumed {
                         mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true);
@@ -339,26 +302,43 @@ fn run() -> Result<(), String> {
         // one CPU instruction and then re-pauses. When not paused, we run
         // a full frame via `step_frame_debug`, which stops early if a
         // breakpoint matches (run-to-breakpoint mode, F3).
+        //
+        // M29 fast-forward (Tab): when active, run `FAST_FORWARD_FRAMES`
+        // frames per vsync tick instead of one. Audio samples are still
+        // drained once per tick (we drop the intermediate frames' samples
+        // to avoid flooding the audio queue and drifting the sound).
         if debugger.is_paused() {
             if debugger.consume_step_request() {
                 emulator.step_instruction();
             }
-        } else if debug_hotkeys.trace_enabled() {
-            // M28: when trace logging is on, run the frame through
-            // `step_frame_traced` so every executed instruction is
-            // written to the trace file.
-            emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
-            if debugger.is_paused() {
-                if let Some(bp) = debugger.last_hit() {
-                    eprintln!("nes-emu: breakpoint hit: {bp}");
-                }
-            }
         } else {
-            emulator.step_frame_debug(&mut debugger);
-            if debugger.is_paused() {
-                // A breakpoint fired mid-frame.
-                if let Some(bp) = debugger.last_hit() {
-                    eprintln!("nes-emu: breakpoint hit: {bp}");
+            let frames_this_tick = if ui_hotkeys.fast_forward() {
+                nes_emu::ui_hotkeys::FAST_FORWARD_FRAMES
+            } else {
+                1
+            };
+            for i in 0..frames_this_tick {
+                if debug_hotkeys.trace_enabled() {
+                    // M28: when trace logging is on, run the frame through
+                    // `step_frame_traced` so every executed instruction is
+                    // written to the trace file.
+                    emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
+                } else {
+                    emulator.step_frame_debug(&mut debugger);
+                }
+                // During fast-forward, drain *intermediate* frames' audio
+                // to keep the queue bounded. The final iteration's
+                // samples are left in the buffer for the post-loop
+                // `take_audio_samples` → `push_samples` call so
+                // fast-forward is not silent.
+                if ui_hotkeys.fast_forward() && i + 1 < frames_this_tick {
+                    let _ = emulator.take_audio_samples();
+                }
+                if debugger.is_paused() {
+                    if let Some(bp) = debugger.last_hit() {
+                        eprintln!("nes-emu: breakpoint hit: {bp}");
+                    }
+                    break;
                 }
             }
         }

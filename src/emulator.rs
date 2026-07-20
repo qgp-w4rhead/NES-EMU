@@ -69,6 +69,18 @@ impl EmulatorState {
         self.cpu.reset(&mut self.bus);
     }
 
+    /// Soft reset (M29 UI hotkey: Ctrl+R). Identical to [`reset`] at the
+    /// CPU level — the 6502 RESET sequence is the same whether the
+    /// machine is powering on or being reset mid-run. The PPU, APU, and
+    /// mapper keep their current state (real hardware partially resets
+    /// these too, but for emulator purposes a CPU-only reset matches
+    /// what most games expect from the reset button).
+    ///
+    /// See: https://www.nesdev.org/wiki/CPU_interrupts#RESET
+    pub fn soft_reset(&mut self) {
+        self.cpu.reset(&mut self.bus);
+    }
+
     /// Borrow the CPU.
     pub fn cpu(&self) -> &Cpu {
         &self.cpu

@@ -25,7 +25,7 @@ pub mod trace_logger;
 
 pub use cpu_debugger::{Breakpoint, CpuDebugger, RegisterSnapshot};
 pub use disasm::{disassemble_at, disassemble_window, DisassembledInstruction};
-pub use hotkeys::{DebugHotkeys, DEFAULT_TRACE_LOG_PATH};
+pub use hotkeys::{handle_debugger_key, DebugHotkeys, DEFAULT_TRACE_LOG_PATH};
 pub use memory_viewer::{MemoryRegion, MemoryViewer};
 pub use overlay::print_debug_overlay;
 pub use ppu_viewer::{PpuView, PpuViewer};

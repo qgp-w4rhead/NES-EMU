@@ -15,7 +15,7 @@
 use sdl2::keyboard::Keycode;
 
 use crate::bus::Bus;
-use crate::debug::{MemoryViewer, PpuViewer, TraceLogger};
+use crate::debug::{CpuDebugger, MemoryViewer, PpuViewer, TraceLogger};
 
 /// Default trace log file path (relative to the CWD).
 pub const DEFAULT_TRACE_LOG_PATH: &str = "trace.log";
@@ -126,5 +126,52 @@ impl DebugHotkeys {
             let lines = self.trace_logger.stop();
             eprintln!("nes-emu: trace logging stopped on exit ({lines} lines)");
         }
+    }
+}
+
+/// Handle M27 debugger hotkeys (F1/F2/F3). Returns `true` if the key
+/// was consumed. Extracted from `src/main.rs` so the binary stays under
+/// the 400-line file-size limit.
+///
+/// - **F1**: toggle pause/resume.
+/// - **F2**: single-step (only when paused; otherwise a no-op with a
+///   stderr hint).
+/// - **F3**: toggle run-to-breakpoint mode.
+pub fn handle_debugger_key(debugger: &mut CpuDebugger, key: Keycode) -> bool {
+    match key {
+        Keycode::F1 => {
+            debugger.toggle_pause();
+            let state = if debugger.is_paused() {
+                "paused"
+            } else {
+                "resumed"
+            };
+            eprintln!("nes-emu: debugger {state}");
+            true
+        }
+        Keycode::F2 => {
+            if debugger.is_paused() {
+                debugger.request_step();
+            } else {
+                eprintln!("nes-emu: F2 single-step ignored (debugger not paused; press F1 first)");
+            }
+            true
+        }
+        Keycode::F3 => {
+            debugger.toggle_run_to_breakpoint();
+            let state = if debugger.run_to_breakpoint() {
+                "ON"
+            } else {
+                "OFF"
+            };
+            eprintln!("nes-emu: run-to-breakpoint {state}");
+            if debugger.run_to_breakpoint() && debugger.breakpoints().is_empty() {
+                eprintln!(
+                    "nes-emu: no breakpoints set — add some via the debugger API to use run-to-breakpoint"
+                );
+            }
+            true
+        }
+        _ => false,
     }
 }
