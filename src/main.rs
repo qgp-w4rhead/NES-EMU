@@ -26,6 +26,8 @@ use nes_emu::config::Config;
 use nes_emu::debug::{handle_debugger_key, print_debug_overlay, CpuDebugger, DebugHotkeys};
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::InputMapper;
+use nes_emu::osd::game_name_from_path;
+use nes_emu::save_state_hotkeys::SaveStateHotkeys;
 use nes_emu::ui_hotkeys::UiHotkeys;
 use nes_emu::video::Video;
 
@@ -206,6 +208,9 @@ fn run() -> Result<(), String> {
     // M29 UI controls: Ctrl+R reset, F9 screenshot, Alt+Enter fullscreen,
     // Tab fast-forward.
     let mut ui_hotkeys = UiHotkeys::default();
+    // M30 save-state slots (F5/F7 + 1..=9,0), rewind (Backspace), OSD (F10).
+    let game_name = game_name_from_path(rom_path_ref);
+    let mut save_state_hotkeys = SaveStateHotkeys::new(game_name);
 
     'running: loop {
         // Drain all pending events each frame; ESC / Q / window-close
@@ -226,13 +231,14 @@ fn run() -> Result<(), String> {
                     keymod,
                     ..
                 } => {
-                    // Intercept UI + debugger + viewer hotkeys
-                    // (M27/M28/M29) before routing to the joypad.
-                    // Short-circuit: the first dispatcher that consumes
-                    // the key wins; the rest are not consulted.
+                    // Intercept UI + debugger + viewer + save-state
+                    // hotkeys (M27/M28/M29/M30) before routing to the
+                    // joypad. Short-circuit: the first dispatcher that
+                    // consumes the key wins; the rest are not consulted.
                     let consumed = ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
                         || handle_debugger_key(&mut debugger, k)
-                        || debug_hotkeys.handle_key(emulator.bus(), k);
+                        || debug_hotkeys.handle_key(emulator.bus(), k)
+                        || save_state_hotkeys.handle_key(&mut emulator, k, keymod);
                     if !consumed {
                         mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true);
                     }
@@ -342,7 +348,14 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        video.present(emulator.framebuffer())?;
+        // M30: when the OSD is enabled, the overlay is blitted into the
+        // framebuffer *before* the single `video.present` call (inside
+        // `post_frame`), so we skip the present here to avoid a double-
+        // present that would halve the frame rate (the renderer is
+        // vsync-locked). When the OSD is off, we present here.
+        if !save_state_hotkeys.osd_enabled() {
+            video.present(emulator.framebuffer())?;
+        }
         let samples = emulator.take_audio_samples();
         if !samples.is_empty() {
             // Audio output is best-effort: if the queue is full (e.g. the
@@ -350,6 +363,14 @@ fn run() -> Result<(), String> {
             // the emulation loop.
             let _ = audio.push_samples(&samples);
         }
+
+        // M30: post-frame hook — capture a rewind snapshot, then (if the
+        // OSD is enabled) blit the overlay into the framebuffer and
+        // present. When the OSD is off, this only pushes the rewind
+        // snapshot and does not present (the present already happened
+        // above). Encapsulated in `SaveStateHotkeys::post_frame` to keep
+        // main.rs under the 400-line limit.
+        save_state_hotkeys.post_frame(&mut emulator, |fb| video.present(fb))?;
 
         // While paused, render a console "overlay" — register snapshot +
         // disassembly window — to stderr each frame. This is the M27

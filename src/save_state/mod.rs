@@ -10,6 +10,13 @@
 //! forward-incompatible save states are rejected cleanly rather than
 //! deserialising into a corrupt state.
 //!
+//! # Submodules
+//!
+//! - [`slots`] — 10 save state slots (F5 save / F7 load + number-key
+//!   selection).
+//! - [`rewind`] — ring buffer of recent snapshots for the rewind feature
+//!   (Backspace pops one frame).
+//!
 //! # What is serialised
 //!
 //! | Component          | Fields                                                  |
@@ -35,6 +42,12 @@
 //! See: https://www.nesdev.org/wiki/Save_state
 
 #![allow(dead_code)]
+
+mod rewind;
+mod slots;
+
+pub use rewind::{RewindBuffer, DEFAULT_REWIND_CAPACITY};
+pub use slots::{SaveStateSlots, SAVE_STATE_SLOT_COUNT};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +106,13 @@ pub enum SaveStateError {
     /// the emulator. The stored version and the current
     /// [`SAVE_STATE_VERSION`] are included.
     VersionMismatch { expected: u32, found: u32 },
+    /// A save state slot index was out of range (`>=
+    /// SAVE_STATE_SLOT_COUNT`). The requested index and the valid maximum
+    /// are included.
+    SlotOutOfRange { requested: usize, max: usize },
+    /// A load was attempted on an empty save state slot. The slot index
+    /// is included.
+    SlotEmpty { slot: usize },
 }
 
 impl std::fmt::Display for SaveStateError {
@@ -105,6 +125,12 @@ impl std::fmt::Display for SaveStateError {
                     f,
                     "save state version mismatch: expected {expected}, found {found}"
                 )
+            }
+            SaveStateError::SlotOutOfRange { requested, max } => {
+                write!(f, "save state slot {requested} out of range (max {max})")
+            }
+            SaveStateError::SlotEmpty { slot } => {
+                write!(f, "save state slot {slot} is empty")
             }
         }
     }

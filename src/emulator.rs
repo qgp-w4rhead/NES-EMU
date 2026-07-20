@@ -158,6 +158,22 @@ impl EmulatorState {
         self.bus.ppu().framebuffer()
     }
 
+    /// Mutably borrow the current framebuffer (256×240 ARGB). Used by the
+    /// OSD (M30) to draw the overlay directly into the framebuffer before
+    /// the video layer uploads it to the SDL2 texture.
+    pub fn framebuffer_mut(&mut self) -> &mut [u32] {
+        self.bus.ppu_mut().framebuffer_mut()
+    }
+
+    /// The loaded cartridge's iNES mapper number, or `0` if no cartridge
+    /// is loaded. Used by the OSD (M30) to display the active mapper.
+    pub fn mapper_number(&self) -> u16 {
+        self.bus
+            .cartridge()
+            .map(|c| c.header.mapper_number)
+            .unwrap_or(0)
+    }
+
     /// Run one full NTSC frame: steps the CPU and PPU in lockstep (1 CPU
     /// cycle = 3 PPU cycles) until the PPU scanline wraps from the
     /// prerender scanline (261) back to scanline 0, then renders the
