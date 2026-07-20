@@ -12,8 +12,25 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 toml = { version = "1.1.3", features = ["parse", "display"] }
 
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Optimized profile for benchmarks — matches release settings so criterion
+# measures real-world performance instead of unoptimized debug builds.
+# `panic = "abort"` is intentionally omitted: the bench profile requires
+# unwinding for criterion's own panic-handling, and cargo emits a warning
+# if `panic = "abort"` is set here.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[bench]]
+name = "frame_bench"
+harness = false
