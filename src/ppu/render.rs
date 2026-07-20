@@ -50,8 +50,9 @@
 #![allow(dead_code)]
 
 use crate::ppu::{
-    Ppu, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, CTRL_SPRITE_PATTERN_1000, CTRL_SPRITE_SIZE_16,
-    MASK_SHOW_BG, MASK_SHOW_BG_LEFT, MASK_SHOW_SPRITES, MASK_SHOW_SPRITES_LEFT, SCREEN_HEIGHT,
+    Ppu, COARSE_X_MASK, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, CTRL_SPRITE_PATTERN_1000,
+    CTRL_SPRITE_SIZE_16, MASK_SHOW_BG, MASK_SHOW_BG_LEFT, MASK_SHOW_SPRITES,
+    MASK_SHOW_SPRITES_LEFT, MAX_SPRITES_PER_SCANLINE, NT_H_BIT, NT_V_BIT, SCREEN_HEIGHT,
     SCREEN_WIDTH,
 };
 
@@ -78,8 +79,6 @@ const ATTR_HFLIP: u8 = 0b0100_0000;
 /// Bit 7: flip sprite vertically.
 const ATTR_VFLIP: u8 = 0b1000_0000;
 
-/// Maximum number of sprites rendered on a single scanline (hardware limit).
-const MAX_SPRITES_PER_SCANLINE: usize = 8;
 /// Number of sprites in OAM (64).
 const SPRITE_COUNT: usize = 64;
 /// Sprite height in 8×8 mode (pixels).
@@ -219,7 +218,7 @@ impl Ppu {
     /// are implemented in M10.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_rendering#Background
-    pub fn render_background(&mut self, chr_read: impl Fn(u16) -> u8) {
+    pub fn render_background(&mut self, mut chr_read: impl FnMut(u16) -> u8) {
         let bg_enabled = (self.ppumask & MASK_SHOW_BG) != 0;
         let bg_left_enabled = (self.ppumask & MASK_SHOW_BG_LEFT) != 0;
         let universal_bg = self.universal_bg_argb();
@@ -389,7 +388,7 @@ impl Ppu {
     /// See: https://www.nesdev.org/wiki/PPU_OAM
     /// See: https://www.nesdev.org/wiki/PPU_rendering#Sprites
     /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
-    pub fn render_sprites(&mut self, chr_read: impl Fn(u16) -> u8) {
+    pub fn render_sprites(&mut self, mut chr_read: impl FnMut(u16) -> u8) {
         // Clear the per-frame status flags at the start of the frame. On
         // real hardware this happens at the prerender scanline (M10);
         // without scanline-locked rendering we clear them here so the
@@ -595,11 +594,340 @@ impl Ppu {
     /// an SDL2 texture.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_rendering
-    pub fn render_frame(&mut self, chr_read: impl Fn(u16) -> u8) {
-        // Pass the closure by reference to both passes; `Fn` is called via
-        // `&self`, so `&chr_read` satisfies the `impl Fn(u16) -> u8` bound.
-        self.render_background(&chr_read);
-        self.render_sprites(&chr_read);
+    pub fn render_frame(&mut self, mut chr_read: impl FnMut(u16) -> u8) {
+        // Pass the closure by &mut reference to both passes; `&mut F`
+        // satisfies `FnMut` when `F: FnMut`. The first borrow is released
+        // when `render_background` returns, so the second is fine.
+        self.render_background(&mut chr_read);
+        self.render_sprites(&mut chr_read);
+    }
+
+    // =================================================================
+    //  M25: Per-pixel (cycle-accurate) rendering
+    // =================================================================
+
+    /// Render a single pixel at the current `(cycle, scanline)` position.
+    ///
+    /// Called once per PPU cycle during visible scanlines (0-239, cycles
+    /// 1-256) by [`Ppu::step_rendered`]. This is the cycle-accurate render
+    /// path: mid-scanline register writes (PPUADDR / PPUSCROLL) take effect
+    /// at the correct pixel because the render position is re-synced from
+    /// `v` whenever [`Ppu::render_v_dirty`] is set.
+    ///
+    /// `chr_read` supplies pattern-table bytes from CHR (cartridge-owned).
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_rendering#Pixel_pipeline
+    pub(super) fn render_one_pixel(&mut self, chr_read: &mut dyn FnMut(u16) -> u8) {
+        // The output pixel X is derived from the PPU cycle (cycle 1 → px 0,
+        // cycle 256 → px 255). This is inherently save-state-safe: the
+        // position is recomputed from the architectural `cycle` field every
+        // pixel rather than being a separate counter that can drift.
+        let px = (self.cycle - 1) as usize;
+        let py = self.scanline as usize;
+        let col = py * SCREEN_WIDTH + px;
+
+        // ---- First pixel of a scanline: snapshot + sprite evaluation ----
+        if !self.scanline_render_initialized {
+            self.snapshot_scanline_render(px);
+            self.evaluate_scanline_sprites();
+            self.scanline_render_initialized = true;
+        }
+
+        // ---- Re-sync on mid-scanline register writes ----
+        if self.render_v_dirty {
+            self.resync_render_position(px);
+        }
+
+        let bg_enabled = (self.ppumask & MASK_SHOW_BG) != 0;
+        let bg_left_enabled = (self.ppumask & MASK_SHOW_BG_LEFT) != 0;
+        let sprites_enabled = (self.ppumask & MASK_SHOW_SPRITES) != 0;
+        let sprites_left_enabled = (self.ppumask & MASK_SHOW_SPRITES_LEFT) != 0;
+
+        // ---- Compute the background pixel ----
+        let mut pixel_argb: u32;
+
+        if !bg_enabled {
+            // Background disabled → universal bg color, transparent.
+            pixel_argb = self.universal_bg_argb();
+            self.bg_pattern[col] = 0;
+        } else if px < 8 && !bg_left_enabled {
+            // Left 8 pixels masked → universal bg color, transparent.
+            pixel_argb = self.universal_bg_argb();
+            self.bg_pattern[col] = 0;
+        } else {
+            // Fetch the background tile for this pixel from the render
+            // position (coarse X/Y, fine X/Y, nametable).
+            let (pattern, pal_select) = self.fetch_bg_pixel(px, chr_read);
+            self.bg_pattern[col] = pattern;
+            let color_addr = if pattern == 0 {
+                PAL_BASE // universal background
+            } else {
+                PAL_BASE | ((pal_select as u16) << 2) | (pattern as u16)
+            };
+            let nes_index = self.read_palette(color_addr);
+            pixel_argb = nes_color_to_argb(nes_index);
+        }
+
+        // ---- Composite sprite pixel on top ----
+        if sprites_enabled && (px >= 8 || sprites_left_enabled) {
+            if let Some((sprite_pattern, sprite_pal)) = self.fetch_sprite_pixel(px, py, chr_read) {
+                // fetch_sprite_pixel returns Some only for an opaque,
+                // priority-OK sprite pixel, so we can safely overwrite the
+                // background pixel with the sprite color.
+                let color_addr =
+                    SPRITE_PAL_BASE | ((sprite_pal as u16) << 2) | (sprite_pattern as u16);
+                let nes_index = self.read_palette(color_addr);
+                pixel_argb = nes_color_to_argb(nes_index);
+            }
+        }
+
+        self.framebuffer[col] = pixel_argb;
+    }
+
+    /// Snapshot the per-scanline render position from the current `v`
+    /// register. Called at the first pixel of each visible scanline. The
+    /// vertical components (coarse Y, fine Y, vertical nametable bit) are
+    /// fixed for the whole scanline; the horizontal components are stored
+    /// as a starting point plus the pixel X at which the snapshot was taken
+    /// — the per-pixel position is derived by advancing from that starting
+    /// point by `(px - render_resync_px)` pixels.
+    fn snapshot_scanline_render(&mut self, px: usize) {
+        self.render_coarse_y = (self.v >> 5) & 0x1F;
+        self.render_fine_y = (self.v >> 12) & 0x07;
+        self.render_nt_v = self.v & NT_V_BIT;
+        self.render_coarse_x_start = self.v & COARSE_X_MASK;
+        self.render_nt_h_start = self.v & NT_H_BIT;
+        self.render_fine_x_start = self.fine_x;
+        self.render_resync_px = px as u16;
+        self.render_v_dirty = false;
+    }
+
+    /// Re-sync the render position from `v` after a mid-scanline register
+    /// write (PPUADDR second write or PPUSCROLL first write set
+    /// [`Ppu::render_v_dirty`]). The vertical components are also re-synced
+    /// since a PPUADDR write can change them. The new horizontal starting
+    /// point is recorded along with the current pixel X so subsequent pixels
+    /// advance from this new origin.
+    fn resync_render_position(&mut self, px: usize) {
+        self.render_coarse_y = (self.v >> 5) & 0x1F;
+        self.render_fine_y = (self.v >> 12) & 0x07;
+        self.render_nt_v = self.v & NT_V_BIT;
+        self.render_coarse_x_start = self.v & COARSE_X_MASK;
+        self.render_nt_h_start = self.v & NT_H_BIT;
+        self.render_fine_x_start = self.fine_x;
+        self.render_resync_px = px as u16;
+        self.render_v_dirty = false;
+    }
+
+    /// Compute the effective horizontal render position (coarse X,
+    /// horizontal nametable bit, fine X) for output pixel `px` by advancing
+    /// from the last snapshot/re-sync starting point by
+    /// `(px - render_resync_px)` pixels.
+    fn effective_render_x(&self, px: usize) -> (u16, u16, u8) {
+        let mut coarse_x = self.render_coarse_x_start;
+        let mut nt_h = self.render_nt_h_start;
+        let fine_x_start = self.render_fine_x_start as u16;
+        let advance = px as u16 - self.render_resync_px;
+        // Advance fine X first; on wrap, advance coarse X with nametable
+        // horizontal-bit wrap.
+        let new_fine_x = (fine_x_start + advance) & 0x07;
+        let cx_inc = (fine_x_start + advance) >> 3;
+        // Now advance coarse X by `cx_inc`, wrapping at 32 with nt_h flip.
+        let total = (coarse_x + cx_inc) as u32;
+        let wraps = total / 32;
+        coarse_x = (total % 32) as u16;
+        if wraps & 1 != 0 {
+            nt_h ^= NT_H_BIT;
+        }
+        (coarse_x, nt_h, new_fine_x as u8)
+    }
+
+    /// Fetch the background pixel (2-bit pattern + 2-bit palette select) at
+    /// output pixel `px`. Returns `(pattern, pal_select)`.
+    ///
+    /// Uses the per-scanline vertical snapshot (coarse Y, fine Y, vertical
+    /// nametable bit) and the per-pixel horizontal position derived from
+    /// the last snapshot/re-sync starting point.
+    fn fetch_bg_pixel(&self, px: usize, chr_read: &mut dyn FnMut(u16) -> u8) -> (u8, u8) {
+        let (coarse_x, nt_h, fine_x) = self.effective_render_x(px);
+        // Effective nametable select (0..3) from the horizontal + vertical
+        // nametable bits.
+        let nt = ((nt_h >> 10) | (self.render_nt_v >> 10)) & 0x03;
+        let coarse_y = self.render_coarse_y;
+
+        // 1) Nametable fetch → tile index.
+        let nt_addr = NT_BASE | (nt << 10) | (coarse_y << 5) | coarse_x;
+        let tile_index = self.read_nametable(nt_addr) as u16;
+
+        // 2) Pattern-table fetch (two bitplanes).
+        let bg_table: u16 = if (self.ppuctrl & CTRL_BG_PATTERN_1000) != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+        let pattern_addr = bg_table | (tile_index << 4) | self.render_fine_y;
+        let plane0 = chr_read(pattern_addr);
+        let plane1 = chr_read(pattern_addr | 0x08);
+        let bit = 7 - (fine_x as u16);
+        let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
+
+        // 3) Attribute-table fetch → 2-bit palette select.
+        let attr_col = coarse_x >> 2;
+        let attr_row = coarse_y >> 2;
+        let attr_addr = NT_BASE | (nt << 10) | ATTR_TABLE_OFFSET | (attr_row << 3) | attr_col;
+        let attr_byte = self.read_nametable(attr_addr);
+        let shift = ((coarse_y & 0x02) << 1) | (coarse_x & 0x02);
+        let pal_select = (attr_byte >> shift) & 0x03;
+
+        (pattern, pal_select)
+    }
+
+    /// Evaluate sprites for the current scanline: scan OAM and select the
+    /// first 8 sprites in range, recording sprite overflow if a 9th+ would
+    /// be in range. Mirrors the logic in [`Ppu::render_sprites`] but stores
+    /// the result in [`Ppu::scanline_sprites`] for per-pixel compositing.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
+    fn evaluate_scanline_sprites(&mut self) {
+        self.scanline_sprite_count = 0;
+        self.scanline_overflow = false;
+
+        let sprite_size_16 = (self.ppuctrl & CTRL_SPRITE_SIZE_16) != 0;
+        let sprite_height: u16 = if sprite_size_16 {
+            SPRITE_HEIGHT_8X16
+        } else {
+            SPRITE_HEIGHT_8X8
+        };
+        let scanline = self.scanline;
+
+        for i in 0..SPRITE_COUNT {
+            let oam_idx = i * 4;
+            let y = self.oam[oam_idx];
+            if y == OAM_Y_HALT {
+                break;
+            }
+            if y >= OAM_Y_HIDDEN {
+                continue;
+            }
+            let top = y as u16 + 1;
+            if scanline < top || scanline >= top + sprite_height {
+                continue;
+            }
+            if self.scanline_sprite_count < MAX_SPRITES_PER_SCANLINE {
+                self.scanline_sprites[self.scanline_sprite_count] = (
+                    i,
+                    y,
+                    self.oam[oam_idx + 1],
+                    self.oam[oam_idx + 2],
+                    self.oam[oam_idx + 3],
+                );
+                self.scanline_sprite_count += 1;
+            } else {
+                self.scanline_overflow = true;
+            }
+        }
+
+        // Latch the overflow flag into PPUSTATUS (set, never cleared mid-frame).
+        if self.scanline_overflow {
+            self.set_sprite_overflow(true);
+        }
+    }
+
+    /// Fetch the sprite pixel at screen position `(px, py)` by compositing
+    /// the scanline's selected sprites. Returns `Some((pattern, pal_select))`
+    /// for the first opaque, priority-OK sprite at this pixel, or `None` if
+    /// no sprite claims it.
+    ///
+    /// Also handles sprite zero hit detection: when sprite 0 (OAM index 0)
+    /// has an opaque pixel AND the background pixel is opaque, the
+    /// sprite-0-hit flag is set (once per frame).
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
+    fn fetch_sprite_pixel(
+        &mut self,
+        px: usize,
+        py: usize,
+        chr_read: &mut dyn FnMut(u16) -> u8,
+    ) -> Option<(u8, u8)> {
+        let sprite_size_16 = (self.ppuctrl & CTRL_SPRITE_SIZE_16) != 0;
+        let sprite_height: u16 = if sprite_size_16 {
+            SPRITE_HEIGHT_8X16
+        } else {
+            SPRITE_HEIGHT_8X8
+        };
+        let sprite_table_8x8: u16 = if (self.ppuctrl & CTRL_SPRITE_PATTERN_1000) != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+        let scanline = py as u16;
+        let col_idx = py * SCREEN_WIDTH + px;
+        let bg_opaque = self.bg_pattern[col_idx] != 0;
+
+        for idx in 0..self.scanline_sprite_count {
+            let (oam_i, y, tile, attr, sx) = self.scanline_sprites[idx];
+            let sx = sx as u16;
+            if (px as u16) < sx || (px as u16) >= sx + SPRITE_WIDTH {
+                continue;
+            }
+            let tile_col = (px as u16 - sx) as u8;
+            let tile_row = (scanline - (y as u16 + 1)) as u8;
+            let row = if (attr & ATTR_VFLIP) != 0 {
+                ((sprite_height - 1) as u8) - tile_row
+            } else {
+                tile_row
+            };
+            let col = if (attr & ATTR_HFLIP) != 0 {
+                7 - tile_col
+            } else {
+                tile_col
+            };
+
+            let (table, tile_base): (u16, u16) = if sprite_size_16 {
+                let t = if (tile & 1) != 0 { 0x1000 } else { 0x0000 };
+                (t, (tile & 0xFE) as u16)
+            } else {
+                (sprite_table_8x8, tile as u16)
+            };
+            let row_in_tile = if sprite_size_16 { row & 0x07 } else { row };
+            let tile_for_row = if sprite_size_16 && row >= 8 {
+                tile_base + 1
+            } else {
+                tile_base
+            };
+
+            let pattern_addr = table | (tile_for_row << 4) | (row_in_tile as u16);
+            let plane0 = chr_read(pattern_addr);
+            let plane1 = chr_read(pattern_addr | 0x08);
+            let bit = 7 - col;
+            let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
+
+            if pattern == 0 {
+                continue; // transparent — try next sprite
+            }
+
+            // Sprite 0 hit detection (triggers once per frame).
+            if !self.scanline_sprite_zero_hit
+                && oam_i == 0
+                && (px as u16) < SPRITE_ZERO_HIT_MAX_X
+                && bg_opaque
+            {
+                self.set_sprite_zero_hit(true);
+                self.scanline_sprite_zero_hit = true;
+            }
+
+            let behind_bg = (attr & ATTR_PRIORITY_BEHIND) != 0;
+            if behind_bg && bg_opaque {
+                // Sprite is behind an opaque background → not visible.
+                // Continue to the next sprite (lower priority, can't claim).
+                continue;
+            }
+
+            let pal = attr & ATTR_PALETTE_MASK;
+            return Some((pattern, pal));
+        }
+
+        None
     }
 
     /// Clear the entire framebuffer to a single ARGB value.

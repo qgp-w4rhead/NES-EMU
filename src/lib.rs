@@ -12,6 +12,7 @@ pub mod bus;
 pub mod cartridge;
 pub mod config;
 pub mod cpu;
+pub mod debug;
 pub mod emulator;
 pub mod input;
 pub mod joypad;

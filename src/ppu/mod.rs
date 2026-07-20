@@ -241,7 +241,99 @@ pub struct Ppu {
     // ---- configuration ----
     /// Nametable mirroring mode, set from the cartridge by the bus.
     mirroring: Mirroring,
+
+    // ---- M25: per-pixel (cycle-accurate) rendering pipeline ----
+    //
+    // The per-pixel renderer outputs one pixel per PPU cycle during visible
+    // scanlines (0-239, cycles 1-256). It runs inside [`Ppu::step_rendered`],
+    // which the bus calls in place of [`Ppu::step`] so that CHR pattern
+    // fetches can be routed through the cartridge.
+    //
+    // All of the following fields are transient pipeline state — they are
+    // recomputed every scanline and are not part of the architectural PPU
+    // state. They are skipped during save-state serialization and default
+    // to zero on restore; the pipeline refills on the next visible scanline.
+    #[serde(skip)]
+    /// Latched nametable byte from the current background tile fetch.
+    fetch_nt: u8,
+    #[serde(skip)]
+    /// Latched attribute byte from the current background tile fetch.
+    fetch_at: u8,
+    #[serde(skip)]
+    /// Latched pattern-table plane-0 byte from the current tile fetch.
+    fetch_pt0: u8,
+    #[serde(skip)]
+    /// Latched pattern-table plane-1 byte from the current tile fetch.
+    fetch_pt1: u8,
+
+    #[serde(skip)]
+    /// Per-scanline vertical position snapshot (taken at the first pixel
+    /// cycle of each visible scanline from `v`): coarse Y (bits 5-9).
+    render_coarse_y: u16,
+    #[serde(skip)]
+    /// Per-scanline vertical position snapshot: fine Y (bits 12-14).
+    render_fine_y: u16,
+    #[serde(skip)]
+    /// Per-scanline vertical position snapshot: vertical nametable bit
+    /// (`NT_V_BIT` or 0).
+    render_nt_v: u16,
+
+    #[serde(skip)]
+    /// Horizontal render position snapshot — coarse X at the last
+    /// snapshot/re-sync point (scanline start or mid-scanline `v` write).
+    render_coarse_x_start: u16,
+    #[serde(skip)]
+    /// Horizontal render position snapshot — horizontal nametable bit
+    /// (`NT_H_BIT` or 0) at the last snapshot/re-sync point.
+    render_nt_h_start: u16,
+    #[serde(skip)]
+    /// Horizontal render position snapshot — fine X (0-7) at the last
+    /// snapshot/re-sync point. This is the per-pixel fine X offset within
+    /// the first tile of the snapshot.
+    render_fine_x_start: u8,
+    #[serde(skip)]
+    /// The pixel X (0-255) at which the last snapshot/re-sync happened.
+    /// The render position for pixel `px` is derived as
+    /// `snapshot + (px - render_resync_px)`.
+    render_resync_px: u16,
+    #[serde(skip)]
+    /// Whether the per-scanline render snapshot has been taken for the
+    /// current scanline. Reset at cycle 0; set at the first pixel output.
+    scanline_render_initialized: bool,
+
+    #[serde(skip)]
+    /// Set by [`Ppu::write_ppuaddr`] on the second write (which copies `t`
+    /// into `v`) and by [`Ppu::write_ppuscroll`] (which changes `t`/`fine_x`).
+    /// The per-pixel renderer checks this and re-syncs its horizontal output
+    /// position from `v` so that mid-scanline raster effects take effect at
+    /// the correct pixel.
+    render_v_dirty: bool,
+
+    #[serde(skip)]
+    /// Whether the per-pixel renderer produced any output during the current
+    /// frame. Reset at the prerender scanline; used by the emulator to decide
+    /// whether the framebuffer is already filled (cycle-accurate path) or
+    /// needs a fallback whole-frame render.
+    rendered_this_frame: bool,
+
+    #[serde(skip)]
+    /// Sprite evaluation result for the current scanline: up to 8 selected
+    /// sprites as `(oam_index, y, tile, attr, x)`.
+    scanline_sprites: [(usize, u8, u8, u8, u8); MAX_SPRITES_PER_SCANLINE],
+    #[serde(skip)]
+    /// Number of valid entries in [`Ppu::scanline_sprites`].
+    scanline_sprite_count: usize,
+    #[serde(skip)]
+    /// Whether sprite overflow was detected for the current scanline.
+    scanline_overflow: bool,
+    #[serde(skip)]
+    /// Whether sprite 0 hit has been set during the current frame (latched
+    /// to avoid re-triggering after the first hit).
+    scanline_sprite_zero_hit: bool,
 }
+
+/// Maximum number of sprites rendered on a single scanline (hardware limit).
+const MAX_SPRITES_PER_SCANLINE: usize = 8;
 
 impl Ppu {
     /// Construct a PPU in power-on state: all registers zeroed, VRAM/OAM/
@@ -271,6 +363,24 @@ impl Ppu {
             cycle: 0,
             nmi_request: false,
             mirroring: Mirroring::Horizontal,
+            fetch_nt: 0,
+            fetch_at: 0,
+            fetch_pt0: 0,
+            fetch_pt1: 0,
+            render_coarse_y: 0,
+            render_fine_y: 0,
+            render_nt_v: 0,
+            render_coarse_x_start: 0,
+            render_nt_h_start: 0,
+            render_fine_x_start: 0,
+            render_resync_px: 0,
+            scanline_render_initialized: false,
+            render_v_dirty: false,
+            rendered_this_frame: false,
+            scanline_sprites: [(0, 0, 0, 0, 0); MAX_SPRITES_PER_SCANLINE],
+            scanline_sprite_count: 0,
+            scanline_overflow: false,
+            scanline_sprite_zero_hit: false,
         }
     }
 
@@ -393,6 +503,11 @@ impl Ppu {
             self.t = (self.t & 0b1111_1111_1110_0000) | ((value as u16) >> 3);
             self.fine_x = value & 0b0000_0111;
             self.w = true;
+            // Mid-scanline PPUSCROLL writes change the per-pixel render
+            // position's fine X offset. Mark the render position dirty so
+            // the per-pixel renderer re-syncs from `fine_x` on the next
+            // pixel (M25 cycle-accurate rendering).
+            self.render_v_dirty = true;
         } else {
             // Second write: coarse Y → t[5:9], fine Y → t[12:14].
             // Preserve bits 15, 14-12 (fine Y is overwritten), 11-10
@@ -404,6 +519,11 @@ impl Ppu {
                 | (((value as u16) & 0b1111_1000) << 2)
                 | (((value as u16) & 0b0000_0111) << 12);
             self.w = false;
+            // The second PPUSCROLL write changes `t`'s vertical bits, which
+            // only take effect at the next scanline (via the prerender
+            // t→v copy). It does NOT immediately affect the current
+            // scanline's rendering, so we do not mark the render position
+            // dirty here.
         }
     }
 
@@ -426,6 +546,13 @@ impl Ppu {
             self.t = (self.t & 0b1111_1111_0000_0000) | (value as u16);
             self.v = self.t;
             self.w = false;
+            // The second PPUADDR write copies `t` into `v`, which directly
+            // changes the rendering position. Mark the per-pixel render
+            // position dirty so the renderer re-syncs from `v` on the next
+            // pixel — this is how mid-scanline raster effects (e.g. status
+            // bar splits, horizontal scrolling changes) take effect at the
+            // correct pixel (M25 cycle-accurate rendering).
+            self.render_v_dirty = true;
         }
     }
 
@@ -663,6 +790,9 @@ impl Ppu {
                 self.set_vblank(false);
                 self.set_sprite_overflow(false);
                 self.set_sprite_zero_hit(false);
+                // Reset the per-pixel renderer's per-frame latch so sprite
+                // zero hit can trigger again on the next frame (M25).
+                self.scanline_sprite_zero_hit = false;
             }
             _ => {}
         }
@@ -704,6 +834,52 @@ impl Ppu {
             {
                 self.copy_v_t_to_v();
             }
+        }
+
+        nmi
+    }
+
+    /// Advance the PPU by one cycle AND perform per-pixel (cycle-accurate)
+    /// rendering, returning `true` if an NMI should be raised this cycle.
+    ///
+    /// This is the M25 cycle-accurate render entry point. It is identical to
+    /// [`Ppu::step`] but additionally renders one pixel per PPU cycle during
+    /// visible scanlines (0-239, cycles 1-256). `chr_read` supplies
+    /// pattern-table bytes from CHR (owned by the cartridge and accessed via
+    /// the bus) — the PPU's own VRAM and palette RAM are read directly.
+    ///
+    /// When rendering is disabled (PPUMASK show-bg and show-sprites both
+    /// clear), each visible pixel is filled with the universal background
+    /// color, matching the behaviour of the whole-frame [`Ppu::render_frame`]
+    /// path.
+    ///
+    /// Mid-scanline register writes (PPUADDR second write, PPUSCROLL first
+    /// write) set [`Ppu::render_v_dirty`]; the per-pixel renderer re-syncs
+    /// its horizontal output position from `v` on the next pixel so that
+    /// raster effects take effect at the correct pixel.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
+    pub fn step_rendered(&mut self, chr_read: &mut dyn FnMut(u16) -> u8) -> bool {
+        // Run the architectural step (cycle advance, VBlank, scroll
+        // increments) first. The per-pixel rendering happens after, at the
+        // new (cycle, scanline) position.
+        let nmi = self.step();
+
+        // Reset the per-scanline render initialization flag at cycle 0 so
+        // the first pixel output of each scanline takes a fresh snapshot.
+        if self.cycle == 0 {
+            self.scanline_render_initialized = false;
+        }
+
+        // Per-pixel rendering: one pixel per cycle on visible scanlines.
+        // Cycles 1-256 output pixels 0-255. Cycle 0 and cycles 257-340 are
+        // horizontal blank / fetch periods (no pixel output).
+        if self.scanline < SCREEN_HEIGHT as u16
+            && self.cycle >= 1
+            && self.cycle <= SCREEN_WIDTH as u16
+        {
+            self.render_one_pixel(chr_read);
+            self.rendered_this_frame = true;
         }
 
         nmi
@@ -888,6 +1064,18 @@ impl Ppu {
     /// Borrow the per-pixel background pattern buffer (0-3 per pixel).
     pub fn bg_pattern(&self) -> &[u8] {
         &self.bg_pattern
+    }
+    /// Whether the per-pixel (cycle-accurate) renderer produced any output
+    /// during the current frame (M25). Used by [`crate::emulator::EmulatorState::step_frame`]
+    /// to decide whether the framebuffer is already filled or needs a
+    /// fallback whole-frame render.
+    pub fn rendered_this_frame(&self) -> bool {
+        self.rendered_this_frame
+    }
+    /// Reset the `rendered_this_frame` flag at the start of a new frame
+    /// (called by [`crate::emulator::EmulatorState::step_frame`]).
+    pub fn reset_rendered_flag(&mut self) {
+        self.rendered_this_frame = false;
     }
     /// Screen dimensions (width, height) in pixels.
     pub fn screen_size() -> (usize, usize) {

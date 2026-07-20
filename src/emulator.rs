@@ -179,92 +179,191 @@ impl EmulatorState {
     /// NTSC.
     pub fn step_frame(&mut self) -> u32 {
         let mut cpu_cycles: u32 = 0;
-        let mut frame_done = false;
 
-        while !frame_done {
+        // M25: the PPU's per-pixel (cycle-accurate) renderer fills the
+        // framebuffer incrementally during `step_ppu`. We no longer call
+        // `render_frame` at the end of the frame — the framebuffer is
+        // already complete (visible scanlines are filled pixel-by-pixel;
+        // when rendering is disabled, each pixel is the universal bg
+        // color). `rendered_this_frame` is reset here so we can detect
+        // whether any per-pixel output happened.
+        //
+        // Clear the framebuffer to the universal background color first so
+        // that any pixels not covered by the per-pixel path (e.g. when the
+        // PPU starts mid-scanline after a save-state restore and the first
+        // few pixels of scanline 0 are skipped) still have a valid color
+        // instead of stale data.
+        let universal_bg = self.bus.ppu().universal_bg_argb();
+        self.bus.ppu_mut().clear_framebuffer(universal_bg);
+        self.bus.ppu_mut().reset_rendered_flag();
+
+        loop {
             let prev_scanline = self.bus.ppu().scanline();
-
-            // Execute one CPU instruction.
-            let step_cycles = self.cpu.step(&mut self.bus) as u32;
-            cpu_cycles = cpu_cycles.saturating_add(step_cycles);
-
-            // Account for OAM-DMA stall: the bus records 512 cycles when
-            // $4014 is written (inside the CPU step above). Advance the
-            // PPU by the stall time without running more CPU instructions.
-            let dma_cycles = self.bus.take_dma_stall_cycles();
-            cpu_cycles = cpu_cycles.saturating_add(dma_cycles);
-
-            // Advance the APU by the total CPU cycles this iteration
-            // (instruction + DMA stall). The APU runs at CPU clock / 2;
-            // the frame counter advances at the CPU clock rate and clocks
-            // quarter/half-frame signals (M16).
-            let apu_cycles = step_cycles + dma_cycles;
-            self.bus.step_apu(apu_cycles);
-
-            // Poll the APU IRQ line (frame counter or DMC). The 6502 IRQ
-            // is level-triggered, so we set `irq_pending` whenever the APU
-            // flag is set; the CPU services it at the next instruction
-            // boundary if the I flag is clear.
-            if self.bus.apu_irq_pending() {
-                self.cpu.irq_pending = true;
-            }
-
-            // Poll the cartridge mapper IRQ line (e.g. MMC3 IRQ counter).
-            // Like the APU IRQ, the 6502 IRQ is level-triggered, so we set
-            // `irq_pending` whenever the mapper flag is set; the CPU
-            // services it at the next instruction boundary if the I flag
-            // is clear. The game's IRQ handler clears the flag by writing
-            // to the mapper's IRQ-disable register (e.g. $E000 for MMC3).
-            if self.bus.cart_irq_pending() {
-                self.cpu.irq_pending = true;
-            }
-
-            // Generate audio samples at 44.1 kHz from the APU output.
-            // One sample every ~40.585 CPU cycles.
-            self.sample_accumulator += apu_cycles as f32;
-            while self.sample_accumulator >= CPU_CYCLES_PER_SAMPLE {
-                self.sample_accumulator -= CPU_CYCLES_PER_SAMPLE;
-                self.audio_buffer.push(self.bus.apu().output());
-            }
-
-            // Advance the PPU by 3× the total CPU cycles this iteration
-            // (instruction + DMA stall), maintaining the 1:3 CPU:PPU clock
-            // ratio. Step in chunks of at most one scanline (341 cycles)
-            // so the 261→0 wrap can be detected even when a DMA stall
-            // pushes the batch past multiple scanlines.
-            let ppu_cycles = 3 * apu_cycles;
-            let mut remaining = ppu_cycles;
-            while remaining > 0 {
-                let chunk = remaining.min(CYCLES_PER_SCANLINE as u32);
-                self.bus.step_ppu(chunk);
-                remaining -= chunk;
-
-                // Consume any latched NMI request after each chunk.
-                if self.bus.take_nmi_request() {
-                    self.cpu.nmi_pending = true;
-                }
-
-                // Detect frame completion: the PPU scanline wrapped from
-                // the prerender scanline (261) to scanline 0 (start of a
-                // new frame). `prev_scanline == SCANLINE_PRERENDER`
-                // guards against breaking on the very first iteration
-                // when the PPU starts at scanline 0.
-                let curr_scanline = self.bus.ppu().scanline();
-                if curr_scanline == 0 && prev_scanline == SCANLINE_PRERENDER {
-                    // Any remaining PPU cycles belong to the next frame;
-                    // they are discarded here and the PPU resumes a few
-                    // cycles into scanline 0 on the next `step_frame`.
-                    frame_done = true;
-                    break;
-                }
+            let (tick_cycles, frame_done) = self.step_one_cpu_tick(prev_scanline);
+            cpu_cycles = cpu_cycles.saturating_add(tick_cycles);
+            if frame_done {
+                break;
             }
         }
 
-        // Render the completed frame into the PPU framebuffer. The PPU
-        // state (VRAM, OAM, palette, scroll) reflects the VBlank handler's
-        // setup for this new frame — which is exactly what should be
-        // displayed.
-        self.bus.render_frame();
+        // M25: the per-pixel (cycle-accurate) renderer fills the
+        // framebuffer incrementally during `step_ppu` above. If for some
+        // reason no per-pixel output happened (e.g. the frame ended before
+        // any visible scanline was reached), fall back to the whole-frame
+        // scanline renderer so the framebuffer is never left stale.
+        if !self.bus.ppu().rendered_this_frame() {
+            self.bus.render_frame();
+        }
+
+        cpu_cycles
+    }
+
+    /// Run one CPU instruction plus its PPU/APU/mapper side-effects,
+    /// returning the CPU cycles consumed this tick and whether the frame
+    /// just completed (the PPU scanline wrapped from the prerender
+    /// scanline 261 to scanline 0).
+    ///
+    /// This is the body of the [`step_frame`] loop, extracted so that the
+    /// debugger (M27) can run a single instruction at a time and so that
+    /// [`step_frame_debug`] can check breakpoints between ticks without
+    /// duplicating the per-tick logic.
+    ///
+    /// `prev_scanline` is the PPU scanline observed *before* this tick's
+    /// CPU step; it is used to detect the 261→0 frame-boundary wrap.
+    fn step_one_cpu_tick(&mut self, prev_scanline: u16) -> (u32, bool) {
+        let mut cpu_cycles: u32 = 0;
+
+        // Execute one CPU instruction.
+        let step_cycles = self.cpu.step(&mut self.bus) as u32;
+        cpu_cycles = cpu_cycles.saturating_add(step_cycles);
+
+        // Account for OAM-DMA stall: the bus records 512 cycles when
+        // $4014 is written (inside the CPU step above). Advance the
+        // PPU by the stall time without running more CPU instructions.
+        let dma_cycles = self.bus.take_dma_stall_cycles();
+        cpu_cycles = cpu_cycles.saturating_add(dma_cycles);
+
+        // Advance the APU by the total CPU cycles this iteration
+        // (instruction + DMA stall). The APU runs at CPU clock / 2;
+        // the frame counter advances at the CPU clock rate and clocks
+        // quarter/half-frame signals (M16).
+        let apu_cycles = step_cycles + dma_cycles;
+        self.bus.step_apu(apu_cycles);
+
+        // Advance CPU-clocked mapper logic (FME-7 / VRC6 IRQ timers,
+        // VRC6 expansion audio). Mappers without CPU-clocked logic
+        // ignore this.
+        self.bus.clock_cart_cpu(apu_cycles);
+
+        // Poll the APU IRQ line (frame counter or DMC). The 6502 IRQ
+        // is level-triggered, so we set `irq_pending` whenever the APU
+        // flag is set; the CPU services it at the next instruction
+        // boundary if the I flag is clear.
+        if self.bus.apu_irq_pending() {
+            self.cpu.irq_pending = true;
+        }
+
+        // Poll the cartridge mapper IRQ line (e.g. MMC3 IRQ counter).
+        // Like the APU IRQ, the 6502 IRQ is level-triggered, so we set
+        // `irq_pending` whenever the mapper flag is set; the CPU
+        // services it at the next instruction boundary if the I flag
+        // is clear. The game's IRQ handler clears the flag by writing
+        // to the mapper's IRQ-disable register (e.g. $E000 for MMC3).
+        if self.bus.cart_irq_pending() {
+            self.cpu.irq_pending = true;
+        }
+
+        // Generate audio samples at 44.1 kHz from the APU output.
+        // One sample every ~40.585 CPU cycles.
+        self.sample_accumulator += apu_cycles as f32;
+        while self.sample_accumulator >= CPU_CYCLES_PER_SAMPLE {
+            self.sample_accumulator -= CPU_CYCLES_PER_SAMPLE;
+            self.audio_buffer.push(self.bus.apu().output());
+        }
+
+        // Advance the PPU by 3× the total CPU cycles this iteration
+        // (instruction + DMA stall), maintaining the 1:3 CPU:PPU clock
+        // ratio. Step in chunks of at most one scanline (341 cycles)
+        // so the 261→0 wrap can be detected even when a DMA stall
+        // pushes the batch past multiple scanlines.
+        let ppu_cycles = 3 * apu_cycles;
+        let mut remaining = ppu_cycles;
+        let mut frame_done = false;
+        while remaining > 0 {
+            let chunk = remaining.min(CYCLES_PER_SCANLINE as u32);
+            self.bus.step_ppu(chunk);
+            remaining -= chunk;
+
+            // Consume any latched NMI request after each chunk.
+            if self.bus.take_nmi_request() {
+                self.cpu.nmi_pending = true;
+            }
+
+            // Detect frame completion: the PPU scanline wrapped from
+            // the prerender scanline (261) to scanline 0 (start of a
+            // new frame). `prev_scanline == SCANLINE_PRERENDER`
+            // guards against breaking on the very first iteration
+            // when the PPU starts at scanline 0.
+            let curr_scanline = self.bus.ppu().scanline();
+            if curr_scanline == 0 && prev_scanline == SCANLINE_PRERENDER {
+                // Any remaining PPU cycles belong to the next frame;
+                // they are discarded here and the PPU resumes a few
+                // cycles into scanline 0 on the next `step_frame`.
+                frame_done = true;
+                break;
+            }
+        }
+
+        (cpu_cycles, frame_done)
+    }
+
+    /// Run one CPU instruction (with PPU / APU / mapper side-effects) and
+    /// return the CPU cycles consumed. Intended for the debugger's
+    /// single-step (F2) — this does *not* loop until a frame completes and
+    /// does *not* clear the framebuffer or reset the rendered flag.
+    pub fn step_instruction(&mut self) -> u32 {
+        let prev_scanline = self.bus.ppu().scanline();
+        let (cycles, _frame_done) = self.step_one_cpu_tick(prev_scanline);
+        cycles
+    }
+
+    /// Run the emulator forward, stopping when the frame completes *or*
+    /// when `debugger.check_before_step` reports that the debugger wants
+    /// to pause (user paused, single-step consumed, or a breakpoint
+    /// matched). Returns the CPU cycles consumed this call.
+    ///
+    /// When the debugger pauses mid-frame, the framebuffer may be
+    /// partially rendered — the caller should still present it (the
+    /// per-pixel renderer leaves a valid image for every pixel visited so
+    /// far, and the universal-bg clear at the top of this method covers
+    /// the rest).
+    ///
+    /// See: [`crate::debug::CpuDebugger`]
+    pub fn step_frame_debug(&mut self, debugger: &mut crate::debug::CpuDebugger) -> u32 {
+        let mut cpu_cycles: u32 = 0;
+
+        let universal_bg = self.bus.ppu().universal_bg_argb();
+        self.bus.ppu_mut().clear_framebuffer(universal_bg);
+        self.bus.ppu_mut().reset_rendered_flag();
+
+        loop {
+            // Check the debugger before each CPU step. The borrow of
+            // `self.cpu` / `self.bus` here is immutable and ends before
+            // the mutable `step_one_cpu_tick` call below.
+            if debugger.check_before_step(&self.cpu, &self.bus) {
+                break;
+            }
+            let prev_scanline = self.bus.ppu().scanline();
+            let (tick_cycles, frame_done) = self.step_one_cpu_tick(prev_scanline);
+            cpu_cycles = cpu_cycles.saturating_add(tick_cycles);
+            if frame_done {
+                break;
+            }
+        }
+
+        if !self.bus.ppu().rendered_this_frame() {
+            self.bus.render_frame();
+        }
 
         cpu_cycles
     }

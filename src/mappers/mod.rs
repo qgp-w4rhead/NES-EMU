@@ -18,10 +18,14 @@
 
 pub mod axrom;
 pub mod cnrom;
+pub mod fme7;
 pub mod mmc1;
+pub mod mmc2;
 pub mod mmc3;
+pub mod mmc5;
 pub mod nrom;
 pub mod uxrom;
+pub mod vrc6;
 
 use crate::cartridge::CartridgeError;
 
@@ -48,6 +52,14 @@ pub enum MapperState {
     Mmc3(mmc3::Mmc3),
     /// Mapper 7 — AxROM.
     Axrom(axrom::Axrom),
+    /// Mapper 5 — MMC5.
+    Mmc5(mmc5::Mmc5),
+    /// Mapper 9 — MMC2.
+    Mmc2(mmc2::Mmc2),
+    /// Mapper 24 / 26 — VRC6.
+    Vrc6(vrc6::Vrc6),
+    /// Mapper 69 — FME-7.
+    Fme7(fme7::Fme7),
 }
 
 impl MapperState {
@@ -62,6 +74,10 @@ impl MapperState {
             MapperState::Cnrom(m) => Box::new(m),
             MapperState::Mmc3(m) => Box::new(m),
             MapperState::Axrom(m) => Box::new(m),
+            MapperState::Mmc5(m) => Box::new(m),
+            MapperState::Mmc2(m) => Box::new(m),
+            MapperState::Vrc6(m) => Box::new(m),
+            MapperState::Fme7(m) => Box::new(m),
         }
     }
 }
@@ -102,6 +118,15 @@ pub trait Mapper: Send {
     /// Read a byte from the PPU-side CHR address space (`$0000..=$1FFF`).
     fn read_chr(&self, addr: u16) -> u8;
 
+    /// Read a byte from CHR with side effects (e.g. MMC2 bank latching).
+    /// The bus calls this from its CHR-read closure during rendering so
+    /// that PPU pattern-fetches at latch-trigger addresses update the
+    /// active CHR bank. Default delegates to `read_chr` (no side effect);
+    /// MMC2 overrides this to toggle its 4 KB CHR bank latches.
+    fn read_chr_latched(&mut self, addr: u16) -> u8 {
+        self.read_chr(addr)
+    }
+
     /// Write a byte to the PPU-side CHR address space (`$0000..=$1FFF`).
     /// Only meaningful for CHR-RAM carts; CHR-ROM carts ignore writes.
     fn write_chr(&mut self, addr: u16, value: u8);
@@ -128,6 +153,19 @@ pub trait Mapper: Send {
     /// scanline). Used by MMC3 and similar mappers for raster-effect IRQs.
     /// Default is a no-op.
     fn clock_irq(&mut self) {}
+
+    /// Reset the mapper's per-frame scanline counter. Called by the bus at
+    /// the start of each frame (prerender scanline). Used by MMC5 to reset
+    /// its internal scanline counter so the IRQ comparison stays correct
+    /// across frames. Default is a no-op.
+    fn reset_scanline_counter(&mut self) {}
+
+    /// Advance the mapper's CPU-clocked logic by `cpu_cycles` CPU cycles.
+    /// Used by mappers whose IRQ timer runs on the CPU clock (e.g. FME-7's
+    /// 16-bit down-counter). Called by the emulator main loop once per CPU
+    /// step with the number of cycles that step consumed. Default is a
+    /// no-op so non-CPU-clocked mappers need not override this.
+    fn clock_cpu(&mut self, _cpu_cycles: u32) {}
 
     /// Return the current contents of battery-backed PRG-RAM (`$6000-$7FFF`),
     /// or `None` if this cartridge has no battery-backed SRAM.
@@ -214,6 +252,38 @@ pub fn from_ines(
             has_battery,
         ))),
         7 => Ok(Box::new(axrom::Axrom::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        5 => Ok(Box::new(mmc5::Mmc5::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        9 => Ok(Box::new(mmc2::Mmc2::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        24 => Ok(Box::new(vrc6::Vrc6::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+            false,
+        ))),
+        26 => Ok(Box::new(vrc6::Vrc6::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+            true,
+        ))),
+        69 => Ok(Box::new(fme7::Fme7::new(
             prg_rom,
             chr_rom,
             mirroring,

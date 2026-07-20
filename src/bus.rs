@@ -222,6 +222,17 @@ impl Bus {
             .unwrap_or(false)
     }
 
+    /// Advance the cartridge mapper's CPU-clocked logic by `cpu_cycles`
+    /// CPU cycles. Used by mappers whose IRQ timer runs on the CPU clock
+    /// (e.g. FME-7's 16-bit down-counter, VRC6's IRQ timer). Called by the
+    /// emulator main loop once per CPU step with the number of cycles that
+    /// step consumed. Mappers without CPU-clocked logic ignore this.
+    pub fn clock_cart_cpu(&mut self, cpu_cycles: u32) {
+        if let Some(cart) = self.cartridge.as_mut() {
+            cart.clock_cpu(cpu_cycles);
+        }
+    }
+
     /// Render the background layer into the PPU framebuffer.
     ///
     /// Delegates to [`Ppu::render_background`], supplying a CHR-read
@@ -234,9 +245,9 @@ impl Bus {
     /// texture.
     pub fn render_background(&mut self) {
         let ppu = &mut self.ppu;
-        let cart = self.cartridge.as_ref();
-        ppu.render_background(move |addr| match cart {
-            Some(c) => c.read_chr(addr),
+        let mut cart = self.cartridge.as_mut();
+        ppu.render_background(|addr| match cart.as_mut() {
+            Some(c) => c.read_chr_latched(addr),
             None => 0,
         });
     }
@@ -249,9 +260,9 @@ impl Bus {
     /// [`Bus::render_frame`]).
     pub fn render_sprites(&mut self) {
         let ppu = &mut self.ppu;
-        let cart = self.cartridge.as_ref();
-        ppu.render_sprites(move |addr| match cart {
-            Some(c) => c.read_chr(addr),
+        let mut cart = self.cartridge.as_mut();
+        ppu.render_sprites(|addr| match cart.as_mut() {
+            Some(c) => c.read_chr_latched(addr),
             None => 0,
         });
     }
@@ -263,9 +274,9 @@ impl Bus {
     /// texture each frame.
     pub fn render_frame(&mut self) {
         let ppu = &mut self.ppu;
-        let cart = self.cartridge.as_ref();
-        ppu.render_frame(move |addr| match cart {
-            Some(c) => c.read_chr(addr),
+        let mut cart = self.cartridge.as_mut();
+        ppu.render_frame(|addr| match cart.as_mut() {
+            Some(c) => c.read_chr_latched(addr),
             None => 0,
         });
     }
@@ -282,7 +293,17 @@ impl Bus {
     pub fn step_ppu(&mut self, cycles: u32) -> bool {
         let mut nmi = false;
         for _ in 0..cycles {
-            if self.ppu.step() {
+            // M25: use the cycle-accurate per-pixel render path. The CHR
+            // closure routes pattern-table fetches through the cartridge;
+            // the PPU's own VRAM and palette are read directly inside the
+            // renderer. When no cartridge is loaded, CHR reads return 0
+            // (blank pattern table).
+            let mut cart = self.cartridge.as_mut();
+            let mut chr_read = |addr: u16| match cart.as_mut() {
+                Some(c) => c.read_chr_latched(addr),
+                None => 0,
+            };
+            if self.ppu.step_rendered(&mut chr_read) {
                 nmi = true;
             }
             // Clock mapper IRQ counter (MMC3 and similar) on the
@@ -298,6 +319,15 @@ impl Bus {
             {
                 if let Some(cart) = self.cartridge.as_mut() {
                     cart.clock_irq();
+                }
+            }
+
+            // Reset the mapper's per-frame scanline counter at the start
+            // of the prerender scanline (beginning of a new frame). Used
+            // by MMC5 to keep its scanline IRQ comparison correct.
+            if scanline == SCANLINE_PRERENDER && ppu_cycle == 1 {
+                if let Some(cart) = self.cartridge.as_mut() {
+                    cart.reset_scanline_counter();
                 }
             }
         }
@@ -561,6 +591,38 @@ impl Bus {
         let c = self.dma_stall_cycles;
         self.dma_stall_cycles = 0;
         c
+    }
+
+    /// Side-effect-free read of the CPU address space, intended for the
+    /// debug tools (M27 disassembler / memory viewer). Unlike [`Bus::read`],
+    /// this never triggers device side-effects: PPUSTATUS does not clear
+    /// VBlank, OAMDATA does not advance OAMADDR, PPUDATA does not advance
+    /// the VRAM address or refill the buffer, and mapper read-side-effects
+    /// (e.g. MMC2 CHR-bank latching) do not fire.
+    ///
+    /// For RAM and cartridge PRG/PRG-RAM (the regions actually disassembled
+    /// in practice) the returned value matches [`Bus::read`]. For PPU / APU
+    /// / I/O register space the returned value is a best-effort snapshot
+    /// (open-bus latch or 0) — disassembling code from `$2000+` is
+    /// meaningless anyway, but the function must not crash or mutate state.
+    pub fn peek(&self, addr: u16) -> u8 {
+        match addr {
+            // RAM + mirrors: pure read, no side-effects.
+            0x0000..=0x1FFF => self.ram[(addr & RAM_MASK) as usize],
+            // PPU / APU / I/O registers: return a safe snapshot without
+            // touching device state. PPU open-bus / status bits are not
+            // safely readable without &mut, so report 0 here — the
+            // disassembler never decodes from this range in practice.
+            0x2000..=0x3FFF => 0,
+            0x4000..=0x401F => 0,
+            // Cartridge space: PRG-ROM / PRG-RAM reads have no read
+            // side-effects on any supported mapper (MMC2 latching lives on
+            // the CHR side, routed via `read_chr_latched`, not `read_prg`).
+            0x4020..=0xFFFF => match &self.cartridge {
+                Some(cart) => cart.read_prg(addr),
+                None => 0,
+            },
+        }
     }
 
     /// Borrow the internal CPU RAM (2 KB). Used by the save state system

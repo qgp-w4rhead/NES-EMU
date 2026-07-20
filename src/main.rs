@@ -27,6 +27,7 @@ use nes_emu::audio::AudioOutput;
 use nes_emu::battery;
 use nes_emu::cartridge::Cartridge;
 use nes_emu::config::Config;
+use nes_emu::debug::{print_debug_overlay, CpuDebugger};
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::InputMapper;
 use nes_emu::video::Video;
@@ -207,6 +208,15 @@ fn run() -> Result<(), String> {
 
     let mut mapper = InputMapper::from_config(&config);
 
+    // CPU debugger (M27). Holds breakpoints and pause / step state. The
+    // main loop drives it via F1 (pause/resume), F2 (single-step while
+    // paused), and F3 (toggle run-to-breakpoint). While paused, a
+    // console "overlay" — register snapshot + disassembly window — is
+    // printed to stderr each frame so the user can inspect emulator
+    // state without a GUI toolkit. A graphical egui overlay lands in
+    // M28 alongside the PPU / memory viewers.
+    let mut debugger = CpuDebugger::new();
+
     'running: loop {
         // Drain all pending events each frame; ESC, window-close, and the
         // conventional 'Q' key all terminate the loop. NES controller
@@ -226,7 +236,49 @@ fn run() -> Result<(), String> {
                 } => break 'running,
                 Event::KeyDown {
                     keycode: Some(k), ..
-                } => mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true),
+                } => {
+                    // Intercept debugger hotkeys (M27) before routing to
+                    // the joypad — F1/F2/F3 are not NES controller buttons.
+                    match k {
+                        Keycode::F1 => {
+                            debugger.toggle_pause();
+                            eprintln!(
+                                "nes-emu: debugger {}",
+                                if debugger.is_paused() {
+                                    "paused"
+                                } else {
+                                    "resumed"
+                                }
+                            );
+                        }
+                        Keycode::F2 => {
+                            if debugger.is_paused() {
+                                debugger.request_step();
+                            } else {
+                                eprintln!(
+                                    "nes-emu: F2 single-step ignored (debugger not paused; press F1 first)"
+                                );
+                            }
+                        }
+                        Keycode::F3 => {
+                            debugger.toggle_run_to_breakpoint();
+                            eprintln!(
+                                "nes-emu: run-to-breakpoint {}",
+                                if debugger.run_to_breakpoint() {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            );
+                            if debugger.run_to_breakpoint() && debugger.breakpoints().is_empty() {
+                                eprintln!(
+                                    "nes-emu: no breakpoints set — add some via the debugger API to use run-to-breakpoint"
+                                );
+                            }
+                        }
+                        _ => mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true),
+                    }
+                }
                 Event::KeyUp {
                     keycode: Some(k), ..
                 } => mapper.handle_key(emulator.bus_mut().joypad_mut(), k, false),
@@ -292,11 +344,25 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Step one full NTSC frame (CPU + PPU + APU in lockstep), then
-        // present the rendered framebuffer and queue the audio samples.
-        // SDL2's vsynced renderer paces the loop to the monitor refresh
-        // rate (~60 Hz).
-        emulator.step_frame();
+        // Step the emulator. When the debugger is paused, we do not advance
+        // the machine — we just re-present the current framebuffer so the
+        // window stays responsive. A pending single-step (F2) runs exactly
+        // one CPU instruction and then re-pauses. When not paused, we run
+        // a full frame via `step_frame_debug`, which stops early if a
+        // breakpoint matches (run-to-breakpoint mode, F3).
+        if debugger.is_paused() {
+            if debugger.consume_step_request() {
+                emulator.step_instruction();
+            }
+        } else {
+            emulator.step_frame_debug(&mut debugger);
+            if debugger.is_paused() {
+                // A breakpoint fired mid-frame.
+                if let Some(bp) = debugger.last_hit() {
+                    eprintln!("nes-emu: breakpoint hit: {bp}");
+                }
+            }
+        }
         video.present(emulator.framebuffer())?;
         let samples = emulator.take_audio_samples();
         if !samples.is_empty() {
@@ -304,6 +370,13 @@ fn run() -> Result<(), String> {
             // audio device is slow), drop the samples rather than blocking
             // the emulation loop.
             let _ = audio.push_samples(&samples);
+        }
+
+        // While paused, render a console "overlay" — register snapshot +
+        // disassembly window — to stderr each frame. This is the M27
+        // debug overlay (a graphical egui overlay lands in M28).
+        if debugger.is_paused() {
+            print_debug_overlay(&emulator, &debugger);
         }
     }
 

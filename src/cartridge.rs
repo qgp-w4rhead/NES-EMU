@@ -198,6 +198,13 @@ impl Cartridge {
         self.mapper.read_chr(addr)
     }
 
+    /// Read a byte from CHR with side effects (MMC2 bank latching). Called
+    /// by the bus during rendering so PPU pattern-fetches at latch-trigger
+    /// addresses update the active CHR bank.
+    pub fn read_chr_latched(&mut self, addr: u16) -> u8 {
+        self.mapper.read_chr_latched(addr)
+    }
+
     /// Write a byte to the PPU-side CHR address space (`$0000..=$1FFF`).
     pub fn write_chr(&mut self, addr: u16, value: u8) {
         self.mapper.write_chr(addr, value);
@@ -237,6 +244,18 @@ impl Cartridge {
     /// the PPU A12 line rises during rendering.
     pub fn clock_irq(&mut self) {
         self.mapper.clock_irq();
+    }
+
+    /// Reset the mapper's per-frame scanline counter. Called by the bus at
+    /// the start of each frame (prerender scanline).
+    pub fn reset_scanline_counter(&mut self) {
+        self.mapper.reset_scanline_counter();
+    }
+
+    /// Advance the mapper's CPU-clocked logic by `cpu_cycles` CPU cycles.
+    /// Used by mappers whose IRQ timer runs on the CPU clock (FME-7, VRC6).
+    pub fn clock_cpu(&mut self, cpu_cycles: u32) {
+        self.mapper.clock_cpu(cpu_cycles);
     }
 
     /// Capture the mapper's full internal state as a [`MapperState`]
@@ -363,11 +382,11 @@ mod tests {
 
     #[test]
     fn unsupported_mapper_returns_error() {
-        // mapper 5 (MMC5) — not yet implemented.
-        let bytes = make_ines(1, 1, 0b0101_0000, 0, 0);
+        // mapper 11 (Color Dreams) — not yet implemented.
+        let bytes = make_ines(1, 1, 0b1011_0000, 0, 0);
         assert!(matches!(
             Cartridge::from_bytes(&bytes),
-            Err(CartridgeError::UnsupportedMapper(5))
+            Err(CartridgeError::UnsupportedMapper(11))
         ));
     }
 

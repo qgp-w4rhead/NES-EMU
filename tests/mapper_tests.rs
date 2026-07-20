@@ -1067,3 +1067,382 @@ fn axrom_cart_loads_in_emulator() {
     let emu = EmulatorState::new(cart);
     assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 7);
 }
+
+// =====================================================================
+// M26 — Advanced mappers: MMC5 (5), MMC2 (9), VRC6 (24/26), FME-7 (69)
+// =====================================================================
+
+/// Build an iNES image with an arbitrary mapper number (up to 255) and
+/// PRG/CHR bank counts. PRG is filled so each 8 KB bank has a unique byte
+/// (bank index); CHR is filled so each 1 KB bank has a unique byte.
+fn make_ines_m26(mapper: u16, prg_8k_banks: u8, chr_1k_banks: u8, flags6: u8) -> Vec<u8> {
+    let prg_size = prg_8k_banks as usize * 8 * 1024;
+    let chr_size = chr_1k_banks as usize * 1024;
+    let mut buf = Vec::with_capacity(HEADER_SIZE + prg_size + chr_size);
+    buf.extend_from_slice(&INES_MAGIC);
+    // PRG in 16KB units: ceil(prg_8k_banks / 2).
+    buf.push(prg_8k_banks.div_ceil(2).max(1));
+    // CHR in 8KB units: ceil(chr_1k_banks / 8).
+    buf.push(chr_1k_banks.div_ceil(8));
+    // flags6: low nibble = mirroring/control, high nibble = mapper low.
+    buf.push(flags6 | (((mapper & 0x0F) as u8) << 4));
+    // flags7: high nibble = mapper high.
+    buf.push(((mapper >> 4) as u8) << 4);
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.resize(HEADER_SIZE + prg_size + chr_size, 0);
+    for i in 0..prg_size {
+        buf[HEADER_SIZE + i] = (i / (8 * 1024)) as u8;
+    }
+    for i in 0..chr_size {
+        buf[HEADER_SIZE + prg_size + i] = (i / 1024) as u8;
+    }
+    buf
+}
+
+// ---- MMC2 (mapper 9) ------------------------------------------------
+
+#[test]
+fn mmc2_selected_for_mapper_9() {
+    let bytes = make_ines_m26(9, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load MMC2 cart");
+    assert_eq!(cart.header.mapper_number, 9);
+}
+
+#[test]
+fn mmc2_prg_banking_via_bus() {
+    // 4 × 8KB PRG. Default: $8000 = bank 0, $A000-$FFFF = fixed last 24KB
+    // (banks 1,2,3).
+    let bytes = make_ines_m26(9, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xA000), 0x01);
+    assert_eq!(bus.read(0xE000), 0x03);
+    // Switch $8000 to bank 2 via $A000.
+    bus.write(0xA000, 0x02);
+    assert_eq!(bus.read(0x8000), 0x02);
+    // Fixed region unchanged.
+    assert_eq!(bus.read(0xA000), 0x01);
+}
+
+#[test]
+fn mmc2_chr_latching_via_cart() {
+    // CHR latching is a PPU-read side-effect; exercise the bank-register
+    // side via the cartridge directly. MMC2 uses 4 KB CHR banks, so with
+    // 8 × 1 KB CHR (2 × 4 KB banks), R0=1 selects 4 KB bank 1 whose first
+    // byte is the 1 KB bank-4 fill (0x04).
+    let bytes = make_ines_m26(9, 4, 8, 0);
+    let mut cart = Cartridge::from_bytes(&bytes).expect("load");
+    // Default R0=0 → 4 KB bank 0 → first byte 0x00.
+    assert_eq!(cart.read_chr(0x0000), 0x00);
+    // R0=1 → 4 KB bank 1 → first byte 0x04.
+    cart.write_prg(0xB000, 0x01);
+    assert_eq!(cart.read_chr(0x0000), 0x04);
+    // R0=0 again → 4 KB bank 0.
+    cart.write_prg(0xB000, 0x00);
+    assert_eq!(cart.read_chr(0x0000), 0x00);
+}
+
+#[test]
+fn mmc2_chr_latch_side_effect_via_read_chr_latched() {
+    // The bus calls read_chr_latched (not read_chr) during rendering so
+    // that PPU pattern-fetches at latch-trigger addresses update the
+    // active CHR bank. Verify the side-effect fires through the cartridge
+    // API.
+    // Use 16 × 1KB CHR (4 × 4KB banks) for clear distinction between
+    // banks: R0=1 → 4KB bank 1 → byte 0x04, R1=2 → 4KB bank 2 → byte 0x08.
+    let bytes = make_ines_m26(9, 4, 16, 0);
+    let mut cart = Cartridge::from_bytes(&bytes).expect("load");
+    cart.write_prg(0xB000, 0x01); // R0 = 1 → 4KB bank 1 → byte 0x04
+    cart.write_prg(0xB001, 0x02); // R1 = 2 → 4KB bank 2 → byte 0x08
+                                  // Default latch_left = 0 → R0 = bank 1 → byte 0x04.
+    assert_eq!(cart.read_chr_latched(0x0000), 0x04);
+    // Read from $0FE8 (latch trigger) → latch_left = 1 → R1 = bank 2.
+    // The read itself returns the byte at $0FE8 in bank 1, but the latch
+    // side-effect changes the active bank for subsequent reads.
+    let _ = cart.read_chr_latched(0x0FE8);
+    // Now $0000 reads from R1 = 4KB bank 2 → byte 0x08.
+    assert_eq!(cart.read_chr_latched(0x0000), 0x08);
+    // Read from $0FD8 → latch_left = 0 → R0 = bank 1 again.
+    let _ = cart.read_chr_latched(0x0FD8);
+    assert_eq!(cart.read_chr_latched(0x0000), 0x04);
+}
+
+#[test]
+fn mmc2_prg_ram_via_bus() {
+    let bytes = make_ines_m26(9, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0x6000, 0x42);
+    assert_eq!(bus.read(0x6000), 0x42);
+}
+
+#[test]
+fn mmc2_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_m26(9, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 9);
+}
+
+// ---- MMC5 (mapper 5) ------------------------------------------------
+
+#[test]
+fn mmc5_selected_for_mapper_5() {
+    let bytes = make_ines_m26(5, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load MMC5 cart");
+    assert_eq!(cart.header.mapper_number, 5);
+}
+
+#[test]
+fn mmc5_prg_banking_via_bus() {
+    // 4 × 8KB PRG. Default: slots 0-2 = bank 0, slot 3 = fixed last (3).
+    let bytes = make_ines_m26(5, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xE000), 0x03);
+    // Switch slot 0 to bank 2 via $5114.
+    bus.write(0x5114, 0x02);
+    assert_eq!(bus.read(0x8000), 0x02);
+}
+
+#[test]
+fn mmc5_hardware_multiplier_via_bus() {
+    let bytes = make_ines_m26(5, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0x5205, 0x07); // A = 7
+    bus.write(0x5206, 0x09); // B = 9 → product 63 = 0x003F
+    assert_eq!(bus.read(0x5205), 0x3F);
+    assert_eq!(bus.read(0x5206), 0x00);
+}
+
+#[test]
+fn mmc5_prm_ram_via_bus() {
+    let bytes = make_ines_m26(5, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Enable PRG-RAM writes ($5102 = 0b11).
+    bus.write(0x5102, 0x02);
+    bus.write(0x5103, 0x01);
+    bus.write(0x6000, 0xAB);
+    assert_eq!(bus.read(0x6000), 0xAB);
+    // Bank-switch the $6000 window via $5113 and verify isolation.
+    bus.write(0x5113, 0x01);
+    bus.write(0x6000, 0xCD);
+    assert_eq!(bus.read(0x6000), 0xCD);
+    bus.write(0x5113, 0x00);
+    assert_eq!(bus.read(0x6000), 0xAB);
+}
+
+#[test]
+fn mmc5_mirroring_switchable_via_bus() {
+    let bytes = make_ines_m26(5, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Default horizontal from header.
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+    // $5105 = 0x50 → vertical.
+    bus.write(0x5105, 0x50);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+}
+
+#[test]
+fn mmc5_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_m26(5, 4, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 5);
+}
+
+// ---- VRC6 (mapper 24) -----------------------------------------------
+
+#[test]
+fn vrc6_selected_for_mapper_24() {
+    let bytes = make_ines_m26(24, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load VRC6 cart");
+    assert_eq!(cart.header.mapper_number, 24);
+}
+
+#[test]
+fn vrc6_prg_banking_via_bus() {
+    // 8 × 8KB PRG. Default: 16k bank 0 at $8000-$BFFF, 8k bank 0 at $C000,
+    // fixed last 8k (bank 7) at $E000.
+    let bytes = make_ines_m26(24, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xBFFF), 0x01);
+    assert_eq!(bus.read(0xC000), 0x00);
+    assert_eq!(bus.read(0xE000), 0x07);
+    // 16k bank 2 → 8k banks 4,5 at $8000-$BFFF.
+    bus.write(0x8000, 0x02);
+    assert_eq!(bus.read(0x8000), 0x04);
+    assert_eq!(bus.read(0xBFFF), 0x05);
+    // 8k bank 3 at $C000.
+    bus.write(0xC000, 0x03);
+    assert_eq!(bus.read(0xC000), 0x03);
+}
+
+#[test]
+fn vrc6_chr_banking_via_bus() {
+    let bytes = make_ines_m26(24, 8, 16, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0xD000, 0x02); // CHR 0 = 2
+    bus.write(0xE003, 0x0F); // CHR 7 = 15
+    {
+        let cart = bus.cartridge().expect("cart");
+        assert_eq!(cart.read_chr(0x0000), 0x02);
+        assert_eq!(cart.read_chr(0x1FFF), 0x0F);
+    }
+}
+
+#[test]
+fn vrc6_mirroring_switchable_via_bus() {
+    let bytes = make_ines_m26(24, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // flags6=0 → horizontal mirroring from header.
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+    // $B003 bit 0 = 0 → vertical.
+    bus.write(0xB003, 0x00);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+    // $B003 bit 0 = 1 → horizontal.
+    bus.write(0xB003, 0x01);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn vrc6_prg_ram_via_bus() {
+    let bytes = make_ines_m26(24, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0x6000, 0x55);
+    assert_eq!(bus.read(0x6000), 0x55);
+}
+
+#[test]
+fn vrc6_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_m26(24, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 24);
+}
+
+#[test]
+fn vrc6_mapper_26_loads() {
+    let bytes = make_ines_m26(26, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load VRC6b cart");
+    assert_eq!(cart.header.mapper_number, 26);
+}
+
+// ---- FME-7 (mapper 69) ----------------------------------------------
+
+#[test]
+fn fme7_selected_for_mapper_69() {
+    let bytes = make_ines_m26(69, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load FME-7 cart");
+    assert_eq!(cart.header.mapper_number, 69);
+}
+
+#[test]
+fn fme7_prg_banking_via_bus() {
+    // 8 × 8KB PRG. Default: all PRG bank regs = 0 → bank 0 everywhere.
+    let bytes = make_ines_m26(69, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xE000), 0x00);
+    // Command 8 (PRG 0) = bank 2.
+    bus.write(0x8000, 0x08);
+    bus.write(0x8001, 0x02);
+    assert_eq!(bus.read(0x8000), 0x02);
+    // Command 11 (PRG 3) = bank 5.
+    bus.write(0x8000, 0x0B);
+    bus.write(0x8001, 0x05);
+    assert_eq!(bus.read(0xE000), 0x05);
+}
+
+#[test]
+fn fme7_chr_banking_via_bus() {
+    let bytes = make_ines_m26(69, 8, 16, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Command 0 (CHR 0) = 2.
+    bus.write(0x8000, 0x00);
+    bus.write(0x8001, 0x02);
+    // Command 7 (CHR 7) = 15.
+    bus.write(0x8000, 0x07);
+    bus.write(0x8001, 0x0F);
+    {
+        let cart = bus.cartridge().expect("cart");
+        assert_eq!(cart.read_chr(0x0000), 0x02);
+        assert_eq!(cart.read_chr(0x1FFF), 0x0F);
+    }
+}
+
+#[test]
+fn fme7_mirroring_switchable_via_bus() {
+    let bytes = make_ines_m26(69, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // flags6=0 → horizontal mirroring from header.
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+    // Command 12 = 0 → vertical.
+    bus.write(0x8000, 0x0C);
+    bus.write(0x8001, 0x00);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+    // Command 12 = 1 → horizontal.
+    bus.write(0x8001, 0x01);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn fme7_prg_ram_via_bus() {
+    let bytes = make_ines_m26(69, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // PRG-RAM disabled by default.
+    bus.write(0x6000, 0x42);
+    assert_eq!(bus.read(0x6000), 0x00);
+    // Command 13 = 0x80 → enable PRG-RAM.
+    bus.write(0x8000, 0x0D);
+    bus.write(0x8001, 0x80);
+    bus.write(0x6000, 0x42);
+    assert_eq!(bus.read(0x6000), 0x42);
+}
+
+#[test]
+fn fme7_irq_via_cart() {
+    // The FME-7 IRQ is CPU-clocked; exercise it via the cartridge directly.
+    let bytes = make_ines_m26(69, 8, 8, 0);
+    let mut cart = Cartridge::from_bytes(&bytes).expect("load");
+    // Latch = 0x0003 via command 14 (low then high).
+    cart.write_prg(0x8000, 0x0E);
+    cart.write_prg(0x8001, 0x03);
+    cart.write_prg(0x8000, 0x0E);
+    cart.write_prg(0x8001, 0x00);
+    // Enable via command 15 bit 0 (reloads counter to 3).
+    cart.write_prg(0x8000, 0x0F);
+    cart.write_prg(0x8001, 0x01);
+    assert!(!cart.irq_pending());
+    // 3 cycles: 3→2→1→0 (no fire). 1 more: 0→reload+fire.
+    cart.clock_cpu(3);
+    assert!(!cart.irq_pending());
+    cart.clock_cpu(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn fme7_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_m26(69, 8, 8, 0);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 69);
+}
