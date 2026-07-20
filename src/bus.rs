@@ -608,9 +608,16 @@ impl Bus {
     }
 
     /// Write to cartridge space (`$4020-$FFFF`).
+    ///
+    /// After the write, the PPU's nametable mirroring is re-synced from the
+    /// cartridge — mappers like MMC1 can change mirroring at runtime via
+    /// register writes, and the PPU must reflect the new mode immediately.
     fn cart_write(&mut self, addr: u16, value: u8) {
         if let Some(cart) = self.cartridge.as_mut() {
             cart.write_prg(addr, value);
+        }
+        if let Some(m) = self.cartridge.as_ref().map(|c| c.mirror_mode()) {
+            self.ppu.set_mirroring(m);
         }
     }
 }

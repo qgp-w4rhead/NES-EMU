@@ -16,6 +16,7 @@
 //! dead-code warnings at the module level.
 #![allow(dead_code)]
 
+pub mod mmc1;
 pub mod nrom;
 
 use crate::cartridge::CartridgeError;
@@ -33,8 +34,10 @@ pub enum Mirroring {
     /// (requires extra VRAM on the cartridge).
     FourScreen,
     /// Single-screen mirroring — only one nametable is visible at all four
-    /// slots (used by e.g. AxROM).
-    SingleScreen,
+    /// slots. The `u8` selects which nametable (0-3) is visible. Used by
+    /// MMC1 (1ScA=0, 1ScB=1) and AxROM (0-3). See:
+    /// https://www.nesdev.org/wiki/Mirroring
+    SingleScreen(u8),
 }
 
 /// The mapper trait — every board type implements this.
@@ -82,6 +85,12 @@ pub fn from_ines(
 ) -> Result<Box<dyn Mapper>, CartridgeError> {
     match mapper_number {
         0 => Ok(Box::new(nrom::Nrom::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        1 => Ok(Box::new(mmc1::Mmc1::new(
             prg_rom,
             chr_rom,
             mirroring,

@@ -755,7 +755,7 @@ impl Ppu {
             Mirroring::Horizontal => nt >> 1, // NT 0,1 → 0; NT 2,3 → 1
             Mirroring::Vertical => nt & 1,    // NT 0,2 → 0; NT 1,3 → 1
             Mirroring::FourScreen => nt,      // all four unique
-            Mirroring::SingleScreen => 0,     // all map to NT 0
+            Mirroring::SingleScreen(nt) => (nt & 3) as usize, // all map to one NT
         };
         phys * 0x400 + offset
     }

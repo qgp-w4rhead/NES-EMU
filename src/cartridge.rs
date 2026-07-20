@@ -314,11 +314,11 @@ mod tests {
 
     #[test]
     fn unsupported_mapper_returns_error() {
-        // mapper 1 (MMC1) — not yet implemented at M2.
-        let bytes = make_ines(1, 1, 0b0001_0000, 0, 0);
+        // mapper 2 (UxROM) — not yet implemented (M19).
+        let bytes = make_ines(1, 1, 0b0010_0000, 0, 0);
         assert!(matches!(
             Cartridge::from_bytes(&bytes),
-            Err(CartridgeError::UnsupportedMapper(1))
+            Err(CartridgeError::UnsupportedMapper(2))
         ));
     }
 

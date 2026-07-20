@@ -33,7 +33,7 @@ fn make_cart(mirroring: Mirroring) -> Cartridge {
         Mirroring::Vertical => 0b0000_0001,
         Mirroring::Horizontal => 0b0000_0000,
         Mirroring::FourScreen => 0b0000_1000,
-        Mirroring::SingleScreen => 0b0000_0000, // not standard for NROM
+        Mirroring::SingleScreen(_) => 0b0000_0000, // not standard for NROM
     };
     bytes.push(flags6);
     bytes.push(0);
