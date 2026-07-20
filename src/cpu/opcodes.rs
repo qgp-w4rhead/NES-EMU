@@ -844,8 +844,8 @@ impl Cpu {
     // ---- helper: read a 16-bit interrupt vector ----------------------
 
     /// Read a little-endian 16-bit vector from CPU address space (used by
-    /// BRK here; NMI/IRQ/RESET reuse this in M6).
-    fn read_vector(&self, bus: &Bus, addr: u16) -> u16 {
+    /// BRK here; NMI/IRQ/RESET reuse this from `mod.rs`).
+    pub(crate) fn read_vector(&self, bus: &Bus, addr: u16) -> u16 {
         let lo = bus.read(addr) as u16;
         let hi = bus.read(addr.wrapping_add(1)) as u16;
         lo | (hi << 8)

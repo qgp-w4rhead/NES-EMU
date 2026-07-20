@@ -5,8 +5,9 @@
 //! The NES variant lacks decimal mode (the D flag exists but has no effect
 //! on arithmetic). M4 covered the register file, flag helpers, and all 13
 //! addressing modes. M5 adds the complete official opcode set with correct
-//! cycle costs (including page-crossing penalties). Interrupt handling
-//! (NMI / IRQ / RESET) lands in M6.
+//! cycle costs (including page-crossing penalties). M6 adds interrupt
+//! handling (NMI / IRQ / RESET) with correct vector fetches and stack
+//! push sequence, plus `nestest.nes` automation-mode validation.
 //!
 //! # Register file
 //!
@@ -81,14 +82,25 @@ pub struct Cpu {
     pub pc: u16,
     /// Status flags (P register).
     pub status: u8,
+    /// Pending non-maskable interrupt. Set by an external device (the PPU
+    /// VBlank in M10, or a test harness) and serviced at the start of the
+    /// next [`Cpu::step`]. NMI is non-maskable and always takes priority
+    /// over IRQ.
+    pub nmi_pending: bool,
+    /// Pending maskable interrupt. Set by an external device (APU frame
+    /// counter, mapper IRQ, or a test harness) and serviced at the start of
+    /// the next [`Cpu::step`] only when the I flag is clear.
+    pub irq_pending: bool,
 }
 
 impl Cpu {
     /// Construct a CPU in a simplified power-on state: registers zeroed,
     /// SP at `$FD`, and only the I and U flags set.
     ///
-    /// The real RESET sequence loads PC from `$FFFC/$FFFD` — that is handled
-    /// in M6 when interrupt handling lands.
+    /// This leaves PC at `$0000`; callers should either invoke
+    /// [`Cpu::reset`] to load PC from the RESET vector at `$FFFC/$FFFD`
+    /// (the normal boot path) or set `pc` manually for test harnesses
+    /// such as `nestest` automation mode (PC = `$C000`).
     pub fn new() -> Self {
         Self {
             a: 0,
@@ -97,6 +109,8 @@ impl Cpu {
             sp: 0xFD,
             pc: 0,
             status: flags::U | flags::I,
+            nmi_pending: false,
+            irq_pending: false,
         }
     }
 
@@ -259,10 +273,104 @@ impl Cpu {
     /// Fetch and execute one instruction, returning the number of CPU
     /// cycles consumed (including page-crossing penalties).
     ///
+    /// Before fetching the opcode, any pending interrupt is serviced:
+    /// [`Cpu::nmi_pending`] takes priority (non-maskable), then
+    /// [`Cpu::irq_pending`] is serviced only when the I flag is clear. An
+    /// interrupt service consumes 7 cycles and pushes PC + status onto the
+    /// stack before loading the new PC from the relevant vector.
+    ///
     /// See: https://www.nesdev.org/6502.txt — cycle counts per opcode.
+    /// See: https://www.nesdev.org/wiki/CPU_interrupts
     pub fn step(&mut self, bus: &mut Bus) -> u8 {
+        // NMI is non-maskable and always wins over IRQ.
+        if self.nmi_pending {
+            self.nmi_pending = false;
+            self.nmi(bus);
+            return 7;
+        }
+        // IRQ is masked by the I flag.
+        if self.irq_pending && !self.interrupt_disable() {
+            self.irq_pending = false;
+            self.irq(bus);
+            return 7;
+        }
         let opcode = self.fetch_byte(bus);
         self.execute(bus, opcode)
+    }
+}
+
+/// Vector addresses for each interrupt type.
+///
+/// See: https://www.nesdev.org/wiki/CPU_interrupts
+pub mod vectors {
+    /// NMI vector (low byte at `$FFFA`, high byte at `$FFFB`).
+    pub const NMI: u16 = 0xFFFA;
+    /// RESET vector (low byte at `$FFFC`, high byte at `$FFFD`).
+    pub const RESET: u16 = 0xFFFC;
+    /// IRQ / BRK vector (low byte at `$FFFE`, high byte at `$FFFF`).
+    pub const IRQ: u16 = 0xFFFE;
+}
+
+impl Cpu {
+    /// Perform a non-maskable interrupt (NMI). Pushes PC and status (with
+    /// B clear and U set) onto the stack, sets the I flag, and loads PC
+    /// from the NMI vector at `$FFFA/$FFFB`. Consumes 7 CPU cycles.
+    ///
+    /// NMI is non-maskable — it is serviced regardless of the I flag. The
+    /// caller is responsible for timing: on real hardware NMI is asserted
+    /// by the PPU at VBlank and sampled at the end of an instruction.
+    ///
+    /// See: https://www.nesdev.org/wiki/CPU_interrupts#NMI
+    pub fn nmi(&mut self, bus: &mut Bus) {
+        self.service_interrupt(bus, vectors::NMI);
+    }
+
+    /// Perform a maskable interrupt (IRQ). Pushes PC and status (with B
+    /// clear and U set) onto the stack, sets the I flag, and loads PC from
+    /// the IRQ/BRK vector at `$FFFE/$FFFF`. Consumes 7 CPU cycles.
+    ///
+    /// The caller must check the I flag before calling this — on real
+    /// hardware IRQ is masked when I is set. [`Cpu::step`] performs this
+    /// check automatically; direct callers should too.
+    ///
+    /// See: https://www.nesdev.org/wiki/CPU_interrupts#IRQ
+    pub fn irq(&mut self, bus: &mut Bus) {
+        self.service_interrupt(bus, vectors::IRQ);
+    }
+
+    /// Perform the RESET sequence. Loads PC from the RESET vector at
+    /// `$FFFC/$FFFD`, sets the I flag, and resets SP to `$FD`. Does NOT
+    /// push anything onto the stack (RESET does not preserve a return
+    /// address). Consumes 7 CPU cycles on real hardware.
+    ///
+    /// This is the normal boot path: after constructing a [`Cpu`] and
+    /// loading a cartridge into the [`Bus`], call `reset` to point PC at
+    /// the cartridge's entry point.
+    ///
+    /// See: https://www.nesdev.org/wiki/CPU_interrupts#RESET
+    pub fn reset(&mut self, bus: &Bus) {
+        // The 6502 RESET sequence decrements SP by 3 (without pushing) and
+        // loads PC from the RESET vector. We model the end state directly:
+        // SP = $FD, I set, U set, PC from $FFFC/$FFFD.
+        self.sp = 0xFD;
+        self.set_interrupt_disable(true);
+        self.status |= flags::U;
+        self.pc = self.read_vector(bus, vectors::RESET);
+    }
+
+    /// Shared body of NMI and IRQ: push PC (high then low), push status
+    /// (B clear, U set), set I, load PC from `vector`.
+    ///
+    /// The pushed PC is the address of the *next* instruction (the PC value
+    /// at the moment the interrupt is serviced, which is already past the
+    /// last fully-executed instruction). RTI restores this value.
+    fn service_interrupt(&mut self, bus: &mut Bus, vector: u16) {
+        self.push_pc(bus, self.pc);
+        // B is cleared for hardware interrupts (NMI/IRQ); U is always set
+        // in the pushed status copy.
+        self.push_status(bus, false);
+        self.set_interrupt_disable(true);
+        self.pc = self.read_vector(bus, vector);
     }
 }
 
