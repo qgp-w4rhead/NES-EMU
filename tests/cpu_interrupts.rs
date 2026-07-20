@@ -64,20 +64,20 @@ fn cpu_at_pc0(sp: u8) -> Cpu {
 
 #[test]
 fn reset_loads_pc_from_fffc_vector() {
-    let bus = bus_with_vectors(&[], 0x0000, 0xABCD, 0x0000);
+    let mut bus = bus_with_vectors(&[], 0x0000, 0xABCD, 0x0000);
     let mut cpu = Cpu::new();
-    cpu.reset(&bus);
+    cpu.reset(&mut bus);
     assert_eq!(cpu.pc, 0xABCD);
 }
 
 #[test]
 fn reset_sets_sp_to_fd_and_i_flag() {
-    let bus = bus_with_vectors(&[], 0, 0x1234, 0);
+    let mut bus = bus_with_vectors(&[], 0, 0x1234, 0);
     let mut cpu = Cpu::new();
     // Corrupt SP and I first to confirm reset overwrites them.
     cpu.sp = 0x10;
     cpu.set_interrupt_disable(false);
-    cpu.reset(&bus);
+    cpu.reset(&mut bus);
     assert_eq!(cpu.sp, 0xFD);
     assert!(cpu.interrupt_disable());
 }
@@ -91,7 +91,7 @@ fn reset_does_not_push_anything_onto_stack() {
     bus.write(0x01FD, 0x77);
     bus.write(0x01FC, 0x88);
     let mut cpu = Cpu::new();
-    cpu.reset(&bus);
+    cpu.reset(&mut bus);
     assert_eq!(bus.read(0x01FD), 0x77);
     assert_eq!(bus.read(0x01FC), 0x88);
     assert_eq!(cpu.sp, 0xFD);
@@ -99,10 +99,10 @@ fn reset_does_not_push_anything_onto_stack() {
 
 #[test]
 fn reset_sets_u_flag() {
-    let bus = bus_with_vectors(&[], 0, 0x0000, 0);
+    let mut bus = bus_with_vectors(&[], 0, 0x0000, 0);
     let mut cpu = Cpu::new();
     cpu.status = 0;
-    cpu.reset(&bus);
+    cpu.reset(&mut bus);
     assert!(cpu.status & flags::U != 0);
 }
 
@@ -335,7 +335,7 @@ fn nestest_automation_passes_with_zero_errors() {
 /// This confirms our RESET sequence correctly fetches $FFFC/$FFFD.
 #[test]
 fn nestest_reset_vector_is_c004() {
-    let bus = nestest_bus();
+    let mut bus = nestest_bus();
     let reset =
         u16::from(bus.read(vectors::RESET)) | (u16::from(bus.read(vectors::RESET + 1)) << 8);
     assert_eq!(reset, 0xC004, "nestest RESET vector should be $C004");
@@ -344,7 +344,7 @@ fn nestest_reset_vector_is_c004() {
 /// nestest's NMI vector points to $C5AF. Confirms $FFFA/$FFFB fetch logic.
 #[test]
 fn nestest_nmi_vector_is_c5af() {
-    let bus = nestest_bus();
+    let mut bus = nestest_bus();
     let nmi = u16::from(bus.read(vectors::NMI)) | (u16::from(bus.read(vectors::NMI + 1)) << 8);
     assert_eq!(nmi, 0xC5AF, "nestest NMI vector should be $C5AF");
 }
@@ -352,7 +352,7 @@ fn nestest_nmi_vector_is_c5af() {
 /// nestest's IRQ vector points to $C5F4. Confirms $FFFE/$FFFF fetch logic.
 #[test]
 fn nestest_irq_vector_is_c5f4() {
-    let bus = nestest_bus();
+    let mut bus = nestest_bus();
     let irq = u16::from(bus.read(vectors::IRQ)) | (u16::from(bus.read(vectors::IRQ + 1)) << 8);
     assert_eq!(irq, 0xC5F4, "nestest IRQ vector should be $C5F4");
 }

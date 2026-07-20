@@ -186,14 +186,14 @@ impl Cpu {
     // ---- operand fetch ------------------------------------------------
 
     /// Read a byte at PC and advance PC by one.
-    pub(crate) fn fetch_byte(&mut self, bus: &Bus) -> u8 {
+    pub(crate) fn fetch_byte(&mut self, bus: &mut Bus) -> u8 {
         let b = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
         b
     }
 
     /// Read a little-endian 16-bit word at PC and advance PC by two.
-    pub(crate) fn fetch_word(&mut self, bus: &Bus) -> u16 {
+    pub(crate) fn fetch_word(&mut self, bus: &mut Bus) -> u16 {
         let lo = self.fetch_byte(bus) as u16;
         let hi = self.fetch_byte(bus) as u16;
         lo | (hi << 8)
@@ -251,7 +251,7 @@ impl Cpu {
     // ---- operand read/write helpers ----------------------------------
 
     /// Read the operand value for an addressing result.
-    pub(crate) fn read_operand(&self, bus: &Bus, op: Operand) -> u8 {
+    pub(crate) fn read_operand(&self, bus: &mut Bus, op: Operand) -> u8 {
         match op {
             Operand::None => 0,
             Operand::Accumulator => self.a,
@@ -348,7 +348,7 @@ impl Cpu {
     /// the cartridge's entry point.
     ///
     /// See: https://www.nesdev.org/wiki/CPU_interrupts#RESET
-    pub fn reset(&mut self, bus: &Bus) {
+    pub fn reset(&mut self, bus: &mut Bus) {
         // The 6502 RESET sequence decrements SP by 3 (without pushing) and
         // loads PC from the RESET vector. We model the end state directly:
         // SP = $FD, I set, U set, PC from $FFFC/$FFFD.

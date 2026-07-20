@@ -71,7 +71,7 @@ impl Cpu {
     ///
     /// The page-cross flag from the indexed modes is discarded here; opcode
     /// handlers that need it call the `am_*_indexed` helpers directly.
-    pub fn resolve(&mut self, bus: &Bus, mode: AddrMode) -> Operand {
+    pub fn resolve(&mut self, bus: &mut Bus, mode: AddrMode) -> Operand {
         match mode {
             AddrMode::Implied => Operand::None,
             AddrMode::Accumulator => Operand::Accumulator,
@@ -99,31 +99,31 @@ impl Cpu {
     }
 
     /// Zero-page: the operand byte is a zero-page address (`$00..=$FF`).
-    fn am_zero_page(&mut self, bus: &Bus) -> u16 {
+    fn am_zero_page(&mut self, bus: &mut Bus) -> u16 {
         self.fetch_byte(bus) as u16
     }
 
     /// Zero-page,X: `(operand + X) & 0xFF` — wraps within the zero page.
-    fn am_zero_page_x(&mut self, bus: &Bus) -> u16 {
+    fn am_zero_page_x(&mut self, bus: &mut Bus) -> u16 {
         let base = self.fetch_byte(bus);
         base.wrapping_add(self.x) as u16
     }
 
     /// Zero-page,Y: `(operand + Y) & 0xFF` — wraps within the zero page.
-    fn am_zero_page_y(&mut self, bus: &Bus) -> u16 {
+    fn am_zero_page_y(&mut self, bus: &mut Bus) -> u16 {
         let base = self.fetch_byte(bus);
         base.wrapping_add(self.y) as u16
     }
 
     /// Absolute: the 16-bit operand is the effective address.
-    pub(crate) fn am_absolute(&mut self, bus: &Bus) -> u16 {
+    pub(crate) fn am_absolute(&mut self, bus: &mut Bus) -> u16 {
         self.fetch_word(bus)
     }
 
     /// Absolute,X: `operand + X` (16-bit wraparound). Returns the effective
     /// address and whether the index crossed a page boundary (penalty cycle
     /// applied by read opcodes in [`super::opcodes`]).
-    pub(crate) fn am_absolute_x(&mut self, bus: &Bus) -> (u16, bool) {
+    pub(crate) fn am_absolute_x(&mut self, bus: &mut Bus) -> (u16, bool) {
         let base = self.fetch_word(bus);
         let eff = base.wrapping_add(self.x as u16);
         (eff, (base & 0xFF00) != (eff & 0xFF00))
@@ -131,7 +131,7 @@ impl Cpu {
 
     /// Absolute,Y: `operand + Y` (16-bit wraparound). Returns the effective
     /// address and page-cross flag.
-    pub(crate) fn am_absolute_y(&mut self, bus: &Bus) -> (u16, bool) {
+    pub(crate) fn am_absolute_y(&mut self, bus: &mut Bus) -> (u16, bool) {
         let base = self.fetch_word(bus);
         let eff = base.wrapping_add(self.y as u16);
         (eff, (base & 0xFF00) != (eff & 0xFF00))
@@ -145,7 +145,7 @@ impl Cpu {
     /// (not `$3100`).
     ///
     /// See: https://www.nesdev.org/6502.txt — "JMP indirect" bug.
-    pub(crate) fn am_indirect(&mut self, bus: &Bus) -> u16 {
+    pub(crate) fn am_indirect(&mut self, bus: &mut Bus) -> u16 {
         let ptr = self.fetch_word(bus);
         let lo = bus.read(ptr);
         // High byte comes from the same page (low byte wraps within it).
@@ -159,7 +159,7 @@ impl Cpu {
     /// The pointer location is `(operand + X) & 0xFF` (wraps in zero page).
     /// The 16-bit pointer is read from two consecutive zero-page addresses
     /// (the second also wraps within zero page).
-    pub(crate) fn am_indirect_x(&mut self, bus: &Bus) -> u16 {
+    pub(crate) fn am_indirect_x(&mut self, bus: &mut Bus) -> u16 {
         let zp = self.fetch_byte(bus);
         let ptr = zp.wrapping_add(self.x);
         let lo = bus.read(ptr as u16);
@@ -173,7 +173,7 @@ impl Cpu {
     /// `operand+1` (the second wraps within zero page), then Y is added
     /// (16-bit wraparound). Returns the effective address and page-cross
     /// flag.
-    pub(crate) fn am_indirect_y(&mut self, bus: &Bus) -> (u16, bool) {
+    pub(crate) fn am_indirect_y(&mut self, bus: &mut Bus) -> (u16, bool) {
         let zp = self.fetch_byte(bus);
         let lo = bus.read(zp as u16);
         let hi = bus.read(zp.wrapping_add(1) as u16);
@@ -184,7 +184,7 @@ impl Cpu {
 
     /// Relative: branch target = PC (after fetching the offset byte) plus
     /// the signed offset. The offset is treated as a signed 8-bit value.
-    pub(crate) fn am_relative(&mut self, bus: &Bus) -> u16 {
+    pub(crate) fn am_relative(&mut self, bus: &mut Bus) -> u16 {
         let offset = self.fetch_byte(bus) as i8;
         self.pc.wrapping_add(offset as u16)
     }

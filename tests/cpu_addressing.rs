@@ -95,20 +95,20 @@ fn set_nz_sets_both_flags_from_value() {
 
 #[test]
 fn implied_returns_none_and_does_not_advance_pc() {
-    let bus = Bus::new();
+    let mut bus = Bus::new();
     let mut cpu = Cpu::new();
     cpu.pc = 0x0123;
-    let op = cpu.resolve(&bus, AddrMode::Implied);
+    let op = cpu.resolve(&mut bus, AddrMode::Implied);
     assert_eq!(op, Operand::None);
     assert_eq!(cpu.pc, 0x0123);
 }
 
 #[test]
 fn accumulator_returns_accumulator_and_does_not_advance_pc() {
-    let bus = Bus::new();
+    let mut bus = Bus::new();
     let mut cpu = Cpu::new();
     cpu.pc = 0x0123;
-    let op = cpu.resolve(&bus, AddrMode::Accumulator);
+    let op = cpu.resolve(&mut bus, AddrMode::Accumulator);
     assert_eq!(op, Operand::Accumulator);
     assert_eq!(cpu.pc, 0x0123);
 }
@@ -117,10 +117,10 @@ fn accumulator_returns_accumulator_and_does_not_advance_pc() {
 
 #[test]
 fn immediate_returns_pc_then_advances_one() {
-    let bus = Bus::new();
+    let mut bus = Bus::new();
     let mut cpu = Cpu::new();
     cpu.pc = 0x0200;
-    let op = cpu.resolve(&bus, AddrMode::Immediate);
+    let op = cpu.resolve(&mut bus, AddrMode::Immediate);
     assert_eq!(op, Operand::Address(0x0200));
     assert_eq!(cpu.pc, 0x0201);
 }
@@ -129,10 +129,10 @@ fn immediate_returns_pc_then_advances_one() {
 
 #[test]
 fn zero_page_returns_operand_and_advances_one() {
-    let bus = bus_with(OPC, &[0x44]);
+    let mut bus = bus_with(OPC, &[0x44]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::ZeroPage);
+    let op = cpu.resolve(&mut bus, AddrMode::ZeroPage);
     assert_eq!(op, Operand::Address(0x0044));
     assert_eq!(cpu.pc, OPC + 1);
 }
@@ -141,11 +141,11 @@ fn zero_page_returns_operand_and_advances_one() {
 
 #[test]
 fn zero_page_x_wraps_within_zero_page() {
-    let bus = bus_with(OPC, &[0xF0]);
+    let mut bus = bus_with(OPC, &[0xF0]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.x = 0x20;
-    let op = cpu.resolve(&bus, AddrMode::ZeroPageX);
+    let op = cpu.resolve(&mut bus, AddrMode::ZeroPageX);
     assert_eq!(op, Operand::Address(0x0010));
     assert_eq!(cpu.pc, OPC + 1);
 }
@@ -153,11 +153,11 @@ fn zero_page_x_wraps_within_zero_page() {
 #[test]
 fn zero_page_x_wrap_around_at_ff() {
     // $FF + $01 = $00 (wraps in zero page, not into $0100).
-    let bus = bus_with(OPC, &[0xFF]);
+    let mut bus = bus_with(OPC, &[0xFF]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.x = 0x01;
-    let op = cpu.resolve(&bus, AddrMode::ZeroPageX);
+    let op = cpu.resolve(&mut bus, AddrMode::ZeroPageX);
     assert_eq!(op, Operand::Address(0x0000));
 }
 
@@ -165,11 +165,11 @@ fn zero_page_x_wrap_around_at_ff() {
 
 #[test]
 fn zero_page_y_wraps_within_zero_page() {
-    let bus = bus_with(OPC, &[0x10]);
+    let mut bus = bus_with(OPC, &[0x10]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.y = 0x05;
-    let op = cpu.resolve(&bus, AddrMode::ZeroPageY);
+    let op = cpu.resolve(&mut bus, AddrMode::ZeroPageY);
     assert_eq!(op, Operand::Address(0x0015));
     assert_eq!(cpu.pc, OPC + 1);
 }
@@ -178,10 +178,10 @@ fn zero_page_y_wraps_within_zero_page() {
 
 #[test]
 fn absolute_returns_little_endian_word_and_advances_two() {
-    let bus = bus_with(OPC, &[0x00, 0x44]);
+    let mut bus = bus_with(OPC, &[0x00, 0x44]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::Absolute);
+    let op = cpu.resolve(&mut bus, AddrMode::Absolute);
     assert_eq!(op, Operand::Address(0x4400));
     assert_eq!(cpu.pc, OPC + 2);
 }
@@ -190,22 +190,22 @@ fn absolute_returns_little_endian_word_and_advances_two() {
 
 #[test]
 fn absolute_x_adds_x_to_base() {
-    let bus = bus_with(OPC, &[0x00, 0x44]);
+    let mut bus = bus_with(OPC, &[0x00, 0x44]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.x = 0x10;
-    let op = cpu.resolve(&bus, AddrMode::AbsoluteX);
+    let op = cpu.resolve(&mut bus, AddrMode::AbsoluteX);
     assert_eq!(op, Operand::Address(0x4410));
     assert_eq!(cpu.pc, OPC + 2);
 }
 
 #[test]
 fn absolute_x_wraps_at_16_bit_boundary() {
-    let bus = bus_with(OPC, &[0xFF, 0xFF]);
+    let mut bus = bus_with(OPC, &[0xFF, 0xFF]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.x = 0x02;
-    let op = cpu.resolve(&bus, AddrMode::AbsoluteX);
+    let op = cpu.resolve(&mut bus, AddrMode::AbsoluteX);
     assert_eq!(op, Operand::Address(0x0001));
 }
 
@@ -213,22 +213,22 @@ fn absolute_x_wraps_at_16_bit_boundary() {
 
 #[test]
 fn absolute_y_adds_y_to_base() {
-    let bus = bus_with(OPC, &[0x34, 0x12]);
+    let mut bus = bus_with(OPC, &[0x34, 0x12]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.y = 0x0C;
-    let op = cpu.resolve(&bus, AddrMode::AbsoluteY);
+    let op = cpu.resolve(&mut bus, AddrMode::AbsoluteY);
     assert_eq!(op, Operand::Address(0x1240));
     assert_eq!(cpu.pc, OPC + 2);
 }
 
 #[test]
 fn absolute_y_wraps_at_16_bit_boundary() {
-    let bus = bus_with(OPC, &[0xFF, 0xFF]);
+    let mut bus = bus_with(OPC, &[0xFF, 0xFF]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.y = 0x02;
-    let op = cpu.resolve(&bus, AddrMode::AbsoluteY);
+    let op = cpu.resolve(&mut bus, AddrMode::AbsoluteY);
     assert_eq!(op, Operand::Address(0x0001));
 }
 
@@ -242,7 +242,7 @@ fn indirect_reads_pointer_at_operand_address() {
     write_ptr(&mut bus, 0x0300, 0x4030);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::Indirect);
+    let op = cpu.resolve(&mut bus, AddrMode::Indirect);
     assert_eq!(op, Operand::Address(0x4030));
     assert_eq!(cpu.pc, OPC + 2);
 }
@@ -258,7 +258,7 @@ fn indirect_page_wrap_bug_high_byte_from_same_page() {
     bus.write(0x0000, 0xCD); // $0800 mirrors $0000 — should NOT be read
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::Indirect);
+    let op = cpu.resolve(&mut bus, AddrMode::Indirect);
     assert_eq!(op, Operand::Address(0xAB80));
 }
 
@@ -270,7 +270,7 @@ fn indirect_page_wrap_at_00ff() {
     bus.write(0x0000, 0x22);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::Indirect);
+    let op = cpu.resolve(&mut bus, AddrMode::Indirect);
     assert_eq!(op, Operand::Address(0x2211));
 }
 
@@ -285,7 +285,7 @@ fn indirect_x_reads_pointer_at_zp_plus_x() {
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.x = 0x04;
-    let op = cpu.resolve(&bus, AddrMode::IndirectX);
+    let op = cpu.resolve(&mut bus, AddrMode::IndirectX);
     assert_eq!(op, Operand::Address(0x5000));
     assert_eq!(cpu.pc, OPC + 1);
 }
@@ -298,7 +298,7 @@ fn indirect_x_pointer_location_wraps_in_zero_page() {
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.x = 0x05;
-    let op = cpu.resolve(&bus, AddrMode::IndirectX);
+    let op = cpu.resolve(&mut bus, AddrMode::IndirectX);
     assert_eq!(op, Operand::Address(0xABCD));
 }
 
@@ -312,7 +312,7 @@ fn indirect_y_adds_y_to_indirect_base() {
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.y = 0x10;
-    let op = cpu.resolve(&bus, AddrMode::IndirectY);
+    let op = cpu.resolve(&mut bus, AddrMode::IndirectY);
     assert_eq!(op, Operand::Address(0x3010));
     assert_eq!(cpu.pc, OPC + 1);
 }
@@ -326,7 +326,7 @@ fn indirect_y_pointer_wraps_in_zero_page() {
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.y = 0x00;
-    let op = cpu.resolve(&bus, AddrMode::IndirectY);
+    let op = cpu.resolve(&mut bus, AddrMode::IndirectY);
     assert_eq!(op, Operand::Address(0x1234));
 }
 
@@ -338,7 +338,7 @@ fn indirect_y_base_wraps_at_16_bit_boundary() {
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
     cpu.y = 0x02;
-    let op = cpu.resolve(&bus, AddrMode::IndirectY);
+    let op = cpu.resolve(&mut bus, AddrMode::IndirectY);
     assert_eq!(op, Operand::Address(0x0001));
 }
 
@@ -347,10 +347,10 @@ fn indirect_y_base_wraps_at_16_bit_boundary() {
 #[test]
 fn relative_positive_offset_adds_to_next_pc() {
     // Operand byte $10 -> target = (PC after fetch) + 0x10.
-    let bus = bus_with(OPC, &[0x10]);
+    let mut bus = bus_with(OPC, &[0x10]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::Relative);
+    let op = cpu.resolve(&mut bus, AddrMode::Relative);
     // After fetch PC=OPC+1=0x0201; +0x10 = 0x0211.
     assert_eq!(op, Operand::Address(0x0211));
     assert_eq!(cpu.pc, OPC + 1);
@@ -359,10 +359,10 @@ fn relative_positive_offset_adds_to_next_pc() {
 #[test]
 fn relative_negative_offset_subtracts_from_next_pc() {
     // Operand byte $FE (-2) -> target = (PC after fetch) - 2 = opcode addr.
-    let bus = bus_with(OPC, &[0xFE]);
+    let mut bus = bus_with(OPC, &[0xFE]);
     let mut cpu = Cpu::new();
     cpu.pc = OPC;
-    let op = cpu.resolve(&bus, AddrMode::Relative);
+    let op = cpu.resolve(&mut bus, AddrMode::Relative);
     // After fetch PC=0x0201; -2 = 0x01FF.
     assert_eq!(op, Operand::Address(0x01FF));
 }
@@ -371,10 +371,10 @@ fn relative_negative_offset_subtracts_from_next_pc() {
 fn relative_wraps_at_16_bit_boundary() {
     // PC=$0000 (operand byte location), offset=$FE (-2): after fetch
     // next_pc=$0001; $0001 - 2 wraps to $FFFF.
-    let bus = bus_with(0x0000, &[0xFE]);
+    let mut bus = bus_with(0x0000, &[0xFE]);
     let mut cpu = Cpu::new();
     cpu.pc = 0x0000;
-    let op = cpu.resolve(&bus, AddrMode::Relative);
+    let op = cpu.resolve(&mut bus, AddrMode::Relative);
     assert_eq!(op, Operand::Address(0xFFFF));
 }
 
