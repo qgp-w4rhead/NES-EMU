@@ -106,7 +106,11 @@ use crate::ppu::Ppu;
 ///   The field is `bool` and serialises at the end of the `Cpu` struct,
 ///   so the bincode layout changes (existing v3 save states will fail the
 ///   version check and report a clean `VersionMismatch` error).
-pub const SAVE_STATE_VERSION: u32 = 4;
+/// - `5` — M35: new mapper variants (`Vrc7`, `Namco163`) and `Fme7`
+///   gained a `ym2149` field (Sunsoft 5B audio). The new `MapperState`
+///   enum variants shift the bincode tag layout, so existing v4 save
+///   states will fail the version check.
+pub const SAVE_STATE_VERSION: u32 = 5;
 
 /// Errors that can occur during save state serialisation or deserialisation.
 #[derive(Debug)]

@@ -346,6 +346,13 @@ impl Cartridge {
         self.mapper.clock_cpu(cpu_cycles);
     }
 
+    /// Current expansion-audio sample in `[-1.0, 1.0]` from the cartridge's
+    /// audio chip (VRC6/VRC7/Sunsoft 5B/Namco 163). Returns 0.0 for carts
+    /// without expansion audio. M35.
+    pub fn expansion_audio_sample(&self) -> f32 {
+        self.mapper.expansion_audio_sample()
+    }
+
     /// Capture the mapper's full internal state as a [`MapperState`]
     /// snapshot. Used by the save state system (M20).
     pub fn save_mapper_state(&self) -> crate::mappers::MapperState {

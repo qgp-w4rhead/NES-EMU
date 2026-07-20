@@ -346,11 +346,18 @@ impl EmulatorState {
         // M32: the CPU-cycles-per-sample ratio is region-dependent
         // (NTSC/Dendy ≈ 40.585, PAL ≈ 37.7) because the PAL CPU clock
         // is slower.
+        // M35: expansion audio (VRC6/VRC7/Sunsoft 5B/Namco 163) is
+        // mixed into each output sample. The expansion chip's state
+        // was advanced by `clock_cart_cpu` above; here we query its
+        // current sample and add it to the internal APU output.
         let cycles_per_sample = self.region.cpu_cycles_per_sample();
         self.sample_accumulator += apu_cycles as f32;
         while self.sample_accumulator >= cycles_per_sample {
             self.sample_accumulator -= cycles_per_sample;
-            self.audio_buffer.push(self.bus.apu_mut().output());
+            let internal = self.bus.apu_mut().output();
+            let expansion = self.bus.expansion_audio_sample();
+            self.audio_buffer
+                .push((internal + expansion).clamp(-1.0, 1.0));
         }
 
         // Advance the PPU by 3× the total CPU cycles this iteration

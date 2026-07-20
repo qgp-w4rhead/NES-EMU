@@ -510,6 +510,29 @@ impl Mapper for Vrc6 {
         super::MapperState::Vrc6(self.clone())
     }
 
+    /// Mixed expansion-audio sample in `[-1.0, 1.0]` (M35).
+    ///
+    /// The VRC6 has three 6-bit DAC channels (two pulses at 0-15, one
+    /// sawtooth at 0-31). The NESdev "VRC6 audio" page documents the
+    /// channel mix: each channel contributes its DAC value, and the
+    /// combined output is `pulse1 + pulse2 + saw` clipped to the 6-bit
+    /// range, then normalised. We map the 6-bit mix (0-63) to `[-1, 1]`
+    /// via `out = sample / 63.0 * 2.0 - 1.0` (silence → -1.0, matching
+    /// the internal APU's DC-offset convention from M16/M31).
+    ///
+    /// See: https://www.nesdev.org/wiki/VRC6_audio
+    fn expansion_audio_sample(&self) -> f32 {
+        let p1 = self.pulse1_sample() as u32; // 0..=15
+        let p2 = self.pulse2_sample() as u32; // 0..=15
+        let saw = self.saw_sample() as u32; // 0..=31
+        let sum = p1.saturating_add(p2).saturating_add(saw).min(63);
+        // 6-bit mix → [-1.0, 1.0]. Gain trimmed so the chip sits roughly
+        // at the same perceived loudness as the internal APU.
+        const VRC6_GAIN: f32 = 0.75;
+        let normalized = (sum as f32 / 63.0) * 2.0 - 1.0;
+        normalized * VRC6_GAIN
+    }
+
     fn restore_state(&mut self, state: super::MapperState) {
         match state {
             super::MapperState::Vrc6(m) => *self = m,

@@ -35,6 +35,7 @@
 //!
 //! See: https://www.nesdev.org/wiki/FME-7
 
+use super::ym2149::Ym2149;
 use super::{Mapper, Mirroring};
 
 /// PRG-ROM bank size (8 KB).
@@ -78,6 +79,10 @@ pub struct Fme7 {
     irq_enable: bool,
     /// Asserted when the counter hits 0; cleared by command 15 with bit 1.
     irq_pending: bool,
+
+    /// On-chip YM2149 PSG (Sunsoft 5B audio). Present on all FME-7 carts
+    /// but only audible on the 5B variant; harmless otherwise.
+    ym2149: Ym2149,
 }
 
 impl Fme7 {
@@ -110,6 +115,7 @@ impl Fme7 {
             irq_latch_high: false,
             irq_enable: false,
             irq_pending: false,
+            ym2149: Ym2149::new(),
         }
     }
 
@@ -209,6 +215,12 @@ impl Mapper for Fme7 {
         match addr {
             0x8000 => self.command = value,
             0x8001 => self.write_data(value),
+            // Sunsoft 5B audio: $C000 = address latch, $E000 = data write.
+            // These are distinct from the FME-7 banking pair ($8000/$8001)
+            // and only the 5B variant wires them to the YM2149, but the
+            // decode is the same on all FME-7 silicon.
+            0xC000 => self.ym2149.write_addr(value),
+            0xE000 => self.ym2149.write_data(value),
             _ => {}
         }
     }
@@ -284,6 +296,15 @@ impl Mapper for Fme7 {
                 self.irq_counter -= 1;
             }
         }
+        // YM2149 runs at APU clock = CPU clock / 2 (M35, Sunsoft 5B).
+        self.ym2149.clock(cpu_cycles / 2);
+    }
+
+    /// Mixed expansion-audio sample in `[-1.0, 1.0]` (M35, Sunsoft 5B).
+    /// See: https://www.nesdev.org/wiki/Sunsoft_5B_audio
+    fn expansion_audio_sample(&self) -> f32 {
+        const S5B_GAIN: f32 = 0.5;
+        self.ym2149.sample() * S5B_GAIN
     }
 
     fn save_state(&self) -> super::MapperState {

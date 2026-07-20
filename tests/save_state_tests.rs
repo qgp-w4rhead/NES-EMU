@@ -338,10 +338,11 @@ fn load_state_rejects_empty_data() {
 }
 
 #[test]
-fn save_state_version_is_four() {
-    // M33 bumped the version: the Cpu struct gained a `halted: bool` field
-    // (KIL/JAM unofficial opcodes), which changes the bincode layout.
-    assert_eq!(SAVE_STATE_VERSION, 4);
+fn save_state_version_is_five() {
+    // M35 bumped the version: new mapper variants (Vrc7, Namco163) and
+    // Fme7 gained a ym2149 field (Sunsoft 5B audio), shifting the
+    // MapperState enum tag layout.
+    assert_eq!(SAVE_STATE_VERSION, 5);
 }
 
 // ---- No-cartridge save/restore -----------------------------------------

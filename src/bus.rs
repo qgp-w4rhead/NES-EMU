@@ -233,6 +233,17 @@ impl Bus {
         }
     }
 
+    /// Current expansion-audio sample in `[-1.0, 1.0]` from the loaded
+    /// cartridge's audio chip (VRC6/VRC7/Sunsoft 5B/Namco 163). Returns
+    /// 0.0 when no cartridge is loaded or the cart has no expansion audio.
+    /// M35.
+    pub fn expansion_audio_sample(&self) -> f32 {
+        self.cartridge
+            .as_ref()
+            .map(|c| c.expansion_audio_sample())
+            .unwrap_or(0.0)
+    }
+
     /// Render the background layer into the PPU framebuffer.
     ///
     /// Delegates to [`Ppu::render_background`], supplying a CHR-read

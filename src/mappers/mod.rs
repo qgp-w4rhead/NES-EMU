@@ -23,9 +23,13 @@ pub mod mmc1;
 pub mod mmc2;
 pub mod mmc3;
 pub mod mmc5;
+pub mod namco163;
 pub mod nrom;
+pub mod opll;
 pub mod uxrom;
 pub mod vrc6;
+pub mod vrc7;
+pub mod ym2149;
 
 use crate::cartridge::CartridgeError;
 
@@ -39,6 +43,7 @@ use crate::cartridge::CartridgeError;
 /// derives; the enum itself derives them too so the entire snapshot can be
 /// serialised with `bincode` as part of a `SaveState`.
 #[derive(serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum MapperState {
     /// Mapper 0 — NROM.
     Nrom(nrom::Nrom),
@@ -58,8 +63,12 @@ pub enum MapperState {
     Mmc2(mmc2::Mmc2),
     /// Mapper 24 / 26 — VRC6.
     Vrc6(vrc6::Vrc6),
-    /// Mapper 69 — FME-7.
+    /// Mapper 69 — FME-7 / Sunsoft 5B.
     Fme7(fme7::Fme7),
+    /// Mapper 85 — VRC7.
+    Vrc7(vrc7::Vrc7),
+    /// Mapper 19 — Namco 163.
+    Namco163(namco163::Namco163),
 }
 
 impl MapperState {
@@ -78,6 +87,8 @@ impl MapperState {
             MapperState::Mmc2(m) => Box::new(m),
             MapperState::Vrc6(m) => Box::new(m),
             MapperState::Fme7(m) => Box::new(m),
+            MapperState::Vrc7(m) => Box::new(m),
+            MapperState::Namco163(m) => Box::new(m),
         }
     }
 }
@@ -166,6 +177,19 @@ pub trait Mapper: Send {
     /// step with the number of cycles that step consumed. Default is a
     /// no-op so non-CPU-clocked mappers need not override this.
     fn clock_cpu(&mut self, _cpu_cycles: u32) {}
+
+    /// Current expansion-audio sample in `[-1.0, 1.0]`, mixed into the
+    /// APU output stream by the emulator main loop (M35). Mappers without
+    /// expansion audio (the vast majority) return `0.0`. Mappers with
+    /// expansion audio (VRC6, VRC7, Sunsoft 5B, Namco 163) override this
+    /// and return their mixed channel output. The sample is queried once
+    /// per output sample (~44.1 kHz) *after* `clock_cpu` has advanced the
+    /// channel state for the elapsed CPU cycles.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU#Expansion_audio
+    fn expansion_audio_sample(&self) -> f32 {
+        0.0
+    }
 
     /// Return the current contents of battery-backed PRG-RAM (`$6000-$7FFF`),
     /// or `None` if this cartridge has no battery-backed SRAM.
@@ -284,6 +308,18 @@ pub fn from_ines(
             true,
         ))),
         69 => Ok(Box::new(fme7::Fme7::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        85 => Ok(Box::new(vrc7::Vrc7::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        19 => Ok(Box::new(namco163::Namco163::new(
             prg_rom,
             chr_rom,
             mirroring,
