@@ -16,9 +16,12 @@
 //! dead-code warnings at the module level.
 #![allow(dead_code)]
 
+pub mod axrom;
+pub mod cnrom;
 pub mod mmc1;
 pub mod mmc3;
 pub mod nrom;
+pub mod uxrom;
 
 use crate::cartridge::CartridgeError;
 
@@ -111,7 +114,25 @@ pub fn from_ines(
             mirroring,
             has_battery,
         ))),
+        2 => Ok(Box::new(uxrom::Uxrom::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        3 => Ok(Box::new(cnrom::Cnrom::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
         4 => Ok(Box::new(mmc3::Mmc3::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        7 => Ok(Box::new(axrom::Axrom::new(
             prg_rom,
             chr_rom,
             mirroring,

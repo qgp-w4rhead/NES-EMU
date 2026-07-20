@@ -683,3 +683,387 @@ fn mmc3_emulator_runs_frames_without_crash() {
     }
     assert_eq!(emu.bus().ppu().scanline(), 0);
 }
+
+// =====================================================================
+// UxROM (mapper 2) integration tests
+// =====================================================================
+
+/// Build an iNES image for UxROM (mapper 2). PRG is filled so each 16 KB
+/// bank has a unique byte (bank index). CHR is filled so each 8 KB bank
+/// has a unique byte (bank index).
+fn make_ines_uxrom(prg_16k_banks: u8, chr_8k_banks: u8, flags6: u8) -> Vec<u8> {
+    let prg_size = prg_16k_banks as usize * PRG_ROM_UNIT;
+    let chr_size = chr_8k_banks as usize * 8 * 1024;
+    let mut buf = Vec::with_capacity(HEADER_SIZE + prg_size + chr_size);
+    buf.extend_from_slice(&INES_MAGIC);
+    buf.push(prg_16k_banks);
+    buf.push(chr_8k_banks);
+    buf.push(flags6); // mapper low nibble in high nibble (2 → 0b0010_0000)
+    buf.push(0); // flags7 — mapper high nibble = 0
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.resize(HEADER_SIZE + prg_size + chr_size, 0);
+    // Fill PRG: each 16 KB bank with its bank index.
+    for i in 0..prg_size {
+        buf[HEADER_SIZE + i] = (i / PRG_ROM_UNIT) as u8;
+    }
+    // Fill CHR: each 8 KB bank with its bank index.
+    for i in 0..chr_size {
+        buf[HEADER_SIZE + prg_size + i] = (i / (8 * 1024)) as u8;
+    }
+    buf
+}
+
+#[test]
+fn uxrom_selected_for_mapper_2() {
+    // flags6 high nibble = 2 → mapper 2. Horizontal mirroring.
+    let bytes = make_ines_uxrom(4, 1, 0b0010_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load UxROM cart");
+    assert_eq!(cart.header.mapper_number, 2);
+    assert_eq!(cart.mirror_mode(), Mirroring::Horizontal);
+}
+
+#[test]
+fn uxrom_default_bank_0_with_fixed_last_bank_via_bus() {
+    // 4 × 16 KB PRG banks. Default: bank 0 at $8000, fixed last (3) at $C000.
+    let bytes = make_ines_uxrom(4, 0, 0b0010_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xBFFF), 0x00);
+    assert_eq!(bus.read(0xC000), 0x03);
+    assert_eq!(bus.read(0xFFFF), 0x03);
+}
+
+#[test]
+fn uxrom_bank_switch_via_bus() {
+    let bytes = make_ines_uxrom(4, 0, 0b0010_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Select bank 2.
+    bus.write(0x8000, 0x02);
+    assert_eq!(bus.read(0x8000), 0x02);
+    assert_eq!(bus.read(0xBFFF), 0x02);
+    // $C000 stays fixed at last bank (3).
+    assert_eq!(bus.read(0xC000), 0x03);
+    assert_eq!(bus.read(0xFFFF), 0x03);
+}
+
+#[test]
+fn uxrom_chr_ram_writes_persist_via_bus() {
+    // chr_8k_banks = 0 → CHR-RAM.
+    let bytes = make_ines_uxrom(4, 0, 0b0010_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    {
+        let cart = bus.cartridge_mut().expect("cart");
+        cart.write_chr(0x0000, 0xAA);
+        cart.write_chr(0x1FFF, 0xBB);
+    }
+    let cart = bus.cartridge().expect("cart");
+    assert_eq!(cart.read_chr(0x0000), 0xAA);
+    assert_eq!(cart.read_chr(0x1FFF), 0xBB);
+}
+
+#[test]
+fn uxrom_mirroring_fixed_from_header_via_bus() {
+    // Vertical mirroring from header (flags6 bit 0 = 1).
+    let bytes = make_ines_uxrom(4, 0, 0b0010_0001);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+    // Bank writes must not change mirroring.
+    bus.write(0x8000, 0x02);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+}
+
+#[test]
+fn uxrom_prg_ram_region_ignored_via_bus() {
+    let bytes = make_ines_uxrom(4, 0, 0b0010_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Writes to $6000-$7FFF should be ignored (no PRG-RAM).
+    bus.write(0x6000, 0xFF);
+    assert_eq!(bus.read(0x6000), 0x00);
+    // Bank selection should be unaffected.
+    assert_eq!(bus.read(0x8000), 0x00);
+}
+
+#[test]
+fn uxrom_cart_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_uxrom(4, 0, 0b0010_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 2);
+}
+
+// =====================================================================
+// CNROM (mapper 3) integration tests
+// =====================================================================
+
+/// Build an iNES image for CNROM (mapper 3). PRG is filled so each 16 KB
+/// bank has a unique byte (bank index). CHR is filled so each 8 KB bank
+/// has a unique byte (bank index).
+fn make_ines_cnrom(prg_16k_banks: u8, chr_8k_banks: u8, flags6: u8) -> Vec<u8> {
+    let prg_size = prg_16k_banks as usize * PRG_ROM_UNIT;
+    let chr_size = chr_8k_banks as usize * 8 * 1024;
+    let mut buf = Vec::with_capacity(HEADER_SIZE + prg_size + chr_size);
+    buf.extend_from_slice(&INES_MAGIC);
+    buf.push(prg_16k_banks);
+    buf.push(chr_8k_banks);
+    buf.push(flags6); // mapper low nibble in high nibble (3 → 0b0011_0000)
+    buf.push(0); // flags7 — mapper high nibble = 0
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.resize(HEADER_SIZE + prg_size + chr_size, 0);
+    // Fill PRG: each 16 KB bank with its bank index.
+    for i in 0..prg_size {
+        buf[HEADER_SIZE + i] = (i / PRG_ROM_UNIT) as u8;
+    }
+    // Fill CHR: each 8 KB bank with its bank index.
+    for i in 0..chr_size {
+        buf[HEADER_SIZE + prg_size + i] = (i / (8 * 1024)) as u8;
+    }
+    buf
+}
+
+#[test]
+fn cnrom_selected_for_mapper_3() {
+    // flags6 high nibble = 3 → mapper 3. Horizontal mirroring.
+    let bytes = make_ines_cnrom(2, 4, 0b0011_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load CNROM cart");
+    assert_eq!(cart.header.mapper_number, 3);
+    assert_eq!(cart.mirror_mode(), Mirroring::Horizontal);
+}
+
+#[test]
+fn cnrom_prg_32k_reads_linearly_via_bus() {
+    // 2 × 16 KB PRG banks (32 KB total). No PRG banking.
+    let bytes = make_ines_cnrom(2, 4, 0b0011_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xBFFF), 0x00);
+    assert_eq!(bus.read(0xC000), 0x01);
+    assert_eq!(bus.read(0xFFFF), 0x01);
+}
+
+#[test]
+fn cnrom_prg_16k_mirrors_high_half_via_bus() {
+    // 1 × 16 KB PRG bank — mirrors into $C000-$FFFF.
+    let bytes = make_ines_cnrom(1, 4, 0b0011_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xC000), 0x00); // mirror
+    assert_eq!(bus.read(0xFFFF), 0x00);
+}
+
+#[test]
+fn cnrom_chr_bank_switch_via_bus() {
+    // 4 × 8 KB CHR banks.
+    let bytes = make_ines_cnrom(2, 4, 0b0011_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Default chr_bank = 0.
+    {
+        let cart = bus.cartridge().expect("cart");
+        assert_eq!(cart.read_chr(0x0000), 0x00);
+        assert_eq!(cart.read_chr(0x1FFF), 0x00);
+    }
+    // Select CHR bank 2.
+    bus.write(0x8000, 0x02);
+    {
+        let cart = bus.cartridge().expect("cart");
+        assert_eq!(cart.read_chr(0x0000), 0x02);
+        assert_eq!(cart.read_chr(0x1FFF), 0x02);
+    }
+    // Select CHR bank 3.
+    bus.write(0x8000, 0x03);
+    {
+        let cart = bus.cartridge().expect("cart");
+        assert_eq!(cart.read_chr(0x0000), 0x03);
+    }
+}
+
+#[test]
+fn cnrom_chr_bank_uses_low_2_bits_via_bus() {
+    // 4 × 8 KB CHR banks. Writing 0xFF → bank 3 (bits 0-1).
+    let bytes = make_ines_cnrom(2, 4, 0b0011_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0x8000, 0xFF);
+    let cart = bus.cartridge().expect("cart");
+    assert_eq!(cart.read_chr(0x0000), 0x03);
+}
+
+#[test]
+fn cnrom_mirroring_fixed_from_header_via_bus() {
+    // Vertical mirroring from header.
+    let bytes = make_ines_cnrom(2, 4, 0b0011_0001);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+    // CHR bank writes must not change mirroring.
+    bus.write(0x8000, 0x02);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+}
+
+#[test]
+fn cnrom_cart_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_cnrom(2, 4, 0b0011_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 3);
+}
+
+// =====================================================================
+// AxROM (mapper 7) integration tests
+// =====================================================================
+
+/// Build an iNES image for AxROM (mapper 7). PRG is filled so each 32 KB
+/// bank has a unique byte (bank index). CHR is filled so each 8 KB bank
+/// has a unique byte (bank index).
+fn make_ines_axrom(prg_32k_banks: u8, chr_8k_banks: u8, flags6: u8) -> Vec<u8> {
+    let prg_size = prg_32k_banks as usize * 32 * 1024;
+    let chr_size = chr_8k_banks as usize * 8 * 1024;
+    let mut buf = Vec::with_capacity(HEADER_SIZE + prg_size + chr_size);
+    buf.extend_from_slice(&INES_MAGIC);
+    // PRG banks in 16KB units: prg_32k_banks * 2.
+    buf.push(prg_32k_banks.saturating_mul(2).max(1));
+    buf.push(chr_8k_banks);
+    buf.push(flags6); // mapper low nibble in high nibble (7 → 0b0111_0000)
+    buf.push(0); // flags7 — mapper high nibble = 0
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.resize(HEADER_SIZE + prg_size + chr_size, 0);
+    // Fill PRG: each 32 KB bank with its bank index.
+    for i in 0..prg_size {
+        buf[HEADER_SIZE + i] = (i / (32 * 1024)) as u8;
+    }
+    // Fill CHR: each 8 KB bank with its bank index.
+    for i in 0..chr_size {
+        buf[HEADER_SIZE + prg_size + i] = (i / (8 * 1024)) as u8;
+    }
+    buf
+}
+
+#[test]
+fn axrom_selected_for_mapper_7() {
+    // flags6 high nibble = 7 → mapper 7. Header mirroring is horizontal but
+    // AxROM always reports single-screen.
+    let bytes = make_ines_axrom(4, 1, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load AxROM cart");
+    assert_eq!(cart.header.mapper_number, 7);
+    assert_eq!(cart.mirror_mode(), Mirroring::SingleScreen(0));
+}
+
+#[test]
+fn axrom_default_bank_0_across_whole_window_via_bus() {
+    // 4 × 32 KB PRG banks. Default: bank 0 across $8000-$FFFF.
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xBFFF), 0x00);
+    assert_eq!(bus.read(0xC000), 0x00);
+    assert_eq!(bus.read(0xFFFF), 0x00);
+}
+
+#[test]
+fn axrom_bank_switch_swaps_whole_32k_window_via_bus() {
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0x8000, 0x02);
+    assert_eq!(bus.read(0x8000), 0x02);
+    assert_eq!(bus.read(0xBFFF), 0x02);
+    assert_eq!(bus.read(0xC000), 0x02);
+    assert_eq!(bus.read(0xFFFF), 0x02);
+}
+
+#[test]
+fn axrom_mirroring_switches_via_bit4_via_bus() {
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Default: single-screen NT 0.
+    assert_eq!(bus.ppu().mirroring(), Mirroring::SingleScreen(0));
+    // Bit 4 set → single-screen NT 1.
+    bus.write(0x8000, 0x10);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::SingleScreen(1));
+    // Bit 4 clear → back to NT 0.
+    bus.write(0x8000, 0x00);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::SingleScreen(0));
+}
+
+#[test]
+fn axrom_mirroring_affects_ppu_nametable_mapping() {
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+
+    // Under SingleScreen(0) (default), all four NT slots map to page 0.
+    // Write 0xAA to $2000 → page 0 offset 0.
+    assert_eq!(bus.ppu().mirroring(), Mirroring::SingleScreen(0));
+    ppu_vram_write(&mut bus, 0x2000, 0xAA);
+
+    // Switch to SingleScreen(1) via bit 4 — now all NT slots map to page 1.
+    // Write 0xBB to $2000 → page 1 offset 0.
+    bus.write(0x8000, 0x10);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::SingleScreen(1));
+    ppu_vram_write(&mut bus, 0x2000, 0xBB);
+
+    // Under SingleScreen(1): all four NT slots → page 1 (0xBB).
+    let vram = bus.ppu().vram();
+    let m = bus.ppu().mirroring();
+    assert_eq!(vram[nt_phys_addr(m, 0x2000)], 0xBB);
+    assert_eq!(vram[nt_phys_addr(m, 0x2400)], 0xBB);
+    assert_eq!(vram[nt_phys_addr(m, 0x2800)], 0xBB);
+    assert_eq!(vram[nt_phys_addr(m, 0x2C00)], 0xBB);
+
+    // Switch back to SingleScreen(0): all four NT slots → page 0 (0xAA).
+    bus.write(0x8000, 0x00);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::SingleScreen(0));
+    let vram = bus.ppu().vram();
+    let m = bus.ppu().mirroring();
+    assert_eq!(vram[nt_phys_addr(m, 0x2000)], 0xAA);
+    assert_eq!(vram[nt_phys_addr(m, 0x2400)], 0xAA);
+    assert_eq!(vram[nt_phys_addr(m, 0x2800)], 0xAA);
+    assert_eq!(vram[nt_phys_addr(m, 0x2C00)], 0xAA);
+}
+
+#[test]
+fn axrom_chr_ram_writes_persist_via_bus() {
+    // chr_8k_banks = 0 → CHR-RAM.
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    {
+        let cart = bus.cartridge_mut().expect("cart");
+        cart.write_chr(0x0000, 0xAA);
+        cart.write_chr(0x1FFF, 0xBB);
+    }
+    let cart = bus.cartridge().expect("cart");
+    assert_eq!(cart.read_chr(0x0000), 0xAA);
+    assert_eq!(cart.read_chr(0x1FFF), 0xBB);
+}
+
+#[test]
+fn axrom_prg_ram_region_ignored_via_bus() {
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    bus.write(0x6000, 0xFF);
+    assert_eq!(bus.read(0x6000), 0x00);
+    // Bank selection unaffected.
+    assert_eq!(bus.read(0x8000), 0x00);
+}
+
+#[test]
+fn axrom_cart_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_axrom(4, 0, 0b0111_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 7);
+}
