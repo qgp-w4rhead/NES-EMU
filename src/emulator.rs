@@ -340,6 +340,56 @@ impl EmulatorState {
     ///
     /// See: [`crate::debug::CpuDebugger`]
     pub fn step_frame_debug(&mut self, debugger: &mut crate::debug::CpuDebugger) -> u32 {
+        // No per-step action in plain debug mode — the debugger's
+        // `check_before_step` is consulted by the helper.
+        self.step_frame_with(debugger, |_pre_cpu, _bus, _cycles| {})
+    }
+
+    /// Run the emulator forward with per-instruction trace logging. This
+    /// is [`step_frame_debug`] plus a [`crate::debug::TraceLogger`] call
+    /// after each CPU step. The trace logger captures the disassembly and
+    /// register state at the *pre-step* PC (matching the FCEUX convention:
+    /// the line shows the instruction that ran and the registers as they
+    /// were when it started). The cycle count returned by
+    /// `step_one_cpu_tick` is passed to `log_instruction` so the trace's
+    /// `CYC` column advances correctly.
+    ///
+    /// The pre-step CPU is captured by cloning `Cpu` (which derives
+    /// `Clone`); the disassembly reads via `Bus::peek` (no side-effects),
+    /// so capturing cannot perturb the step we are about to run.
+    ///
+    /// See: [`crate::debug::TraceLogger`]
+    pub fn step_frame_traced(
+        &mut self,
+        debugger: &mut crate::debug::CpuDebugger,
+        logger: &mut crate::debug::TraceLogger,
+    ) -> u32 {
+        self.step_frame_with(debugger, |pre_cpu, bus, cycles| {
+            // Log the instruction that just executed. The disassembly
+            // reads via `Bus::peek` (no side-effects), so this cannot
+            // perturb the next iteration's step. On the first write
+            // error (e.g. disk full), stop the trace and report once
+            // to stderr so the user knows tracing halted.
+            if logger.is_enabled() {
+                if let Err(e) = logger.log_instruction(pre_cpu, bus, cycles) {
+                    let lines = logger.stop();
+                    eprintln!("nes-emu: trace log write failed ({e}); stopped after {lines} lines");
+                }
+            }
+        })
+    }
+
+    /// Shared frame loop for `step_frame_debug` and `step_frame_traced`.
+    /// Clears the framebuffer, runs CPU/PPU ticks in lockstep until the
+    /// PPU completes a frame (or the debugger pauses), invoking `step`
+    /// after each CPU tick with the pre-step CPU snapshot, the bus, and
+    /// the cycle count for the tick. Finally renders the framebuffer if
+    /// the PPU did not already render it inline.
+    fn step_frame_with(
+        &mut self,
+        debugger: &mut crate::debug::CpuDebugger,
+        mut step: impl FnMut(&Cpu, &Bus, u32),
+    ) -> u32 {
         let mut cpu_cycles: u32 = 0;
 
         let universal_bg = self.bus.ppu().universal_bg_argb();
@@ -353,9 +403,18 @@ impl EmulatorState {
             if debugger.check_before_step(&self.cpu, &self.bus) {
                 break;
             }
+            // Capture the pre-step CPU so the trace line / step callback
+            // sees the instruction at its entry point. `Cpu` derives
+            // `Clone` and is small (8 bytes of registers + 2 bools), so
+            // this is cheap and allocation-free.
+            let pre_cpu = self.cpu.clone();
+
             let prev_scanline = self.bus.ppu().scanline();
             let (tick_cycles, frame_done) = self.step_one_cpu_tick(prev_scanline);
             cpu_cycles = cpu_cycles.saturating_add(tick_cycles);
+
+            step(&pre_cpu, &self.bus, tick_cycles);
+
             if frame_done {
                 break;
             }

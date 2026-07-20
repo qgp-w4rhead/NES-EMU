@@ -27,7 +27,7 @@ use nes_emu::audio::AudioOutput;
 use nes_emu::battery;
 use nes_emu::cartridge::Cartridge;
 use nes_emu::config::Config;
-use nes_emu::debug::{print_debug_overlay, CpuDebugger};
+use nes_emu::debug::{print_debug_overlay, CpuDebugger, DebugHotkeys};
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::InputMapper;
 use nes_emu::video::Video;
@@ -100,82 +100,52 @@ fn resolve_config_path(explicit: Option<&str>) -> PathBuf {
     }
 }
 
-/// Initialize SDL2, load the ROM, build the emulator, and drive the
-/// frame-locked main loop until the user requests exit (ESC, window-close,
-/// or Q on the window).
-fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
-    let cli = parse_args(&args)?;
-    let rom_path = cli.rom_path;
-    let config_path = resolve_config_path(cli.config_path.as_deref());
-
-    // Load user config (M22). A missing file is not an error — we fall
-    // back to defaults and write a template `config.toml` so the user has
-    // something to edit. Parse errors are reported but non-fatal: the
-    // emulator boots with defaults so a malformed config never blocks the
-    // user from playing.
-    let config = match Config::load_from_path(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("nes-emu: warning: {e}; using default config");
-            Config::default()
+/// Handle M27 debugger hotkeys (F1/F2/F3). Returns `true` if consumed.
+fn handle_debugger_key(debugger: &mut CpuDebugger, key: Keycode) -> bool {
+    match key {
+        Keycode::F1 => {
+            debugger.toggle_pause();
+            let state = if debugger.is_paused() {
+                "paused"
+            } else {
+                "resumed"
+            };
+            eprintln!("nes-emu: debugger {state}");
+            true
         }
-    };
-    // First-run: write a default config.toml template if none exists.
-    if let Err(e) = Config::ensure_default_file(&config_path) {
-        eprintln!("nes-emu: warning: could not write default config: {e}");
-    }
-
-    let cartridge = Cartridge::from_path(&rom_path)
-        .map_err(|e| format!("failed to load ROM '{rom_path}': {e}"))?;
-
-    // Battery-backed PRG-RAM persistence (M21): if the cartridge advertises
-    // battery-backed SRAM and a `.nessram` sidecar file exists next to the
-    // ROM, load its contents into the cartridge's PRG-RAM before booting.
-    // A missing sidecar is not an error — the game simply starts with
-    // zeroed PRG-RAM (first run). Load errors are reported but non-fatal:
-    // the game still boots with empty SRAM so the user is not blocked.
-    let rom_path_ref = std::path::Path::new(&rom_path);
-    let mut cartridge = cartridge;
-    if cartridge.has_battery() {
-        match battery::load_for_rom(rom_path_ref) {
-            Ok(Some(data)) => cartridge.load_battery_sram(&data),
-            Ok(None) => {}
-            Err(e) => eprintln!("nes-emu: warning: could not read battery SRAM: {e}"),
+        Keycode::F2 => {
+            if debugger.is_paused() {
+                debugger.request_step();
+            } else {
+                eprintln!("nes-emu: F2 single-step ignored (debugger not paused; press F1 first)");
+            }
+            true
         }
+        Keycode::F3 => {
+            debugger.toggle_run_to_breakpoint();
+            let state = if debugger.run_to_breakpoint() {
+                "ON"
+            } else {
+                "OFF"
+            };
+            eprintln!("nes-emu: run-to-breakpoint {state}");
+            if debugger.run_to_breakpoint() && debugger.breakpoints().is_empty() {
+                eprintln!(
+                    "nes-emu: no breakpoints set — add some via the debugger API to use run-to-breakpoint"
+                );
+            }
+            true
+        }
+        _ => false,
     }
+}
 
-    let mut emulator = EmulatorState::new(cartridge);
-    emulator.reset();
-
-    let sdl_context = sdl2::init()?;
-    let video_subsystem = sdl_context.video()?;
-    let audio_subsystem = sdl_context.audio()?;
-    let game_controller_subsystem = sdl_context.game_controller()?;
-
-    // Window scale from config (M22). Falls back to the video module's
-    // default if the config value is zero or out of a sane range.
-    let scale = if (1..=8).contains(&config.window_scale) {
-        config.window_scale
-    } else {
-        nes_emu::video::DEFAULT_SCALE
-    };
-    let mut video = Video::new(&video_subsystem, scale)?;
-    let mut audio = AudioOutput::new(&audio_subsystem)?;
-    // Apply master volume from config (M22). Clamped to [0.0, 1.0] inside
-    // `set_volume`.
-    audio.set_volume(config.audio_volume);
-    let mut event_pump = sdl_context.event_pump()?;
-
-    // Open all connected SDL2 game controllers (M22). Each open controller
-    // is held in `gamepads` for the lifetime of the loop so SDL2 keeps
-    // reporting its events. We also build `gamepad_index_map`, which maps
-    // SDL2 joystick **instance IDs** (the `which` field of
-    // `ControllerButtonDown`/`Up` events) to a sequential NES controller
-    // index (0, 1, ...). This is necessary because instance IDs are
-    // monotonically increasing and not reused — after a disconnect/reconnect
-    // a gamepad gets a higher ID, so we cannot pass `which` directly as a
-    // controller index. See: https://wiki.libsdl.org/SDL_GameControllerOpen
+/// Open all connected SDL2 game controllers at startup, returning the
+/// held controllers and a map from SDL2 instance ID → NES controller
+/// index. See: https://wiki.libsdl.org/SDL_GameControllerOpen
+fn open_initial_gamepads(
+    game_controller_subsystem: &sdl2::GameControllerSubsystem,
+) -> (Vec<GameController>, HashMap<u32, usize>) {
     let mut gamepads: Vec<GameController> = Vec::new();
     let mut gamepad_index_map: HashMap<u32, usize> = HashMap::new();
     let num_joysticks = game_controller_subsystem.num_joysticks().unwrap_or(0);
@@ -205,24 +175,81 @@ fn run() -> Result<(), String> {
     if gamepads.is_empty() {
         eprintln!("nes-emu: no gamepads detected; keyboard only");
     }
+    (gamepads, gamepad_index_map)
+}
+
+/// Initialize SDL2, load the ROM, build the emulator, and drive the
+/// frame-locked main loop until the user requests exit (ESC, window-close,
+/// or Q on the window).
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    let cli = parse_args(&args)?;
+    let rom_path = cli.rom_path;
+    let config_path = resolve_config_path(cli.config_path.as_deref());
+
+    // Load user config (M22). Missing/invalid config is non-fatal: we
+    // fall back to defaults and write a template `config.toml`.
+    let config = match Config::load_from_path(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("nes-emu: warning: {e}; using default config");
+            Config::default()
+        }
+    };
+    if let Err(e) = Config::ensure_default_file(&config_path) {
+        eprintln!("nes-emu: warning: could not write default config: {e}");
+    }
+
+    let cartridge = Cartridge::from_path(&rom_path)
+        .map_err(|e| format!("failed to load ROM '{rom_path}': {e}"))?;
+
+    // Battery-backed PRG-RAM persistence (M21): load `.nessram` sidecar
+    // if present. Missing file / errors are non-fatal.
+    let rom_path_ref = std::path::Path::new(&rom_path);
+    let mut cartridge = cartridge;
+    if cartridge.has_battery() {
+        match battery::load_for_rom(rom_path_ref) {
+            Ok(Some(data)) => cartridge.load_battery_sram(&data),
+            Ok(None) => {}
+            Err(e) => eprintln!("nes-emu: warning: could not read battery SRAM: {e}"),
+        }
+    }
+
+    let mut emulator = EmulatorState::new(cartridge);
+    emulator.reset();
+
+    let sdl_context = sdl2::init()?;
+    let video_subsystem = sdl_context.video()?;
+    let audio_subsystem = sdl_context.audio()?;
+    let game_controller_subsystem = sdl_context.game_controller()?;
+
+    // Window scale from config (M22); falls back to default if invalid.
+    let scale = if (1..=8).contains(&config.window_scale) {
+        config.window_scale
+    } else {
+        nes_emu::video::DEFAULT_SCALE
+    };
+    let mut video = Video::new(&video_subsystem, scale)?;
+    let mut audio = AudioOutput::new(&audio_subsystem)?;
+    audio.set_volume(config.audio_volume);
+    let mut event_pump = sdl_context.event_pump()?;
+
+    // Open all connected SDL2 game controllers (M22). `gamepad_index_map`
+    // maps SDL2 instance IDs → sequential NES controller index.
+    let (mut gamepads, mut gamepad_index_map) = open_initial_gamepads(&game_controller_subsystem);
+    let mut next_seq: usize = gamepads.len();
 
     let mut mapper = InputMapper::from_config(&config);
 
-    // CPU debugger (M27). Holds breakpoints and pause / step state. The
-    // main loop drives it via F1 (pause/resume), F2 (single-step while
-    // paused), and F3 (toggle run-to-breakpoint). While paused, a
-    // console "overlay" — register snapshot + disassembly window — is
-    // printed to stderr each frame so the user can inspect emulator
-    // state without a GUI toolkit. A graphical egui overlay lands in
-    // M28 alongside the PPU / memory viewers.
+    // CPU debugger (M27): F1 pause/resume, F2 single-step, F3 run-to-BP.
     let mut debugger = CpuDebugger::new();
+    // M28 debug viewers: F4 PPU viewer, F6 memory dump, F8 trace logger,
+    // PageUp/PageDown navigate, `[`/`]` switch CPU/PPU region.
+    let mut debug_hotkeys = DebugHotkeys::default();
 
     'running: loop {
-        // Drain all pending events each frame; ESC, window-close, and the
-        // conventional 'Q' key all terminate the loop. NES controller
-        // buttons are wired to the joypad via `InputMapper` (M22). Both
-        // keyboard and gamepad events are routed through the same mapper
-        // so they work simultaneously.
+        // Drain all pending events each frame; ESC / Q / window-close
+        // terminate. NES buttons route through `InputMapper` (M22).
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -237,46 +264,14 @@ fn run() -> Result<(), String> {
                 Event::KeyDown {
                     keycode: Some(k), ..
                 } => {
-                    // Intercept debugger hotkeys (M27) before routing to
-                    // the joypad — F1/F2/F3 are not NES controller buttons.
-                    match k {
-                        Keycode::F1 => {
-                            debugger.toggle_pause();
-                            eprintln!(
-                                "nes-emu: debugger {}",
-                                if debugger.is_paused() {
-                                    "paused"
-                                } else {
-                                    "resumed"
-                                }
-                            );
-                        }
-                        Keycode::F2 => {
-                            if debugger.is_paused() {
-                                debugger.request_step();
-                            } else {
-                                eprintln!(
-                                    "nes-emu: F2 single-step ignored (debugger not paused; press F1 first)"
-                                );
-                            }
-                        }
-                        Keycode::F3 => {
-                            debugger.toggle_run_to_breakpoint();
-                            eprintln!(
-                                "nes-emu: run-to-breakpoint {}",
-                                if debugger.run_to_breakpoint() {
-                                    "ON"
-                                } else {
-                                    "OFF"
-                                }
-                            );
-                            if debugger.run_to_breakpoint() && debugger.breakpoints().is_empty() {
-                                eprintln!(
-                                    "nes-emu: no breakpoints set — add some via the debugger API to use run-to-breakpoint"
-                                );
-                            }
-                        }
-                        _ => mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true),
+                    // Intercept debugger + viewer hotkeys (M27/M28)
+                    // before routing to the joypad. Short-circuit: if
+                    // the M27 debugger consumes the key, the M28
+                    // dispatcher is not consulted (and vice versa).
+                    let consumed = handle_debugger_key(&mut debugger, k)
+                        || debug_hotkeys.handle_key(emulator.bus(), k);
+                    if !consumed {
+                        mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true);
                     }
                 }
                 Event::KeyUp {
@@ -302,12 +297,8 @@ fn run() -> Result<(), String> {
                         );
                     }
                 }
-                // Gamepad hot-plug: open the newly added controller and
-                // assign it the next sequential NES controller index. The
-                // `which` field here is the joystick **device index** (not
-                // instance ID) — that's what `GameControllerSubsystem::open`
-                // expects. After opening, we record the mapping from the
-                // new controller's instance ID to its sequential index.
+                // Gamepad hot-plug: `which` is the joystick device index
+                // (not instance ID) — that's what `open` expects.
                 Event::ControllerDeviceAdded { which, .. } => {
                     match game_controller_subsystem.open(which) {
                         Ok(c) => {
@@ -330,11 +321,9 @@ fn run() -> Result<(), String> {
                         }
                     }
                 }
-                // Gamepad hot-unplug: drop it from the index map. The
-                // `GameController` itself stays in `gamepads` (dropping it
-                // would close the device); SDL2 simply stops sending events
-                // for it. We keep the sequential slot reserved so a later
-                // hot-plug doesn't renumber existing controllers.
+                // Gamepad hot-unplug: drop from the index map. The
+                // `GameController` stays in `gamepads` (dropping it would
+                // close the device); the slot stays reserved.
                 Event::ControllerDeviceRemoved { which, .. } => {
                     if gamepad_index_map.remove(&which).is_some() {
                         eprintln!("nes-emu: gamepad (instance {which}) removed");
@@ -353,6 +342,16 @@ fn run() -> Result<(), String> {
         if debugger.is_paused() {
             if debugger.consume_step_request() {
                 emulator.step_instruction();
+            }
+        } else if debug_hotkeys.trace_enabled() {
+            // M28: when trace logging is on, run the frame through
+            // `step_frame_traced` so every executed instruction is
+            // written to the trace file.
+            emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
+            if debugger.is_paused() {
+                if let Some(bp) = debugger.last_hit() {
+                    eprintln!("nes-emu: breakpoint hit: {bp}");
+                }
             }
         } else {
             emulator.step_frame_debug(&mut debugger);
@@ -391,6 +390,9 @@ fn run() -> Result<(), String> {
             }
         }
     }
+
+    // M28: flush + close the trace log on exit so no lines are lost.
+    debug_hotkeys.shutdown();
 
     Ok(())
 }
