@@ -32,11 +32,14 @@
 //! # Dummy reads
 //!
 //! Several addressing modes perform a spurious read before the real access
-//! (indexed reads on page cross, RMW reads). These have no observable
-//! effect until bus devices with read side-effects (PPU registers, certain
-//! mappers) are introduced in later milestones; the cycle counts here
-//! already account for them. Actual dummy read bus cycles will be issued
-//! when those devices land.
+//! (indexed reads on page cross, RMW reads, store dummy reads, zero-page
+//! indexed base reads). These trigger side effects on bus devices with
+//! read-sensitive registers (PPU `$2002` VBlank-clear, `$2004` OAMADDR
+//! increment, `$2007` VRAM-advance, and certain mappers). The dummy-read
+//! addressing helpers in [`super::addressing`] (`am_absolute_x_read`,
+//! `am_absolute_x_rmw`, `am_zero_page_x_dr`, etc.) issue the spurious bus
+//! read at the correct cycle so those side-effects fire. Cycle counts
+//! already account for the extra cycle.
 
 use super::flags;
 use super::{Cpu, Operand};
@@ -61,8 +64,8 @@ impl Cpu {
                 3
             }
             0xB5 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                let v = self.read_operand(bus, op);
+                let a = self.am_zero_page_x_dr(bus);
+                let v = bus.read(a);
                 self.lda(v);
                 4
             }
@@ -73,13 +76,13 @@ impl Cpu {
                 4
             }
             0xBD => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 let v = bus.read(a);
                 self.lda(v);
                 4 + u8::from(pc)
             }
             0xB9 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 let v = bus.read(a);
                 self.lda(v);
                 4 + u8::from(pc)
@@ -91,7 +94,7 @@ impl Cpu {
                 6
             }
             0xB1 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 let v = bus.read(a);
                 self.lda(v);
                 5 + u8::from(pc)
@@ -110,8 +113,8 @@ impl Cpu {
                 3
             }
             0xB6 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageY);
-                let v = self.read_operand(bus, op);
+                let a = self.am_zero_page_y_dr(bus);
+                let v = bus.read(a);
                 self.ldx(v);
                 4
             }
@@ -122,7 +125,7 @@ impl Cpu {
                 4
             }
             0xBE => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 let v = bus.read(a);
                 self.ldx(v);
                 4 + u8::from(pc)
@@ -141,8 +144,8 @@ impl Cpu {
                 3
             }
             0xB4 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                let v = self.read_operand(bus, op);
+                let a = self.am_zero_page_x_dr(bus);
+                let v = bus.read(a);
                 self.ldy(v);
                 4
             }
@@ -153,7 +156,7 @@ impl Cpu {
                 4
             }
             0xBC => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 let v = bus.read(a);
                 self.ldy(v);
                 4 + u8::from(pc)
@@ -166,8 +169,8 @@ impl Cpu {
                 3
             }
             0x95 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.write_operand(bus, op, self.a);
+                let a = self.am_zero_page_x_dr(bus);
+                bus.write(a, self.a);
                 4
             }
             0x8D => {
@@ -176,12 +179,12 @@ impl Cpu {
                 4
             }
             0x9D => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 bus.write(a, self.a);
                 5
             } // no page-cross penalty on store
             0x99 => {
-                let (a, _) = self.am_absolute_y(bus);
+                let a = self.am_absolute_y_rmw(bus);
                 bus.write(a, self.a);
                 5
             }
@@ -191,7 +194,7 @@ impl Cpu {
                 6
             }
             0x91 => {
-                let (a, _) = self.am_indirect_y(bus);
+                let a = self.am_indirect_y_rmw(bus);
                 bus.write(a, self.a);
                 6
             }
@@ -203,8 +206,8 @@ impl Cpu {
                 3
             }
             0x96 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageY);
-                self.write_operand(bus, op, self.x);
+                let a = self.am_zero_page_y_dr(bus);
+                bus.write(a, self.x);
                 4
             }
             0x8E => {
@@ -220,8 +223,8 @@ impl Cpu {
                 3
             }
             0x94 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.write_operand(bus, op, self.y);
+                let a = self.am_zero_page_x_dr(bus);
+                bus.write(a, self.y);
                 4
             }
             0x8C => {
@@ -287,8 +290,8 @@ impl Cpu {
                 3
             }
             0x35 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.and(self.read_operand(bus, op));
+                let a = self.am_zero_page_x_dr(bus);
+                self.and(bus.read(a));
                 4
             }
             0x2D => {
@@ -297,12 +300,12 @@ impl Cpu {
                 4
             }
             0x3D => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 self.and(bus.read(a));
                 4 + u8::from(pc)
             }
             0x39 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 self.and(bus.read(a));
                 4 + u8::from(pc)
             }
@@ -312,7 +315,7 @@ impl Cpu {
                 6
             }
             0x31 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 self.and(bus.read(a));
                 5 + u8::from(pc)
             }
@@ -328,8 +331,8 @@ impl Cpu {
                 3
             }
             0x15 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.ora(self.read_operand(bus, op));
+                let a = self.am_zero_page_x_dr(bus);
+                self.ora(bus.read(a));
                 4
             }
             0x0D => {
@@ -338,12 +341,12 @@ impl Cpu {
                 4
             }
             0x1D => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 self.ora(bus.read(a));
                 4 + u8::from(pc)
             }
             0x19 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 self.ora(bus.read(a));
                 4 + u8::from(pc)
             }
@@ -353,7 +356,7 @@ impl Cpu {
                 6
             }
             0x11 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 self.ora(bus.read(a));
                 5 + u8::from(pc)
             }
@@ -369,8 +372,8 @@ impl Cpu {
                 3
             }
             0x55 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.eor(self.read_operand(bus, op));
+                let a = self.am_zero_page_x_dr(bus);
+                self.eor(bus.read(a));
                 4
             }
             0x4D => {
@@ -379,12 +382,12 @@ impl Cpu {
                 4
             }
             0x5D => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 self.eor(bus.read(a));
                 4 + u8::from(pc)
             }
             0x59 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 self.eor(bus.read(a));
                 4 + u8::from(pc)
             }
@@ -394,7 +397,7 @@ impl Cpu {
                 6
             }
             0x51 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 self.eor(bus.read(a));
                 5 + u8::from(pc)
             }
@@ -423,8 +426,8 @@ impl Cpu {
                 3
             }
             0x75 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.adc(self.read_operand(bus, op));
+                let a = self.am_zero_page_x_dr(bus);
+                self.adc(bus.read(a));
                 4
             }
             0x6D => {
@@ -433,12 +436,12 @@ impl Cpu {
                 4
             }
             0x7D => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 self.adc(bus.read(a));
                 4 + u8::from(pc)
             }
             0x79 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 self.adc(bus.read(a));
                 4 + u8::from(pc)
             }
@@ -448,7 +451,7 @@ impl Cpu {
                 6
             }
             0x71 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 self.adc(bus.read(a));
                 5 + u8::from(pc)
             }
@@ -465,8 +468,8 @@ impl Cpu {
                 3
             }
             0xF5 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.sbc(self.read_operand(bus, op));
+                let a = self.am_zero_page_x_dr(bus);
+                self.sbc(bus.read(a));
                 4
             }
             0xED => {
@@ -475,12 +478,12 @@ impl Cpu {
                 4
             }
             0xFD => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 self.sbc(bus.read(a));
                 4 + u8::from(pc)
             }
             0xF9 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 self.sbc(bus.read(a));
                 4 + u8::from(pc)
             }
@@ -490,7 +493,7 @@ impl Cpu {
                 6
             }
             0xF1 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 self.sbc(bus.read(a));
                 5 + u8::from(pc)
             }
@@ -507,8 +510,8 @@ impl Cpu {
                 3
             }
             0xD5 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.cmp(self.a, self.read_operand(bus, op));
+                let a = self.am_zero_page_x_dr(bus);
+                self.cmp(self.a, bus.read(a));
                 4
             }
             0xCD => {
@@ -517,12 +520,12 @@ impl Cpu {
                 4
             }
             0xDD => {
-                let (a, pc) = self.am_absolute_x(bus);
+                let (a, pc) = self.am_absolute_x_read(bus);
                 self.cmp(self.a, bus.read(a));
                 4 + u8::from(pc)
             }
             0xD9 => {
-                let (a, pc) = self.am_absolute_y(bus);
+                let (a, pc) = self.am_absolute_y_read(bus);
                 self.cmp(self.a, bus.read(a));
                 4 + u8::from(pc)
             }
@@ -532,7 +535,7 @@ impl Cpu {
                 6
             }
             0xD1 => {
-                let (a, pc) = self.am_indirect_y(bus);
+                let (a, pc) = self.am_indirect_y_read(bus);
                 self.cmp(self.a, bus.read(a));
                 5 + u8::from(pc)
             }
@@ -577,8 +580,8 @@ impl Cpu {
                 5
             }
             0xF6 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.rmw(bus, op, Self::inc_value);
+                let a = self.am_zero_page_x_dr(bus);
+                self.rmw(bus, Operand::Address(a), Self::inc_value);
                 6
             }
             0xEE => {
@@ -587,7 +590,7 @@ impl Cpu {
                 6
             }
             0xFE => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 let op = Operand::Address(a);
                 self.rmw(bus, op, Self::inc_value);
                 7
@@ -599,8 +602,8 @@ impl Cpu {
                 5
             }
             0xD6 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.rmw(bus, op, Self::dec_value);
+                let a = self.am_zero_page_x_dr(bus);
+                self.rmw(bus, Operand::Address(a), Self::dec_value);
                 6
             }
             0xCE => {
@@ -609,7 +612,7 @@ impl Cpu {
                 6
             }
             0xDE => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 let op = Operand::Address(a);
                 self.rmw(bus, op, Self::dec_value);
                 7
@@ -649,8 +652,8 @@ impl Cpu {
                 5
             }
             0x16 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.rmw(bus, op, Self::asl_value);
+                let a = self.am_zero_page_x_dr(bus);
+                self.rmw(bus, Operand::Address(a), Self::asl_value);
                 6
             }
             0x0E => {
@@ -659,7 +662,7 @@ impl Cpu {
                 6
             }
             0x1E => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 let op = Operand::Address(a);
                 self.rmw(bus, op, Self::asl_value);
                 7
@@ -677,8 +680,8 @@ impl Cpu {
                 5
             }
             0x56 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.rmw(bus, op, Self::lsr_value);
+                let a = self.am_zero_page_x_dr(bus);
+                self.rmw(bus, Operand::Address(a), Self::lsr_value);
                 6
             }
             0x4E => {
@@ -687,7 +690,7 @@ impl Cpu {
                 6
             }
             0x5E => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 let op = Operand::Address(a);
                 self.rmw(bus, op, Self::lsr_value);
                 7
@@ -705,8 +708,8 @@ impl Cpu {
                 5
             }
             0x36 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.rmw(bus, op, Self::rol_value);
+                let a = self.am_zero_page_x_dr(bus);
+                self.rmw(bus, Operand::Address(a), Self::rol_value);
                 6
             }
             0x2E => {
@@ -715,7 +718,7 @@ impl Cpu {
                 6
             }
             0x3E => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 let op = Operand::Address(a);
                 self.rmw(bus, op, Self::rol_value);
                 7
@@ -733,8 +736,8 @@ impl Cpu {
                 5
             }
             0x76 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPageX);
-                self.rmw(bus, op, Self::ror_value);
+                let a = self.am_zero_page_x_dr(bus);
+                self.rmw(bus, Operand::Address(a), Self::ror_value);
                 6
             }
             0x6E => {
@@ -743,7 +746,7 @@ impl Cpu {
                 6
             }
             0x7E => {
-                let (a, _) = self.am_absolute_x(bus);
+                let a = self.am_absolute_x_rmw(bus);
                 let op = Operand::Address(a);
                 self.rmw(bus, op, Self::ror_value);
                 7
@@ -857,12 +860,16 @@ impl Cpu {
     /// and update N/Z flags from the new value. Used by `INC`, `DEC`,
     /// `ASL`, `LSR`, `ROL`, `ROR` for memory operands (accumulator forms
     /// bypass this and operate on `self.a` directly).
+    ///
+    /// The dummy read at the page-wrap / base address is issued by the
+    /// addressing-mode helper (`am_absolute_x_rmw` / `am_zero_page_x_dr`)
+    /// before this method is called, so the side-effect fires at the
+    /// correct cycle.
     fn rmw<F>(&mut self, bus: &mut Bus, op: Operand, f: F)
     where
         F: FnOnce(&mut Self, u8) -> u8,
     {
         let v = self.read_operand(bus, op);
-        // Dummy read cycle already accounted for in the cycle count.
         let new = f(self, v);
         self.write_operand(bus, op, new);
         self.set_nz(new);
