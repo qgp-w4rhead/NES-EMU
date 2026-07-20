@@ -278,15 +278,23 @@ impl Bus {
             // hardware; reads return the open-bus latch (last written value).
             0x4000..=0x4007 => self.apu_read(addr - APU_IO_BASE),
 
-            // $4008-$4013: APU registers (open-bus latch until M15/M16).
-            0x4008..=0x4013 => self.apu_read(addr - APU_IO_BASE),
+            // $4008-$400B: triangle channel registers (M15). Write-only;
+            // reads return the open-bus latch.
+            0x4008..=0x400B => self.apu_read(addr - APU_IO_BASE),
+
+            // $400C-$400F: noise channel registers (M15). Write-only;
+            // reads return the open-bus latch.
+            0x400C..=0x400F => self.apu_read(addr - APU_IO_BASE),
+
+            // $4010-$4013: DMC channel registers (open-bus latch until M16).
+            0x4010..=0x4013 => self.apu_read(addr - APU_IO_BASE),
 
             // $4014: OAMDMA — write-only; reads return open bus.
             0x4014 => self.apu_read(0x14),
 
-            // $4015: APU status — bits 0,1 reflect pulse length counters;
-            // bits 5-7 come from the open-bus latch (unused / IRQ flags land
-            // in M16). Bits 2-4 are 0 until triangle/noise/DMC (M15/M16).
+            // $4015: APU status — bits 0-3 reflect pulse/triangle/noise
+            // length counters; bits 5-7 come from the open-bus latch
+            // (unused / IRQ flags land in M16). Bit 4 (DMC) is 0 until M16.
             0x4015 => self.apu_status_read(),
 
             // $4016: controller 1 + open-bus bits 1-7.
@@ -322,14 +330,28 @@ impl Bus {
                 self.apu_open_bus[offset as usize] = value;
             }
 
-            // $4008-$4013: APU registers (open-bus latch until M15/M16).
-            0x4008..=0x4013 => self.apu_write(addr - APU_IO_BASE, value),
+            // $4008-$400B: triangle channel registers (M15).
+            0x4008..=0x400B => {
+                let offset = addr - APU_IO_BASE;
+                self.apu_triangle_write(offset, value);
+                self.apu_open_bus[offset as usize] = value;
+            }
+
+            // $400C-$400F: noise channel registers (M15).
+            0x400C..=0x400F => {
+                let offset = addr - APU_IO_BASE;
+                self.apu_noise_write(offset, value);
+                self.apu_open_bus[offset as usize] = value;
+            }
+
+            // $4010-$4013: DMC channel registers (open-bus latch until M16).
+            0x4010..=0x4013 => self.apu_write(addr - APU_IO_BASE, value),
 
             // $4014: OAMDMA — triggers 256-byte DMA from CPU page to OAM.
             0x4014 => self.oam_dma(value),
 
-            // $4015: APU status — enables/disables the pulse channels (bits
-            // 0,1). Other bits latched on the open bus until M15/M16.
+            // $4015: APU status — enables/disables the pulse, triangle, and
+            // noise channels (bits 0-3). The DMC bits (4,7) land in M16.
             0x4015 => {
                 self.apu_open_bus[0x15] = value;
                 self.apu.write_status(value);
@@ -493,10 +515,26 @@ impl Bus {
         }
     }
 
-    /// Read the `$4015` APU status register. Bits 0,1 come from the APU
-    /// (pulse length-counter status); bits 5-7 come from the open-bus
-    /// latch (bit 5 unused, bits 6,7 are IRQ flags handled in M16). Bits
-    /// 2-4 are 0 until triangle/noise/DMC land in M15/M16.
+    /// Write to a triangle channel register. `offset` is `addr - 0x4000`
+    /// in `8..=0xB`: reg = offset - 8 (0..=3).
+    fn apu_triangle_write(&mut self, offset: u16, value: u8) {
+        self.apu
+            .triangle_mut()
+            .write_register((offset - 0x08) as u8, value);
+    }
+
+    /// Write to a noise channel register. `offset` is `addr - 0x4000` in
+    /// `0xC..=0xF`: reg = offset - 0xC (0..=3).
+    fn apu_noise_write(&mut self, offset: u16, value: u8) {
+        self.apu
+            .noise_mut()
+            .write_register((offset - 0x0C) as u8, value);
+    }
+
+    /// Read the `$4015` APU status register. Bits 0-3 come from the APU
+    /// (pulse/triangle/noise length-counter status); bits 5-7 come from
+    /// the open-bus latch (bit 5 unused, bits 6,7 are IRQ flags handled
+    /// in M16). Bit 4 (DMC) is 0 until M16.
     fn apu_status_read(&self) -> u8 {
         (self.apu.read_status() & 0x1F) | (self.apu_open_bus[0x15] & 0xE0)
     }

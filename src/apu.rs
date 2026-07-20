@@ -65,6 +65,25 @@ const MAX_PERIOD: u16 = 0x7FF;
 /// unit mute). See: https://www.nesdev.org/wiki/APU_Sweep
 const MIN_AUDIBLE_PERIOD: u16 = 8;
 
+/// 32-step triangle waveform sequence. The channel outputs one value per
+/// timer period; the sequence ramps 15→0 then 0→15, producing a triangle
+/// wave at 1/32 the timer frequency. There is no envelope — the output
+/// level is taken directly from this table.
+///
+/// See: https://www.nesdev.org/wiki/APU_Triangle#Sequencer
+const TRIANGLE_SEQUENCE: [u8; 32] = [
+    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    13, 14, 15,
+];
+
+/// Noise channel timer periods indexed by the 4-bit period select
+/// (`$400E` bits 0-3). Each entry is the timer reload value in APU cycles.
+///
+/// See: https://www.nesdev.org/wiki/APU_Noise#Tableref
+const NOISE_PERIOD_TABLE: [u16; 16] = [
+    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+];
+
 /// One of the two NES pulse wave channels.
 ///
 /// `pulse2` selects the pulse-2 sweep negate variant, which subtracts one
@@ -390,11 +409,500 @@ impl PulseChannel {
     }
 }
 
-/// The APU — currently owns the two pulse channels. Triangle, noise, DMC,
-/// and the frame counter are added in M15/M16.
+/// The NES triangle wave channel.
+///
+/// The triangle channel produces a 32-step waveform (15→0→15) at full
+/// volume — there is no envelope. Two counters gate the output:
+///
+/// - **Linear counter** — 7-bit, clocked at the quarter-frame rate. The
+///   halt flag (`$4008` bit 7) doubles as the length-counter halt flag.
+/// - **Length counter** — clocked at the half-frame rate, same table as
+///   the pulse channels.
+///
+/// The 11-bit timer ticks at the APU clock rate (CPU/2); each time it
+/// reloads the 32-step sequence advances one position.
+///
+/// Register map (see <https://www.nesdev.org/wiki/APU_Triangle>):
+///
+/// | Register  | Bits          | Function                                     |
+/// |-----------|---------------|----------------------------------------------|
+/// | `$4008`   | `Clll llll`   | Halt/loop + linear counter reload value      |
+/// | `$4009`   | `---- ----`   | Unused                                       |
+/// | `$400A`   | `TTTT TTTT`   | Timer low 8 bits                             |
+/// | `$400B`   | `LLLL LTTT`   | Length load + timer high 3 bits              |
+///
+/// See: https://www.nesdev.org/wiki/APU_Triangle
+/// See: https://www.nesdev.org/wiki/APU_Length_Counter
+pub struct TriangleChannel {
+    // ---- $4008: linear counter control ---------------------------------
+    /// Halt flag — halts both the linear counter and the length counter
+    /// (bit 7 of `$4008`).
+    halt: bool,
+    /// Linear counter reload value (bits 0-6 of `$4008`, 0..=127).
+    linear_reload: u8,
+    /// Current linear counter value; 0 silences the channel.
+    linear_counter: u8,
+    /// Start flag — set on `$400B` write; reloads the linear counter on
+    /// the next quarter-frame clock.
+    linear_start: bool,
+
+    // ---- $400A + $400B: timer ------------------------------------------
+    /// 11-bit timer reload value (period).
+    timer_period: u16,
+    /// Running timer counter.
+    timer: u16,
+    /// Current position in the 32-step triangle sequence (0..=31).
+    sequence: u8,
+
+    // ---- Length counter -------------------------------------------------
+    /// Current length counter value; 0 silences the channel.
+    length_counter: u8,
+    /// Channel enable from `$4015` bit 2. When cleared the length counter
+    /// is forced to 0.
+    enabled: bool,
+}
+
+impl TriangleChannel {
+    /// Create a new, fully-reset triangle channel.
+    fn new() -> Self {
+        Self {
+            halt: false,
+            linear_reload: 0,
+            linear_counter: 0,
+            linear_start: false,
+            timer_period: 0,
+            timer: 0,
+            sequence: 0,
+            length_counter: 0,
+            enabled: false,
+        }
+    }
+
+    /// Write to one of the triangle channel registers.
+    ///
+    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
+    /// the channel base `$4008`).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Triangle#Registers
+    pub fn write_register(&mut self, reg: u8, value: u8) {
+        match reg {
+            0 => {
+                // $4008: Clll llll — halt + linear counter reload value.
+                self.halt = (value & 0x80) != 0;
+                self.linear_reload = value & 0x7F;
+            }
+            1 => {
+                // $4009: unused.
+            }
+            2 => {
+                // $400A: timer low 8 bits.
+                self.timer_period = (self.timer_period & 0xFF00) | value as u16;
+            }
+            3 => {
+                // $400B: LLLL LTTT — length load + timer high 3 bits.
+                let high = (value & 0x07) as u16;
+                self.timer_period = (self.timer_period & 0x00FF) | (high << 8);
+                // The running timer's high 3 bits are set immediately; the
+                // low 8 bits are not affected (matches the pulse $4003
+                // behavior).
+                self.timer = (self.timer & 0x00FF) | (high << 8);
+
+                // Length counter load (only if the channel is enabled via
+                // $4015; otherwise the load is suppressed).
+                if self.enabled {
+                    let idx = (value >> 3) as usize;
+                    self.length_counter = LENGTH_TABLE[idx];
+                }
+
+                // Side effects: linear counter restart + sequencer reset.
+                self.linear_start = true;
+                self.sequence = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the channel enable flag from `$4015`. When cleared, the length
+    /// counter is immediately forced to 0 (silencing the channel).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Status
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.length_counter = 0;
+        }
+    }
+
+    /// Whether the channel is currently enabled via `$4015`.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Current length counter value (0 means the channel is silenced).
+    pub fn length_counter(&self) -> u8 {
+        self.length_counter
+    }
+
+    /// Current linear counter value (0 means the channel is silenced).
+    pub fn linear_counter(&self) -> u8 {
+        self.linear_counter
+    }
+
+    /// Current timer period (11-bit reload value).
+    pub fn timer_period(&self) -> u16 {
+        self.timer_period
+    }
+
+    /// Current running timer counter value.
+    pub fn timer(&self) -> u16 {
+        self.timer
+    }
+
+    /// Current sequence position (0..=31).
+    pub fn sequence(&self) -> u8 {
+        self.sequence
+    }
+
+    /// Advance the channel by one APU cycle (half a CPU cycle). The timer
+    /// counts down; on reaching zero it reloads to the period and the
+    /// 32-step waveform sequencer advances one step.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Triangle#Timer
+    pub fn tick(&mut self) {
+        if self.timer == 0 {
+            self.timer = self.timer_period;
+            self.sequence = (self.sequence + 1) & 0x1F;
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    /// Clock the linear counter (quarter-frame signal from the frame
+    /// counter).
+    ///
+    /// Per NESdev:
+    /// 1. If the start flag is set, reload the counter and clear start.
+    /// 2. Else if the counter is non-zero, decrement it.
+    /// 3. If the halt flag is set, set the start flag (so step 1 runs next
+    ///    quarter-frame — the counter never decrements while halt is set).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Triangle#Linear_counter
+    fn clock_linear(&mut self) {
+        if self.linear_start {
+            self.linear_start = false;
+            self.linear_counter = self.linear_reload;
+        } else if self.linear_counter > 0 {
+            self.linear_counter -= 1;
+        }
+        if self.halt {
+            self.linear_start = true;
+        }
+    }
+
+    /// Clock the length counter (half-frame signal). The counter is held
+    /// (not decremented) when the halt flag is set (shared with the linear
+    /// counter halt).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Length_Counter#Clocking
+    fn clock_length(&mut self) {
+        if !self.halt && self.length_counter > 0 {
+            self.length_counter -= 1;
+        }
+    }
+
+    /// Quarter-frame clock: clocks the linear counter.
+    pub fn clock_quarter_frame(&mut self) {
+        self.clock_linear();
+    }
+
+    /// Half-frame clock: clocks the length counter (the linear counter is
+    /// also clocked at the quarter-frame rate, which the frame counter
+    /// calls separately).
+    pub fn clock_half_frame(&mut self) {
+        self.clock_length();
+    }
+
+    /// Current output sample (0..=15). Returns 0 when the channel is
+    /// disabled or silenced by the length counter or the linear counter
+    /// reaching zero. The triangle channel has no envelope — the output
+    /// level is taken directly from the 32-step waveform sequence.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Triangle#Output
+    pub fn sample(&self) -> u8 {
+        if !self.enabled || self.length_counter == 0 || self.linear_counter == 0 {
+            return 0;
+        }
+        TRIANGLE_SEQUENCE[self.sequence as usize]
+    }
+}
+
+/// The NES noise channel.
+///
+/// The noise channel produces pseudo-random audio via a 15-bit linear-
+/// feedback shift register (LFSR). Two feedback taps are selectable via
+/// the mode bit (`$400E` bit 7): bits 0+1 (default, periodic) or bits 0+6
+/// (metallic). The channel shares the envelope + length-counter design
+/// of the pulse channels but has no sweep and a fixed lookup-table period.
+///
+/// Register map (see <https://www.nesdev.org/wiki/APU_Noise>):
+///
+/// | Register  | Bits          | Function                                     |
+/// |-----------|---------------|----------------------------------------------|
+/// | `$400C`   | `--LC VVVV`   | Halt/loop + constant-volume + volume         |
+/// | `$400D`   | `---- ----`   | Unused                                       |
+/// | `$400E`   | `L--- PPPP`   | Mode + period select (index into table)      |
+/// | `$400F`   | `LLLL L---`   | Length load + envelope restart               |
+///
+/// See: https://www.nesdev.org/wiki/APU_Noise
+/// See: https://www.nesdev.org/wiki/APU_Envelope
+/// See: https://www.nesdev.org/wiki/APU_Length_Counter
+pub struct NoiseChannel {
+    // ---- $400C: envelope / length control ------------------------------
+    /// Length-counter halt / envelope loop flag (bit 5 of `$400C`).
+    halt: bool,
+    /// Constant-volume mode (bit 4 of `$400C`).
+    constant_volume: bool,
+    /// Volume / envelope divider period (bits 3-0 of `$400C`), 0..=15.
+    volume: u8,
+
+    // ---- $400E: mode + period ------------------------------------------
+    /// LFSR mode (bit 7 of `$400E`): `false` = XOR bits 0,1; `true` = XOR
+    /// bits 0,6.
+    mode: bool,
+    /// Period index (bits 0-3 of `$400E`) into `NOISE_PERIOD_TABLE`.
+    period_index: u8,
+
+    // ---- Timer ----------------------------------------------------------
+    /// Current timer reload value (from `NOISE_PERIOD_TABLE[period_index]`).
+    timer_period: u16,
+    /// Running timer counter.
+    timer: u16,
+
+    // ---- LFSR -----------------------------------------------------------
+    /// 15-bit linear-feedback shift register. Initialized to 1 on reset
+    /// per the NESdev wiki.
+    lfsr: u16,
+
+    // ---- Length counter -------------------------------------------------
+    /// Current length counter value; 0 silences the channel.
+    length_counter: u8,
+    /// Channel enable from `$4015` bit 3. When cleared the length counter
+    /// is forced to 0.
+    enabled: bool,
+
+    // ---- Envelope -------------------------------------------------------
+    /// Envelope divider count.
+    envelope_divider: u8,
+    /// Current envelope decay level (0..=15) — used as the output volume
+    /// when not in constant-volume mode.
+    envelope_decay: u8,
+    /// Start flag — set on `$400F` write; restarts the envelope on the
+    /// next quarter-frame clock.
+    envelope_start: bool,
+}
+
+impl NoiseChannel {
+    /// Create a new, fully-reset noise channel. The LFSR is initialized
+    /// to 1 per the NESdev wiki and the timer period defaults to the
+    /// first entry of the noise period table.
+    fn new() -> Self {
+        Self {
+            halt: false,
+            constant_volume: false,
+            volume: 0,
+            mode: false,
+            period_index: 0,
+            timer_period: NOISE_PERIOD_TABLE[0],
+            timer: 0,
+            lfsr: 1,
+            length_counter: 0,
+            enabled: false,
+            envelope_divider: 0,
+            envelope_decay: 0,
+            envelope_start: false,
+        }
+    }
+
+    /// Write to one of the noise channel registers.
+    ///
+    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
+    /// the channel base `$400C`).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Noise#Registers
+    pub fn write_register(&mut self, reg: u8, value: u8) {
+        match reg {
+            0 => {
+                // $400C: --LC VVVV
+                self.halt = (value & 0x20) != 0;
+                self.constant_volume = (value & 0x10) != 0;
+                self.volume = value & 0x0F;
+            }
+            1 => {
+                // $400D: unused.
+            }
+            2 => {
+                // $400E: L--- PPPP — mode + period select.
+                self.mode = (value & 0x80) != 0;
+                self.period_index = value & 0x0F;
+                self.timer_period = NOISE_PERIOD_TABLE[self.period_index as usize];
+                // The running timer is not reset on a period change.
+            }
+            3 => {
+                // $400F: LLLL L--- — length load + envelope restart.
+                if self.enabled {
+                    let idx = (value >> 3) as usize;
+                    self.length_counter = LENGTH_TABLE[idx];
+                }
+                self.envelope_start = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the channel enable flag from `$4015`. When cleared, the length
+    /// counter is immediately forced to 0 (silencing the channel).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Status
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.length_counter = 0;
+        }
+    }
+
+    /// Whether the channel is currently enabled via `$4015`.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Current length counter value (0 means the channel is silenced).
+    pub fn length_counter(&self) -> u8 {
+        self.length_counter
+    }
+
+    /// Current envelope decay level (the volume used in envelope mode).
+    pub fn envelope_decay(&self) -> u8 {
+        self.envelope_decay
+    }
+
+    /// Current timer period (from the noise period lookup table).
+    pub fn timer_period(&self) -> u16 {
+        self.timer_period
+    }
+
+    /// Current running timer counter value.
+    pub fn timer(&self) -> u16 {
+        self.timer
+    }
+
+    /// Current LFSR value (15-bit shift register).
+    pub fn lfsr(&self) -> u16 {
+        self.lfsr
+    }
+
+    /// Current LFSR mode (`false` = bits 0+1, `true` = bits 0+6).
+    pub fn mode(&self) -> bool {
+        self.mode
+    }
+
+    /// Current period index (0..=15) into `NOISE_PERIOD_TABLE`.
+    pub fn period_index(&self) -> u8 {
+        self.period_index
+    }
+
+    /// Advance the channel by one APU cycle (half a CPU cycle). The timer
+    /// counts down; on reaching zero it reloads to the period and the LFSR
+    /// is clocked (one shift).
+    ///
+    /// LFSR feedback: `bit 0 XOR (mode ? bit 6 : bit 1)`. The register is
+    /// shifted right by 1 and bit 14 is set to the feedback bit.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Noise#Shift_register
+    pub fn tick(&mut self) {
+        if self.timer == 0 {
+            self.timer = self.timer_period;
+            // Clock the LFSR.
+            let bit0 = self.lfsr & 0x0001;
+            let tap = if self.mode { 6 } else { 1 };
+            let tap_bit = (self.lfsr >> tap) & 0x0001;
+            let feedback = bit0 ^ tap_bit;
+            self.lfsr >>= 1;
+            if feedback != 0 {
+                self.lfsr |= 0x4000; // bit 14
+            }
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    /// Clock the envelope (quarter-frame signal from the frame counter).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Envelope#Clocking
+    pub fn clock_envelope(&mut self) {
+        if self.envelope_start {
+            self.envelope_start = false;
+            self.envelope_decay = 15;
+            self.envelope_divider = self.volume;
+        } else if self.envelope_divider == 0 {
+            self.envelope_divider = self.volume;
+            if self.envelope_decay > 0 {
+                self.envelope_decay -= 1;
+            } else if self.halt {
+                self.envelope_decay = 15;
+            }
+        } else {
+            self.envelope_divider -= 1;
+        }
+    }
+
+    /// Clock the length counter (half-frame signal). The counter is held
+    /// (not decremented) when the halt flag is set.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Length_Counter#Clocking
+    fn clock_length(&mut self) {
+        if !self.halt && self.length_counter > 0 {
+            self.length_counter -= 1;
+        }
+    }
+
+    /// Quarter-frame clock: clocks the envelope.
+    pub fn clock_quarter_frame(&mut self) {
+        self.clock_envelope();
+    }
+
+    /// Half-frame clock: clocks the length counter.
+    pub fn clock_half_frame(&mut self) {
+        self.clock_length();
+    }
+
+    /// Current output sample (0..=15). Returns 0 when the channel is
+    /// silenced (length counter zero) or when LFSR bit 0 is set (the
+    /// hardware gates the output on the inverted bit 0). Otherwise the
+    /// output is the envelope decay level (or constant volume).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Noise#Output
+    pub fn sample(&self) -> u8 {
+        if !self.enabled || self.length_counter == 0 {
+            return 0;
+        }
+        if self.lfsr & 1 != 0 {
+            return 0;
+        }
+        if self.constant_volume {
+            self.volume
+        } else {
+            self.envelope_decay
+        }
+    }
+}
+
+/// The APU — owns the two pulse channels, the triangle channel, and the
+/// noise channel. The DMC channel and frame counter are added in M16.
 pub struct Apu {
     pulse1: PulseChannel,
     pulse2: PulseChannel,
+    triangle: TriangleChannel,
+    noise: NoiseChannel,
     /// Half-cycle accumulator: the APU runs at CPU clock / 2, so one APU
     /// cycle is two CPU cycles. This accumulates fractional APU cycles
     /// across `step` calls.
@@ -402,11 +910,13 @@ pub struct Apu {
 }
 
 impl Apu {
-    /// Build a reset APU with both pulse channels silenced.
+    /// Build a reset APU with all channels silenced.
     pub fn new() -> Self {
         Self {
             pulse1: PulseChannel::new(false),
             pulse2: PulseChannel::new(true),
+            triangle: TriangleChannel::new(),
+            noise: NoiseChannel::new(),
             cycle_accumulator: 0,
         }
     }
@@ -431,19 +941,42 @@ impl Apu {
         &mut self.pulse2
     }
 
-    /// Write the status register `$4015`. Bits 0 and 1 enable/disable the
-    /// two pulse channels (clearing the bit forces the channel's length
-    /// counter to zero). Other bits are handled in M15/M16.
+    /// Borrow the triangle channel.
+    pub fn triangle(&self) -> &TriangleChannel {
+        &self.triangle
+    }
+
+    /// Mutably borrow the triangle channel.
+    pub fn triangle_mut(&mut self) -> &mut TriangleChannel {
+        &mut self.triangle
+    }
+
+    /// Borrow the noise channel.
+    pub fn noise(&self) -> &NoiseChannel {
+        &self.noise
+    }
+
+    /// Mutably borrow the noise channel.
+    pub fn noise_mut(&mut self) -> &mut NoiseChannel {
+        &mut self.noise
+    }
+
+    /// Write the status register `$4015`. Bits 0-3 enable/disable the
+    /// pulse 1, pulse 2, triangle, and noise channels (clearing a bit
+    /// forces that channel's length counter to zero). The DMC bits (4,7)
+    /// land in M16.
     ///
     /// See: https://www.nesdev.org/wiki/APU_Status
     pub fn write_status(&mut self, value: u8) {
         self.pulse1.set_enabled(value & 0x01 != 0);
         self.pulse2.set_enabled(value & 0x02 != 0);
+        self.triangle.set_enabled(value & 0x04 != 0);
+        self.noise.set_enabled(value & 0x08 != 0);
     }
 
-    /// Read the status register `$4015`. Bits 0 and 1 reflect whether each
-    /// pulse channel's length counter is non-zero. Other bits (triangle,
-    /// noise, DMC, IRQ flags) are 0 until M15/M16.
+    /// Read the status register `$4015`. Bits 0-3 reflect whether each
+    /// channel's length counter is non-zero. The DMC and IRQ flags
+    /// (bits 4,6,7) are 0 until M16.
     ///
     /// See: https://www.nesdev.org/wiki/APU_Status
     pub fn read_status(&self) -> u8 {
@@ -454,11 +987,17 @@ impl Apu {
         if self.pulse2.length_counter > 0 {
             v |= 0x02;
         }
+        if self.triangle.length_counter > 0 {
+            v |= 0x04;
+        }
+        if self.noise.length_counter > 0 {
+            v |= 0x08;
+        }
         v
     }
 
-    /// Advance the APU by `cpu_cycles` CPU cycles. The pulse channel timers
-    /// tick once per APU cycle (every 2 CPU cycles). Frame-counter clocking
+    /// Advance the APU by `cpu_cycles` CPU cycles. All channel timers tick
+    /// once per APU cycle (every 2 CPU cycles). Frame-counter clocking
     /// (quarter/half-frame) is added in M16.
     pub fn step(&mut self, cpu_cycles: u32) {
         self.cycle_accumulator = self.cycle_accumulator.saturating_add(cpu_cycles);
@@ -466,28 +1005,41 @@ impl Apu {
             self.cycle_accumulator -= 2;
             self.pulse1.tick();
             self.pulse2.tick();
+            self.triangle.tick();
+            self.noise.tick();
         }
     }
 
-    /// Quarter-frame signal — clocks the pulse envelopes. Called by the
-    /// frame counter (M16) at ≈240 Hz NTSC.
+    /// Quarter-frame signal — clocks the pulse/noise envelopes and the
+    /// triangle linear counter. Called by the frame counter (M16) at
+    /// ≈240 Hz NTSC.
     pub fn clock_quarter_frame(&mut self) {
         self.pulse1.clock_quarter_frame();
         self.pulse2.clock_quarter_frame();
+        self.triangle.clock_quarter_frame();
+        self.noise.clock_quarter_frame();
     }
 
-    /// Half-frame signal — clocks the pulse length counters and sweep
-    /// units. Called by the frame counter (M16) at ≈120 Hz NTSC.
+    /// Half-frame signal — clocks the length counters (all four channels)
+    /// and the pulse sweep units. The triangle linear counter is clocked
+    /// separately at the quarter-frame rate by `clock_quarter_frame`.
+    /// Called by the frame counter (M16) at ≈120 Hz NTSC.
     pub fn clock_half_frame(&mut self) {
         self.pulse1.clock_half_frame();
         self.pulse2.clock_half_frame();
+        self.triangle.clock_half_frame();
+        self.noise.clock_half_frame();
     }
 
-    /// Mix the current pulse channel samples into a single 0..=15 value.
-    /// For M14 this is a simple sum (clamped); the non-linear mixer and
-    /// remaining channels land in M15/M16.
+    /// Mix the current channel samples into a single 0..=15 value. For
+    /// M15 this is a simple sum (clamped); the non-linear mixer lands in
+    /// Tier 3. The triangle channel's full-volume output (0..=15) is
+    /// added directly; the noise channel contributes its envelope volume.
     pub fn mix(&self) -> u8 {
-        let s = self.pulse1.sample() as u16 + self.pulse2.sample() as u16;
+        let s = self.pulse1.sample() as u16
+            + self.pulse2.sample() as u16
+            + self.triangle.sample() as u16
+            + self.noise.sample() as u16;
         if s > 15 {
             15
         } else {
@@ -963,6 +1515,532 @@ mod tests {
             p.write_register(3, 0x00);
         }
         // Each channel outputs 15 at sequence 0; mix clamps 15+15 to 15.
+        assert_eq!(apu.mix(), 15);
+    }
+
+    // ============================================================
+    // Triangle channel (M15)
+    // ============================================================
+
+    /// Build a triangle channel with a loaded length + linear counter,
+    /// enabled via `$4015`. The linear counter is started by the `$400B`
+    /// write's start flag, then clocked once via `clock_quarter_frame` to
+    /// reload it to the configured reload value.
+    fn triangle_audible(period: u16, linear_reload: u8) -> TriangleChannel {
+        let mut c = TriangleChannel::new();
+        c.set_enabled(true);
+        // $4008: halt clear, linear reload value.
+        c.write_register(0, linear_reload & 0x7F);
+        // $400A: timer low.
+        c.write_register(2, (period & 0xFF) as u8);
+        // $400B: length index 0 (length = 10) + timer high.
+        c.write_register(3, ((period >> 8) as u8) & 0x07);
+        // Start the linear counter (the $400B write set the start flag;
+        // clock it once to reload).
+        c.clock_quarter_frame();
+        c
+    }
+
+    #[test]
+    fn triangle_sequence_is_correct() {
+        // 32-step ramp: 15→0 (with a doubled 0) then 0→15.
+        assert_eq!(TRIANGLE_SEQUENCE[0], 15);
+        assert_eq!(TRIANGLE_SEQUENCE[15], 0);
+        assert_eq!(TRIANGLE_SEQUENCE[16], 0);
+        assert_eq!(TRIANGLE_SEQUENCE[31], 15);
+        assert_eq!(TRIANGLE_SEQUENCE.len(), 32);
+    }
+
+    #[test]
+    fn triangle_timer_reload_advances_sequence_one_step() {
+        // period = 0 → every tick reloads + advances.
+        let mut c = triangle_audible(0, 127);
+        let s0 = c.sequence();
+        c.tick();
+        assert_eq!(c.sequence(), (s0 + 1) & 0x1F);
+        c.tick();
+        assert_eq!(c.sequence(), (s0 + 2) & 0x1F);
+    }
+
+    #[test]
+    fn triangle_timer_counts_down_then_reloads() {
+        // period = 3. After $400B the running timer's high 3 bits are set
+        // but the low 8 bits are 0, so timer starts at 0. The first tick
+        // reloads to 3 and advances the sequence.
+        let mut c = triangle_audible(3, 127);
+        assert_eq!(c.timer(), 0);
+        c.tick(); // 0 → reload(3) + advance
+        assert_eq!(c.timer(), 3);
+        c.tick(); // 3 → 2
+        c.tick(); // 2 → 1
+        c.tick(); // 1 → 0
+        c.tick(); // 0 → reload(3) + advance
+        assert_eq!(c.timer(), 3);
+    }
+
+    #[test]
+    fn triangle_400b_write_preserves_low_8_bits_of_running_timer() {
+        let mut c = triangle_audible(0x1FF, 127);
+        // After $400B: timer = (0 & 0xFF) | (1 << 8) = 0x100.
+        assert_eq!(c.timer(), 0x100);
+        c.tick(); // 0x100 → 0x0FF
+        assert_eq!(c.timer(), 0x0FF);
+        // Write $400B with high = 0x3. Low 8 bits (0xFF) preserved.
+        c.write_register(3, 0x03);
+        assert_eq!(c.timer(), 0x3FF);
+        assert_eq!(c.timer_period(), 0x3FF);
+    }
+
+    #[test]
+    fn triangle_length_load_gated_by_4015_enable() {
+        let mut c = TriangleChannel::new();
+        // Not enabled — length load suppressed.
+        c.write_register(3, 0 << 3);
+        assert_eq!(c.length_counter(), 0);
+        // Enable + load.
+        c.set_enabled(true);
+        c.write_register(3, 0 << 3);
+        assert_eq!(c.length_counter(), LENGTH_TABLE[0]);
+    }
+
+    #[test]
+    fn triangle_length_decrements_on_half_frame() {
+        let mut c = triangle_audible(8, 127);
+        let start = c.length_counter();
+        c.clock_half_frame();
+        assert_eq!(c.length_counter(), start - 1);
+    }
+
+    #[test]
+    fn triangle_length_halt_freezes_count() {
+        let mut c = TriangleChannel::new();
+        c.set_enabled(true);
+        // $4008 bit 7 = halt (halts both linear and length counters).
+        c.write_register(0, 0x80);
+        c.write_register(3, 0 << 3); // length = 10
+        let start = c.length_counter();
+        c.clock_half_frame();
+        assert_eq!(c.length_counter(), start);
+    }
+
+    #[test]
+    fn triangle_linear_counter_reloads_on_start() {
+        let mut c = TriangleChannel::new();
+        c.set_enabled(true);
+        c.write_register(0, 0x2A); // linear reload = 0x2A
+        c.write_register(3, 0); // sets linear_start
+        assert_eq!(c.linear_counter(), 0);
+        c.clock_quarter_frame(); // start → reload to 0x2A
+        assert_eq!(c.linear_counter(), 0x2A);
+    }
+
+    #[test]
+    fn triangle_linear_counter_decrements_when_not_halted() {
+        let mut c = triangle_audible(8, 5);
+        assert_eq!(c.linear_counter(), 5);
+        c.clock_quarter_frame();
+        assert_eq!(c.linear_counter(), 4);
+        c.clock_quarter_frame();
+        assert_eq!(c.linear_counter(), 3);
+    }
+
+    #[test]
+    fn triangle_linear_counter_halt_keeps_it_reloaded() {
+        // With halt set, the linear counter is reloaded every quarter-frame
+        // (never decrements).
+        let mut c = TriangleChannel::new();
+        c.set_enabled(true);
+        c.write_register(0, 0x80 | 5); // halt + linear reload 5
+        c.write_register(3, 0); // start flag
+        c.clock_quarter_frame(); // start → reload to 5
+        assert_eq!(c.linear_counter(), 5);
+        c.clock_quarter_frame(); // halt → reload again
+        assert_eq!(c.linear_counter(), 5);
+        c.clock_quarter_frame();
+        assert_eq!(c.linear_counter(), 5);
+    }
+
+    #[test]
+    fn triangle_linear_counter_stops_at_zero() {
+        let mut c = triangle_audible(8, 1);
+        assert_eq!(c.linear_counter(), 1);
+        c.clock_quarter_frame(); // 1 → 0
+        assert_eq!(c.linear_counter(), 0);
+        c.clock_quarter_frame(); // stays 0
+        assert_eq!(c.linear_counter(), 0);
+    }
+
+    #[test]
+    fn triangle_sample_zero_when_length_zero() {
+        let mut c = triangle_audible(8, 127);
+        // Burn down length to 0 (length 10 → 10 half-frames).
+        for _ in 0..10 {
+            c.clock_half_frame();
+        }
+        assert_eq!(c.length_counter(), 0);
+        assert_eq!(c.sample(), 0);
+    }
+
+    #[test]
+    fn triangle_sample_zero_when_linear_zero() {
+        let mut c = triangle_audible(8, 1);
+        // Burn down linear counter to 0 (1 quarter-frame).
+        c.clock_quarter_frame();
+        assert_eq!(c.linear_counter(), 0);
+        assert_eq!(c.sample(), 0);
+    }
+
+    #[test]
+    fn triangle_sample_follows_sequence() {
+        // With length + linear loaded, the sample tracks the 32-step
+        // sequence as the timer advances.
+        let mut c = triangle_audible(0, 127); // period 0 → advance every tick
+        for &expected in TRIANGLE_SEQUENCE.iter() {
+            assert_eq!(c.sample(), expected);
+            c.tick(); // advance to next sequence position
+        }
+        // After 32 ticks the sequence wraps back to position 0.
+        assert_eq!(c.sequence(), 0);
+        assert_eq!(c.sample(), TRIANGLE_SEQUENCE[0]);
+    }
+
+    #[test]
+    fn triangle_disabling_via_4015_clears_length() {
+        let mut c = triangle_audible(8, 127);
+        assert!(c.length_counter() > 0);
+        c.set_enabled(false);
+        assert_eq!(c.length_counter(), 0);
+        assert_eq!(c.sample(), 0);
+    }
+
+    #[test]
+    fn triangle_4009_write_is_ignored() {
+        let mut c = TriangleChannel::new();
+        // $4009 is unused — writing it must not change any state.
+        let before_period = c.timer_period();
+        c.write_register(1, 0xFF);
+        assert_eq!(c.timer_period(), before_period);
+    }
+
+    // ============================================================
+    // Noise channel (M15)
+    // ============================================================
+
+    /// Build a noise channel with a loaded length + envelope started,
+    /// enabled via `$4015`. The envelope is started by the `$400F` write
+    /// and clocked once to set decay = 15.
+    fn noise_audible(period_index: u8, volume: u8) -> NoiseChannel {
+        let mut c = NoiseChannel::new();
+        c.set_enabled(true);
+        // $400C: halt clear, constant volume, volume.
+        c.write_register(0, 0b0001_0000 | (volume & 0x0F));
+        // $400E: mode 0, period index.
+        c.write_register(2, period_index & 0x0F);
+        // $400F: length index 0 (length = 10) + envelope restart.
+        c.write_register(3, 0 << 3);
+        c
+    }
+
+    #[test]
+    fn noise_period_table_loads_correct_values() {
+        let mut c = NoiseChannel::new();
+        for (idx, &expected) in NOISE_PERIOD_TABLE.iter().enumerate() {
+            c.write_register(2, idx as u8);
+            assert_eq!(c.timer_period(), expected);
+            assert_eq!(c.period_index(), idx as u8);
+        }
+    }
+
+    #[test]
+    fn noise_mode_bit_selects_tap() {
+        let mut c = NoiseChannel::new();
+        c.write_register(2, 0x00); // mode 0
+        assert!(!c.mode());
+        c.write_register(2, 0x80); // mode 1
+        assert!(c.mode());
+    }
+
+    #[test]
+    fn noise_lfsr_shifts_on_timer_reload() {
+        // The LFSR only shifts when the timer reloads. With period index 0
+        // → period 4, the constructor leaves timer = 0, so the first tick
+        // reloads + shifts. Thereafter each shift takes period+1 ticks
+        // (period ticks to count down + 1 to trigger the reload).
+        let mut c = NoiseChannel::new();
+        c.write_register(2, 0); // period index 0 → period 4
+        c.set_enabled(true);
+        let lfsr_before = c.lfsr();
+        // First tick: timer 0 → reload(4) + shift.
+        c.tick();
+        // feedback = bit0 XOR bit1 (mode 0). LFSR=1: bit0=1, bit1=0 → fb=1.
+        // Shift right → 0, set bit 14 → 0x4000.
+        assert_eq!(c.lfsr(), 0x4000);
+        assert_ne!(c.lfsr(), lfsr_before);
+        // 5 ticks (period+1) to the next shift.
+        for _ in 0..5 {
+            c.tick();
+        }
+        // LFSR=0x4000: bit0=0, bit1=0 → fb=0. Shift right → 0x2000.
+        assert_eq!(c.lfsr(), 0x2000);
+    }
+
+    #[test]
+    fn noise_lfsr_mode0_xor_bits_0_and_1() {
+        let mut c = NoiseChannel::new();
+        c.set_enabled(true);
+        c.write_register(2, 0x00); // mode 0, period index 0 → period 4
+                                   // First shift (tick 1): LFSR 1 → 0x4000 (bit0=1,bit1=0 → fb=1).
+        c.tick();
+        assert_eq!(c.lfsr(), 0x4000);
+        // 5 ticks (period+1) to the next shift: 0x4000 → 0x2000 (fb=0).
+        for _ in 0..5 {
+            c.tick();
+        }
+        assert_eq!(c.lfsr(), 0x2000);
+        // Continue until the bit reaches position 1 (LFSR=0x0002). From
+        // position 13 (after shift 2) that's 12 more shifts (13→12→…→1).
+        // Total shifts: 2 + 12 = 14.
+        for _ in 0..12 {
+            for _ in 0..5 {
+                c.tick();
+            }
+        }
+        assert_eq!(c.lfsr(), 0x0002);
+        // One more shift: bit0=0, bit1=1 → fb=1 → 0x4001.
+        for _ in 0..5 {
+            c.tick();
+        }
+        assert_eq!(c.lfsr(), 0x4001);
+    }
+
+    #[test]
+    fn noise_lfsr_mode1_xor_bits_0_and_6() {
+        let mut c = NoiseChannel::new();
+        c.set_enabled(true);
+        c.write_register(2, 0x80); // mode 1, period index 0 → period 4
+                                   // First shift: LFSR 1 → 0x4000 (bit0=1, bit6=0 → fb=1).
+        c.tick();
+        assert_eq!(c.lfsr(), 0x4000);
+        // Same as mode 0 until the bit reaches position 1 or 6. Drive the
+        // LFSR until the bit is at position 6 (LFSR=0x0040). From position
+        // 14 that's 8 shifts (14→13→…→6). 1 shift already done, so 8 more.
+        for _ in 0..8 {
+            for _ in 0..5 {
+                c.tick();
+            }
+        }
+        assert_eq!(c.lfsr(), 0x0040);
+        // At LFSR=0x0040: bit0=0, bit6=1 → mode 1 fb = 0 XOR 1 = 1.
+        // Mode 0 would give bit0=0, bit1=0 → fb=0. So the next shift
+        // differs between modes. Mode 1: fb=1 → shift right (0x0020) +
+        // set bit 14 → 0x4020.
+        for _ in 0..5 {
+            c.tick();
+        }
+        assert_eq!(c.lfsr(), 0x4020);
+    }
+
+    #[test]
+    fn noise_lfsr_mode1_distinguishes_from_mode0() {
+        // Run both modes forward enough that the feedback tap difference
+        // (bit 1 vs bit 6) produces divergent LFSR states. Starting from
+        // LFSR=1, the single bit walks down from position 14; the modes
+        // diverge once the bit reaches position 6 (where mode 1 taps it
+        // but mode 0 doesn't). That's ~8 shifts = ~41 ticks (period 4).
+        let mut c0 = NoiseChannel::new();
+        c0.set_enabled(true);
+        c0.write_register(2, 0x00); // mode 0
+        let mut c1 = NoiseChannel::new();
+        c1.set_enabled(true);
+        c1.write_register(2, 0x80); // mode 1
+        for _ in 0..50 {
+            c0.tick();
+            c1.tick();
+        }
+        // After 50 ticks (10 shifts with period 4) the bit has walked
+        // past position 6, where mode 1 produced different feedback than
+        // mode 0. The LFSRs must have diverged.
+        assert_ne!(c0.lfsr(), c1.lfsr());
+    }
+
+    #[test]
+    fn noise_length_load_gated_by_4015_enable() {
+        let mut c = NoiseChannel::new();
+        c.write_register(3, 0 << 3);
+        assert_eq!(c.length_counter(), 0);
+        c.set_enabled(true);
+        c.write_register(3, 0 << 3);
+        assert_eq!(c.length_counter(), LENGTH_TABLE[0]);
+    }
+
+    #[test]
+    fn noise_length_decrements_on_half_frame() {
+        let mut c = noise_audible(0, 15);
+        let start = c.length_counter();
+        c.clock_half_frame();
+        assert_eq!(c.length_counter(), start - 1);
+    }
+
+    #[test]
+    fn noise_length_halt_freezes_count() {
+        let mut c = NoiseChannel::new();
+        c.set_enabled(true);
+        // $400C bit 5 = halt.
+        c.write_register(0, 0x20);
+        c.write_register(3, 0 << 3);
+        let start = c.length_counter();
+        c.clock_half_frame();
+        assert_eq!(c.length_counter(), start);
+    }
+
+    #[test]
+    fn noise_envelope_restarts_on_400f_write() {
+        let mut c = NoiseChannel::new();
+        c.write_register(0, 0x00); // envelope mode, volume 0
+        c.write_register(3, 0); // start
+        c.clock_envelope(); // start → decay 15
+        assert_eq!(c.envelope_decay(), 15);
+        for _ in 0..3 {
+            c.clock_envelope();
+        }
+        assert!(c.envelope_decay() < 15);
+        c.write_register(3, 0); // restart
+        c.clock_envelope();
+        assert_eq!(c.envelope_decay(), 15);
+    }
+
+    #[test]
+    fn noise_envelope_decays_one_step_per_volume_plus_one_clocks() {
+        let mut c = NoiseChannel::new();
+        c.write_register(0, 0x00); // volume 0 → divider period 1
+        c.write_register(3, 0); // start
+        c.clock_envelope(); // start → decay 15
+        c.clock_envelope(); // divider 0 → reload, decay 15 → 14
+        assert_eq!(c.envelope_decay(), 14);
+        c.clock_envelope();
+        assert_eq!(c.envelope_decay(), 13);
+    }
+
+    #[test]
+    fn noise_constant_volume_bypasses_decay() {
+        let mut c = noise_audible(0, 7);
+        // LFSR starts at 1 (bit 0 set) → sample 0 until the LFSR shifts.
+        assert_eq!(c.lfsr() & 1, 1);
+        assert_eq!(c.sample(), 0);
+        // Tick once: timer 0 → reload(4) + shift. LFSR 1 → 0x4000 (bit 0 = 0).
+        c.tick();
+        assert_eq!(c.lfsr() & 1, 0);
+        assert_eq!(c.sample(), 7);
+        // Clocking the envelope should not change the output volume.
+        for _ in 0..20 {
+            c.clock_envelope();
+            assert_eq!(c.sample(), 7);
+        }
+    }
+
+    #[test]
+    fn noise_sample_zero_when_disabled() {
+        let mut c = NoiseChannel::new();
+        // Not enabled — length load suppressed, sample 0.
+        c.write_register(0, 0b0001_1111); // const vol 15
+        c.write_register(3, 0);
+        assert_eq!(c.sample(), 0);
+    }
+
+    #[test]
+    fn noise_sample_zero_when_length_zero() {
+        let mut c = noise_audible(0, 15);
+        // Burn down length to 0 (length 10 → 10 half-frames).
+        for _ in 0..10 {
+            c.clock_half_frame();
+        }
+        assert_eq!(c.length_counter(), 0);
+        assert_eq!(c.sample(), 0);
+    }
+
+    #[test]
+    fn noise_sample_zero_when_lfsr_bit0_set() {
+        // LFSR starts at 1 (bit 0 set) → sample 0 regardless of volume.
+        let mut c = noise_audible(0, 15);
+        assert_eq!(c.lfsr() & 1, 1);
+        assert_eq!(c.sample(), 0);
+        // After one tick the LFSR shifts to 0x4000 (bit 0 clear) → audible.
+        c.tick();
+        assert_eq!(c.lfsr() & 1, 0);
+        assert_eq!(c.sample(), 15);
+    }
+
+    #[test]
+    fn noise_400d_write_is_ignored() {
+        let mut c = NoiseChannel::new();
+        let before_period = c.timer_period();
+        c.write_register(1, 0xFF);
+        assert_eq!(c.timer_period(), before_period);
+    }
+
+    #[test]
+    fn noise_400e_write_does_not_reset_running_timer() {
+        // Writing $400E changes the period but the running timer keeps
+        // counting down from its current value (the new period applies on
+        // the next reload).
+        let mut c = NoiseChannel::new();
+        c.set_enabled(true);
+        c.write_register(2, 0x00); // period index 0 → period 4
+        c.tick(); // timer 0 → reload(4) + shift; timer now 4
+        c.tick(); // 4 → 3
+        assert_eq!(c.timer(), 3);
+        // Change to period index 1 (period 8). Running timer stays at 3.
+        c.write_register(2, 0x01);
+        assert_eq!(c.timer_period(), 8);
+        assert_eq!(c.timer(), 3);
+        c.tick(); // 3 → 2 (still counting down, not reloaded)
+        assert_eq!(c.timer(), 2);
+    }
+
+    // ---- Apu top-level with triangle + noise ---------------------------
+
+    #[test]
+    fn apu_status_reflects_triangle_and_noise_length() {
+        let mut apu = Apu::new();
+        apu.write_status(0x0C); // enable triangle (bit 2) + noise (bit 3)
+        apu.triangle_mut().write_register(3, 0 << 3); // length = 10
+        apu.noise_mut().write_register(3, 1 << 3); // length = 254
+        let s = apu.read_status();
+        assert_eq!(s & 0x04, 0x04);
+        assert_eq!(s & 0x08, 0x08);
+    }
+
+    #[test]
+    fn apu_step_ticks_triangle_and_noise_timers() {
+        let mut apu = Apu::new();
+        apu.write_status(0x04); // enable triangle
+        apu.triangle_mut().write_register(2, 0x00);
+        apu.triangle_mut().write_register(3, 0x00); // period 0
+        let s0 = apu.triangle().sequence();
+        apu.step(2); // one APU cycle
+        assert_eq!(apu.triangle().sequence(), (s0 + 1) & 0x1F);
+    }
+
+    #[test]
+    fn apu_mix_includes_triangle_and_noise() {
+        let mut apu = Apu::new();
+        apu.write_status(0x0C); // triangle + noise
+                                // Triangle: period 0, length 10, linear counter reloaded.
+        apu.triangle_mut().write_register(0, 127); // linear reload 127
+        apu.triangle_mut().write_register(2, 0x00);
+        apu.triangle_mut().write_register(3, 0x00); // length 10, start
+        apu.clock_quarter_frame(); // start linear counter → 127
+                                   // Noise: const vol 5, length 10. LFSR bit 0 = 1 initially → silent.
+        apu.noise_mut().write_register(0, 0b0001_0101); // const vol 5
+        apu.noise_mut().write_register(3, 0x00); // length 10
+                                                 // Triangle at sequence 0 outputs 15; noise is silent (LFSR bit 0 = 1).
+        assert_eq!(apu.triangle().sample(), 15);
+        assert_eq!(apu.noise().sample(), 0);
+        assert_eq!(apu.mix(), 15);
+        // Shift the noise LFSR so bit 0 = 0 → noise contributes 5.
+        apu.noise_mut().tick();
+        assert_eq!(apu.noise().sample(), 5);
+        // Mix = 15 (triangle) + 5 (noise) = 20 → clamped to 15.
         assert_eq!(apu.mix(), 15);
     }
 }
