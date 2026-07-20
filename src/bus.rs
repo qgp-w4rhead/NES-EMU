@@ -77,6 +77,12 @@ pub struct Bus {
     /// Loaded cartridge, if any. When `None`, cartridge space reads return
     /// open bus (`0x00`) and writes are ignored.
     cartridge: Option<Cartridge>,
+
+    /// Pending OAM-DMA stall cycles (512 per DMA). Set when `$4014` is
+    /// written; consumed by the emulator main loop (M12) so the PPU
+    /// advances by the stall time while the CPU is paused.
+    /// See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
+    dma_stall_cycles: u32,
 }
 
 impl Bus {
@@ -87,6 +93,7 @@ impl Bus {
             ppu: Ppu::new(),
             apu_open_bus: [0u8; APU_IO_REG_COUNT],
             cartridge: None,
+            dma_stall_cycles: 0,
         }
     }
 
@@ -356,8 +363,11 @@ impl Bus {
     }
 
     /// Perform an OAM DMA: copy 256 bytes from CPU page `value << 8` into
-    /// OAM. On real hardware this stalls the CPU for 512 cycles; cycle
-    /// accounting is deferred to M12.
+    /// OAM. On real hardware this stalls the CPU for 512 cycles (514 if
+    /// the write lands on an odd CPU cycle); we model the common 512-cycle
+    /// stall here. The emulator main loop (M12) consumes
+    /// [`Bus::take_dma_stall_cycles`] to advance the PPU by the stall time
+    /// while the CPU is paused.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
     fn oam_dma(&mut self, page: u8) {
@@ -371,6 +381,18 @@ impl Bus {
         self.ppu.oam_dma(&data);
         // Latch the DMA page on the APU/IO open bus for $4014 reads.
         self.apu_open_bus[0x14] = page;
+        // Record the CPU stall cycles for the emulator loop to consume.
+        self.dma_stall_cycles = self.dma_stall_cycles.saturating_add(512);
+    }
+
+    /// Consume and return pending OAM-DMA stall cycles (set by a write to
+    /// `$4014`). The emulator main loop calls this after each `Cpu::step`
+    /// and advances the PPU by 3× the returned value to model the CPU
+    /// being stalled for the DMA transfer.
+    pub fn take_dma_stall_cycles(&mut self) -> u32 {
+        let c = self.dma_stall_cycles;
+        self.dma_stall_cycles = 0;
+        c
     }
 
     /// Read from the APU / I/O register file (open-bus latch until M14/M16).

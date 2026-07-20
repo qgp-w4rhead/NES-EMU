@@ -1,18 +1,22 @@
 //! NES emulator entry point.
 //!
-//! Milestone 1 scope: initialize SDL2, open a 768x720 window (3x integer
-//! scale of the NES's native 256x240 resolution), and run an event loop
-//! that presents a blank black framebuffer each frame and exits when the
-//! user presses ESC or closes the window.
+//! Milestone 12 scope: load an iNES ROM from `--rom <path>`, build the
+//! `EmulatorState`, and run a frame-locked main loop that steps the
+//! emulator one NTSC frame per vsync and presents the PPU framebuffer via
+//! SDL2.
 //!
 //! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
+//! See: https://www.nesdev.org/wiki/Cycle_reference — ~29,830 CPU cycles
+//! per NTSC frame at 60.0988 Hz.
 
 use std::process::ExitCode;
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
-use nes_emu::video::{new_framebuffer, Video, DEFAULT_SCALE};
+use nes_emu::cartridge::Cartridge;
+use nes_emu::emulator::EmulatorState;
+use nes_emu::video::{Video, DEFAULT_SCALE};
 
 /// Application entry point. Returns a process exit code so that SDL2 or
 /// initialization errors are reported cleanly without panicking in the
@@ -27,15 +31,48 @@ fn main() -> ExitCode {
     }
 }
 
-/// Initialize SDL2, build the window, and drive the event loop until the
-/// user requests exit (ESC, window-close, or Q on the window).
+/// Print usage information to stderr.
+fn print_usage() {
+    eprintln!("usage: nes-emu --rom <path-to-.nes>");
+}
+
+/// Parse `--rom <path>` from the argument list. Returns the path or an
+/// error message.
+fn parse_rom_path(args: &[String]) -> Result<String, String> {
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--rom" {
+            return iter
+                .next()
+                .ok_or_else(|| "--rom requires a path argument".to_string())
+                .cloned();
+        }
+        if let Some(rest) = arg.strip_prefix("--rom=") {
+            return Ok(rest.to_string());
+        }
+    }
+    Err("missing --rom <path>".to_string())
+}
+
+/// Initialize SDL2, load the ROM, build the emulator, and drive the
+/// frame-locked main loop until the user requests exit (ESC, window-close,
+/// or Q on the window).
 fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    let rom_path = parse_rom_path(&args).inspect_err(|_e| {
+        print_usage();
+    })?;
+
+    let cartridge = Cartridge::from_path(&rom_path)
+        .map_err(|e| format!("failed to load ROM '{rom_path}': {e}"))?;
+
+    let mut emulator = EmulatorState::new(cartridge);
+    emulator.reset();
+
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
 
     let mut video = Video::new(&video_subsystem, DEFAULT_SCALE)?;
-    let framebuffer = new_framebuffer();
-
     let mut event_pump = sdl_context.event_pump()?;
 
     'running: loop {
@@ -56,10 +93,11 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Present the (currently blank) framebuffer. The framebuffer is
-        // opaque black for M1; later milestones will fill it with real
-        // PPU output.
-        video.present(&framebuffer)?;
+        // Step one full NTSC frame (CPU + PPU in lockstep), then present
+        // the rendered framebuffer. SDL2's vsynced renderer paces the
+        // loop to the monitor refresh rate (~60 Hz).
+        emulator.step_frame();
+        video.present(emulator.framebuffer())?;
     }
 
     Ok(())

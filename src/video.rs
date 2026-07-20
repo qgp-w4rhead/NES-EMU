@@ -105,7 +105,7 @@ impl Video {
 
     /// Upload `fb` to the streaming texture and present it, integer-scaled
     /// to fill the window.
-    pub fn present(&mut self, fb: &Framebuffer) -> Result<(), String> {
+    pub fn present(&mut self, fb: &[u32]) -> Result<(), String> {
         self.texture
             .update(None, to_byte_slice(fb), NES_WIDTH as usize * 4)
             .map_err(|e| format!("texture update failed: {e}"))?;
@@ -124,8 +124,8 @@ impl Video {
 /// texture update API. The framebuffer layout already matches
 /// `ARGB8888` on a little-endian host (bytes: B, G, R, A in memory, which
 /// SDL2 reads as 0xAARRGGBB).
-fn to_byte_slice(fb: &Framebuffer) -> &[u8] {
-    let len = fb.len() * std::mem::size_of::<u32>();
+fn to_byte_slice(fb: &[u32]) -> &[u8] {
+    let len = std::mem::size_of_val(fb);
     // SAFETY: `[u32]` and `[u8]` share the same element alignment
     // requirements for the underlying bytes; we only read within `len`.
     unsafe { std::slice::from_raw_parts(fb.as_ptr() as *const u8, len) }
