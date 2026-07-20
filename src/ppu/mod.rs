@@ -789,6 +789,12 @@ impl Ppu {
     pub fn ppumask(&self) -> u8 {
         self.ppumask
     }
+    /// Whether the PPU is currently rendering (background or sprites
+    /// enabled). Used by the bus to decide whether to clock mapper IRQ
+    /// counters (e.g. MMC3) — A12 only rises during active rendering.
+    pub fn is_rendering(&self) -> bool {
+        (self.ppumask & (MASK_SHOW_BG | MASK_SHOW_SPRITES)) != 0
+    }
     /// Current PPUSTATUS byte (raw, without open-bus fill).
     pub fn ppustatus(&self) -> u8 {
         self.ppustatus

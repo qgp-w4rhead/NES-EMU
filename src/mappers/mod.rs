@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 pub mod mmc1;
+pub mod mmc3;
 pub mod nrom;
 
 use crate::cartridge::CartridgeError;
@@ -69,6 +70,20 @@ pub trait Mapper: Send {
     fn has_battery(&self) -> bool {
         false
     }
+
+    /// Whether the mapper is currently asserting a CPU IRQ. The emulator
+    /// main loop polls this after each CPU step and raises
+    /// `Cpu::irq_pending` when it returns `true`. Default is `false`
+    /// (mappers without IRQ sources need not override this).
+    fn irq_pending(&self) -> bool {
+        false
+    }
+
+    /// Clock the mapper's IRQ counter by one step. Called by the bus when
+    /// the PPU A12 line rises during rendering (approximately once per
+    /// scanline). Used by MMC3 and similar mappers for raster-effect IRQs.
+    /// Default is a no-op.
+    fn clock_irq(&mut self) {}
 }
 
 /// Construct the appropriate mapper for an iNES mapper number.
@@ -91,6 +106,12 @@ pub fn from_ines(
             has_battery,
         ))),
         1 => Ok(Box::new(mmc1::Mmc1::new(
+            prg_rom,
+            chr_rom,
+            mirroring,
+            has_battery,
+        ))),
+        4 => Ok(Box::new(mmc3::Mmc3::new(
             prg_rom,
             chr_rom,
             mirroring,

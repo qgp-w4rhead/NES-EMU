@@ -212,6 +212,18 @@ impl Cartridge {
     pub fn has_battery(&self) -> bool {
         self.mapper.has_battery()
     }
+
+    /// Whether the mapper is currently asserting a CPU IRQ. The emulator
+    /// main loop polls this to raise `Cpu::irq_pending`.
+    pub fn irq_pending(&self) -> bool {
+        self.mapper.irq_pending()
+    }
+
+    /// Clock the mapper's IRQ counter by one step. Called by the bus when
+    /// the PPU A12 line rises during rendering.
+    pub fn clock_irq(&mut self) {
+        self.mapper.clock_irq();
+    }
 }
 
 #[cfg(test)]

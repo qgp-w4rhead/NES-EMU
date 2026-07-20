@@ -328,3 +328,358 @@ fn mmc1_cart_loads_in_emulator() {
     // The emulator should have the cart loaded and not crash on construction.
     assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 1);
 }
+
+// =====================================================================
+// MMC3 (mapper 4) integration tests
+// =====================================================================
+
+/// Build an iNES image for MMC3 (mapper 4). PRG is filled so each 8 KB
+/// bank has a unique byte (bank index); CHR is filled so each 1 KB bank
+/// has a unique byte (bank index).
+fn make_ines_mmc3(prg_8k_banks: u8, chr_1k_banks: u8, flags6: u8) -> Vec<u8> {
+    let prg_size = prg_8k_banks as usize * 8 * 1024;
+    let chr_size = chr_1k_banks as usize * 1024;
+    let mut buf = Vec::with_capacity(HEADER_SIZE + prg_size + chr_size);
+    buf.extend_from_slice(&INES_MAGIC);
+    // PRG banks in 16KB units: prg_8k_banks / 2 (round up).
+    buf.push((prg_8k_banks + 1) / 2);
+    // CHR banks in 8KB units: chr_1k_banks / 8 (round up).
+    buf.push((chr_1k_banks + 7) / 8);
+    buf.push(flags6); // mapper low nibble in high nibble
+    buf.push(0); // flags7 — mapper high nibble = 0
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.resize(HEADER_SIZE + prg_size + chr_size, 0);
+    // Fill PRG: each 8 KB bank with its bank index.
+    for i in 0..prg_size {
+        buf[HEADER_SIZE + i] = (i / (8 * 1024)) as u8;
+    }
+    // Fill CHR: each 1 KB bank with its bank index.
+    for i in 0..chr_size {
+        buf[HEADER_SIZE + prg_size + i] = (i / 1024) as u8;
+    }
+    buf
+}
+
+/// Write to an MMC3 bank register via the bus. `bank_select` is the full
+/// value written to `$8000` (mode bits in 6-7, register index in 0-2);
+/// `value` is written to `$8001`. Callers that need specific PRG/CHR mode
+/// bits should OR them into `bank_select`.
+fn mmc3_write_bank_full(bus: &mut Bus, bank_select: u8, value: u8) {
+    bus.write(0x8000, bank_select);
+    bus.write(0x8001, value);
+}
+
+/// Convenience wrapper for `mmc3_write_bank_full` that selects register
+/// `reg` (0-7) with mode bits = 0 (PRG mode 0, CHR mode 0). Tests that
+/// need mode 1 should use `mmc3_write_bank_full` directly.
+fn mmc3_write_bank(bus: &mut Bus, reg: u8, value: u8) {
+    mmc3_write_bank_full(bus, reg & 0x07, value);
+}
+
+// ---- Mapper selection --------------------------------------------------
+
+#[test]
+fn mmc3_selected_for_mapper_4() {
+    // flags6 high nibble = 4 → mapper 4. Horizontal mirroring.
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load MMC3 cart");
+    assert_eq!(cart.header.mapper_number, 4);
+    assert_eq!(cart.mirror_mode(), Mirroring::Horizontal);
+}
+
+#[test]
+fn mmc3_battery_flag_propagates() {
+    // flags6 = 0b0100_0010 → mapper 4, battery flag.
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0010);
+    let cart = Cartridge::from_bytes(&bytes).expect("load MMC3 cart");
+    assert!(cart.has_battery());
+}
+
+// ---- PRG banking via bus -----------------------------------------------
+
+#[test]
+fn mmc3_prg_mode_0_default_via_bus() {
+    // 4 × 8KB PRG (32 KB). Default mode 0: R6@$8000, R7@$A000, fixed@$C000.
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Default R6=R7=0 → bank 0 at $8000 and $A000.
+    assert_eq!(bus.read(0x8000), 0x00);
+    assert_eq!(bus.read(0xA000), 0x00);
+    // Fixed last 16KB at $C000: banks 2 and 3.
+    assert_eq!(bus.read(0xC000), 0x02);
+    assert_eq!(bus.read(0xE000), 0x03);
+}
+
+#[test]
+fn mmc3_prg_bank_switch_mode_0_via_bus() {
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // R6 = 1 → bank 1 at $8000. R7 = 2 → bank 2 at $A000.
+    mmc3_write_bank(&mut bus, 6, 0x01);
+    mmc3_write_bank(&mut bus, 7, 0x02);
+    assert_eq!(bus.read(0x8000), 0x01);
+    assert_eq!(bus.read(0x9FFF), 0x01);
+    assert_eq!(bus.read(0xA000), 0x02);
+    assert_eq!(bus.read(0xBFFF), 0x02);
+    // Fixed last 16KB unchanged.
+    assert_eq!(bus.read(0xC000), 0x02);
+    assert_eq!(bus.read(0xE000), 0x03);
+}
+
+#[test]
+fn mmc3_prg_mode_1_via_bus() {
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // PRG mode 1: bit 6 of $8000 = 1. R6 = 1 → bank 1 at $C000.
+    mmc3_write_bank_full(&mut bus, 0b0100_0000 | 6, 0x01);
+    // R7 = 2 → bank 2 at $A000 (preserve PRG mode 1).
+    mmc3_write_bank_full(&mut bus, 0b0100_0000 | 7, 0x02);
+    // $8000 = fixed 2nd-last (bank 2).
+    assert_eq!(bus.read(0x8000), 0x02);
+    // $A000 = R7 = bank 2.
+    assert_eq!(bus.read(0xA000), 0x02);
+    // $C000 = R6 = bank 1.
+    assert_eq!(bus.read(0xC000), 0x01);
+    // $E000 = fixed last (bank 3).
+    assert_eq!(bus.read(0xE000), 0x03);
+}
+
+// ---- PRG-RAM via bus ---------------------------------------------------
+
+#[test]
+fn mmc3_prg_ram_enabled_via_bus() {
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // PRG-RAM disabled by default → writes ignored, reads return 0.
+    bus.write(0x6000, 0x42);
+    assert_eq!(bus.read(0x6000), 0x00);
+    // Enable PRG-RAM via $A001 (bit 7 = 1).
+    bus.write(0xA001, 0x80);
+    bus.write(0x6000, 0x42);
+    bus.write(0x7FFF, 0x99);
+    assert_eq!(bus.read(0x6000), 0x42);
+    assert_eq!(bus.read(0x7FFF), 0x99);
+}
+
+#[test]
+fn mmc3_prg_ram_read_returns_zero_before_enable_via_bus() {
+    // Bus-level assertion that $6000 reads 0 before $A001 enable (the
+    // mapper returns 0 for disabled PRG-RAM, not open-bus filler).
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.read(0x6000), 0x00);
+    assert_eq!(bus.read(0x7FFF), 0x00);
+}
+
+#[test]
+fn mmc3_prg_ram_write_protect_via_bus() {
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // Enable + write protect (bits 7 and 6).
+    bus.write(0xA001, 0xC0);
+    bus.write(0x6000, 0x42);
+    assert_eq!(bus.read(0x6000), 0x00); // write blocked
+}
+
+// ---- CHR banking via bus -----------------------------------------------
+
+#[test]
+fn mmc3_chr_mode_0_via_bus() {
+    // 8 × 1KB CHR banks.
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // R0 = 2 → 2KB at $0000 (1KB banks 2&3).
+    mmc3_write_bank(&mut bus, 0, 0x02);
+    // R2 = 6 → 1KB at $1000.
+    mmc3_write_bank(&mut bus, 2, 0x06);
+    let cart = bus.cartridge().expect("cart");
+    assert_eq!(cart.read_chr(0x0000), 0x02);
+    assert_eq!(cart.read_chr(0x0400), 0x03);
+    assert_eq!(cart.read_chr(0x1000), 0x06);
+}
+
+#[test]
+fn mmc3_chr_mode_1_via_bus() {
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // CHR mode 1: bit 7 of $8000 = 1. R0 = 2 → 2KB at $1000 (1KB banks 2&3).
+    mmc3_write_bank_full(&mut bus, 0b1000_0000, 0x02);
+    // R2 = 6 → 1KB at $0000 (preserve CHR mode 1).
+    mmc3_write_bank_full(&mut bus, 0b1000_0000 | 2, 0x06);
+    let cart = bus.cartridge().expect("cart");
+    assert_eq!(cart.read_chr(0x0000), 0x06);
+    assert_eq!(cart.read_chr(0x1000), 0x02);
+    assert_eq!(cart.read_chr(0x1400), 0x03);
+}
+
+#[test]
+fn mmc3_chr_ram_writes_persist_via_bus() {
+    // chr_1k_banks = 0 → CHR-RAM (8 KB = 8 × 1KB banks).
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    // With default bank registers (all 0), $0000 and $1000 both map to
+    // CHR bank 0 (aliasing). Set R1 = 2 so $0800 maps to banks 2&3,
+    // distinct from $0000 → banks 0&1.
+    mmc3_write_bank(&mut bus, 1, 0x02);
+    {
+        let cart = bus.cartridge_mut().expect("cart");
+        cart.write_chr(0x0000, 0xAA);
+        cart.write_chr(0x0800, 0xBB);
+    }
+    let cart = bus.cartridge().expect("cart");
+    assert_eq!(cart.read_chr(0x0000), 0xAA);
+    assert_eq!(cart.read_chr(0x0800), 0xBB);
+}
+
+// ---- Mirroring via bus -------------------------------------------------
+
+#[test]
+fn mmc3_mirroring_change_propagates_to_ppu() {
+    // Start with horizontal mirroring (header).
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+    // Change to vertical via $A000 (bit 0 = 0).
+    bus.write(0xA000, 0x00);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Vertical);
+    // Change back to horizontal (bit 0 = 1).
+    bus.write(0xA000, 0x01);
+    assert_eq!(bus.ppu().mirroring(), Mirroring::Horizontal);
+}
+
+// ---- IRQ counter via PPU step ------------------------------------------
+
+#[test]
+fn mmc3_irq_fires_after_correct_scanline_count() {
+    use nes_emu::ppu::CYCLES_PER_SCANLINE;
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+
+    // Enable PPU rendering so A12 rises (MMC3 IRQ clocking is gated).
+    bus.write(0x2001, 0x08); // PPUMASK show background
+
+    // Set IRQ latch = 5, reload, and enable IRQ.
+    bus.write(0xC000, 0x05); // IRQ latch = 5
+    bus.write(0xC001, 0x00); // force reload
+    bus.write(0xE001, 0x00); // enable IRQ
+
+    // The IRQ counter reloads to 5 on the first clock, then decrements
+    // once per scanline. It fires when it wraps past 0:
+    //   clock 1: reload → 5
+    //   clock 2: 5→4, clock 3: 4→3, clock 4: 3→2, clock 5: 2→1,
+    //   clock 6: 1→0, clock 7: 0→reload + IRQ
+    // So the IRQ fires after 7 scanlines (6 decrements + 1 wrap clock).
+    // Step 7 scanlines worth of PPU cycles (7 × 341 = 2387).
+    assert!(!bus.cart_irq_pending());
+    for _ in 0..7 {
+        bus.step_ppu(CYCLES_PER_SCANLINE as u32);
+    }
+    assert!(bus.cart_irq_pending(), "IRQ should fire after 7 scanlines");
+}
+
+#[test]
+fn mmc3_irq_disabled_does_not_fire() {
+    use nes_emu::ppu::CYCLES_PER_SCANLINE;
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+
+    bus.write(0x2001, 0x08); // enable rendering
+    bus.write(0xC000, 0x02);
+    bus.write(0xC001, 0x00); // reload
+                             // IRQ NOT enabled (default disabled).
+
+    for _ in 0..10 {
+        bus.step_ppu(CYCLES_PER_SCANLINE as u32);
+    }
+    assert!(!bus.cart_irq_pending());
+}
+
+#[test]
+fn mmc3_irq_cleared_by_e000_write() {
+    use nes_emu::ppu::CYCLES_PER_SCANLINE;
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+
+    bus.write(0x2001, 0x08);
+    bus.write(0xC000, 0x01);
+    bus.write(0xC001, 0x00);
+    bus.write(0xE001, 0x00); // enable
+
+    // Fire the IRQ (latch=1 → 3 clocks: reload, 1→0, 0→IRQ).
+    for _ in 0..3 {
+        bus.step_ppu(CYCLES_PER_SCANLINE as u32);
+    }
+    assert!(bus.cart_irq_pending());
+    // Clear via $E000.
+    bus.write(0xE000, 0x00);
+    assert!(!bus.cart_irq_pending());
+}
+
+#[test]
+fn mmc3_irq_not_clocked_when_rendering_disabled() {
+    use nes_emu::ppu::CYCLES_PER_SCANLINE;
+    let bytes = make_ines_mmc3(4, 8, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut bus = Bus::with_cartridge(cart);
+
+    // Rendering OFF (PPUMASK = 0) — A12 should not rise, so the IRQ
+    // counter is not clocked.
+    bus.write(0xC000, 0x01);
+    bus.write(0xC001, 0x00);
+    bus.write(0xE001, 0x00);
+
+    for _ in 0..20 {
+        bus.step_ppu(CYCLES_PER_SCANLINE as u32);
+    }
+    assert!(!bus.cart_irq_pending());
+}
+
+// ---- Emulator integration ----------------------------------------------
+
+#[test]
+fn mmc3_cart_loads_in_emulator() {
+    use nes_emu::emulator::EmulatorState;
+    let bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let emu = EmulatorState::new(cart);
+    assert_eq!(emu.bus().cartridge().unwrap().header.mapper_number, 4);
+}
+
+#[test]
+fn mmc3_emulator_runs_frames_without_crash() {
+    use nes_emu::emulator::EmulatorState;
+    // Build a ROM with RESET vector pointing to $C000 (NOP loop).
+    let mut bytes = make_ines_mmc3(4, 0, 0b0100_0000);
+    // Fill PRG with NOP (0xEA) first.
+    for i in 0..(4 * 8 * 1024) {
+        bytes[HEADER_SIZE + i] = 0xEA;
+    }
+    // Set the RESET vector once. $FFFC in CPU space maps to the fixed last
+    // 16KB bank at $C000 = bank 3 (offset 3*8192 in PRG). $FFFC = offset
+    // 0x3FFC in the $C000 window = bank 3 offset 0x1FFC.
+    let fixed_off = HEADER_SIZE + 3 * 8 * 1024 + 0x1FFC;
+    bytes[fixed_off] = 0x00;
+    bytes[fixed_off + 1] = 0xC0;
+
+    let cart = Cartridge::from_bytes(&bytes).expect("load");
+    let mut emu = EmulatorState::new(cart);
+    emu.reset();
+    assert_eq!(emu.cpu().pc, 0xC000);
+    for _ in 0..3 {
+        emu.step_frame();
+    }
+    assert_eq!(emu.bus().ppu().scanline(), 0);
+}

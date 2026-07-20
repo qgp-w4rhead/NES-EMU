@@ -158,6 +158,16 @@ impl EmulatorState {
                 self.cpu.irq_pending = true;
             }
 
+            // Poll the cartridge mapper IRQ line (e.g. MMC3 IRQ counter).
+            // Like the APU IRQ, the 6502 IRQ is level-triggered, so we set
+            // `irq_pending` whenever the mapper flag is set; the CPU
+            // services it at the next instruction boundary if the I flag
+            // is clear. The game's IRQ handler clears the flag by writing
+            // to the mapper's IRQ-disable register (e.g. $E000 for MMC3).
+            if self.bus.cart_irq_pending() {
+                self.cpu.irq_pending = true;
+            }
+
             // Generate audio samples at 44.1 kHz from the APU output.
             // One sample every ~40.585 CPU cycles.
             self.sample_accumulator += apu_cycles as f32;

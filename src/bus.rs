@@ -29,7 +29,7 @@
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
-use crate::ppu::Ppu;
+use crate::ppu::{Ppu, SCANLINE_PRERENDER, SCREEN_HEIGHT};
 
 /// Size of the CPU internal RAM in bytes (2 KB).
 pub const RAM_SIZE: usize = 0x0800;
@@ -54,6 +54,15 @@ const APU_IO_REG_COUNT: usize = 0x18;
 
 /// First address of cartridge space.
 const CART_BASE: u16 = 0x4020;
+
+/// PPU cycle at which the MMC3 IRQ counter is clocked (approximation of
+/// the A12 rising edge during rendering). On real hardware, A12 rises
+/// when the PPU begins fetching from the second pattern table ($1000+),
+/// which happens around PPU cycle 260 of each visible scanline (sprite
+/// pattern fetch phase). We clock once per scanline at this cycle when
+/// rendering is enabled.
+/// See: https://www.nesdev.org/wiki/MMC3#IRQ
+const MMC3_IRQ_CLOCK_CYCLE: u16 = 260;
 
 /// Last address of the APU / I/O test region (disabled on retail units).
 const APU_IO_TEST_END: u16 = 0x401F;
@@ -203,6 +212,16 @@ impl Bus {
         self.apu.irq_pending()
     }
 
+    /// Whether the loaded cartridge's mapper is asserting a CPU IRQ
+    /// (e.g. MMC3 IRQ counter). The emulator main loop polls this after
+    /// each CPU step and raises `Cpu::irq_pending` when it returns `true`.
+    pub fn cart_irq_pending(&self) -> bool {
+        self.cartridge
+            .as_ref()
+            .map(|c| c.irq_pending())
+            .unwrap_or(false)
+    }
+
     /// Render the background layer into the PPU framebuffer.
     ///
     /// Delegates to [`Ppu::render_background`], supplying a CHR-read
@@ -265,6 +284,21 @@ impl Bus {
         for _ in 0..cycles {
             if self.ppu.step() {
                 nmi = true;
+            }
+            // Clock mapper IRQ counter (MMC3 and similar) on the
+            // approximate PPU A12 rising edge. A12 only rises during
+            // active rendering (background or sprites enabled) on visible
+            // scanlines (0-239) and the prerender scanline (261).
+            let ppu_cycle = self.ppu.cycle();
+            let scanline = self.ppu.scanline();
+            let rendering = self.ppu.is_rendering();
+            if rendering
+                && ppu_cycle == MMC3_IRQ_CLOCK_CYCLE
+                && (scanline < SCREEN_HEIGHT as u16 || scanline == SCANLINE_PRERENDER)
+            {
+                if let Some(cart) = self.cartridge.as_mut() {
+                    cart.clock_irq();
+                }
             }
         }
         nmi
