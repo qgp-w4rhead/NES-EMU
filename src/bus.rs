@@ -748,10 +748,12 @@ impl Bus {
         self.apu_open_bus[offset as usize] = value;
     }
 
-    /// Read from cartridge space (`$4020-$FFFF`).
-    fn cart_read(&self, addr: u16) -> u8 {
-        match &self.cartridge {
-            Some(cart) => cart.read_prg(addr),
+    /// Read from cartridge space (`$4020-$FFFF`). Uses `read_prg_mut`
+    /// so that mappers with read side-effects (e.g. FDS disk-data read
+    /// at `$4031` advancing the read pointer) fire correctly.
+    fn cart_read(&mut self, addr: u16) -> u8 {
+        match &mut self.cartridge {
+            Some(cart) => cart.read_prg_mut(addr),
             None => 0x00,
         }
     }

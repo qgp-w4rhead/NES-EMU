@@ -18,6 +18,8 @@
 
 pub mod axrom;
 pub mod cnrom;
+pub mod fds;
+pub mod fds_audio;
 pub mod fme7;
 pub mod mmc1;
 pub mod mmc2;
@@ -69,6 +71,8 @@ pub enum MapperState {
     Vrc7(vrc7::Vrc7),
     /// Mapper 19 — Namco 163.
     Namco163(namco163::Namco163),
+    /// Mapper 20 — Famicom Disk System (FDS).
+    Fds(fds::Fds),
 }
 
 impl MapperState {
@@ -89,6 +93,7 @@ impl MapperState {
             MapperState::Fme7(m) => Box::new(m),
             MapperState::Vrc7(m) => Box::new(m),
             MapperState::Namco163(m) => Box::new(m),
+            MapperState::Fds(m) => Box::new(m),
         }
     }
 }
@@ -120,6 +125,18 @@ pub enum Mirroring {
 pub trait Mapper: Send {
     /// Read a byte from the CPU-side PRG address space (`$6000..=$FFFF`).
     fn read_prg(&self, addr: u16) -> u8;
+
+    /// Read a byte from the CPU-side PRG address space with potential
+    /// side effects. Most mappers have read-only PRG (ROM/RAM) and
+    /// delegate to [`read_prg`]. Mappers with read side-effects (e.g.
+    /// FDS disk-data read at `$4031` advancing the read pointer, or
+    /// `$4030` clearing the timer IRQ flag) override this to mutate
+    /// internal state on read. The bus calls this from `cart_read`
+    /// so that read side-effects fire correctly. Default: delegate to
+    /// [`read_prg`] (no side effects).
+    fn read_prg_mut(&mut self, addr: u16) -> u8 {
+        self.read_prg(addr)
+    }
 
     /// Write a byte to the CPU-side PRG address space (`$6000..=$FFFF`).
     /// For read-only ROM mappers this is usually a no-op (or a register

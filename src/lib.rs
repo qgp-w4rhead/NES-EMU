@@ -17,6 +17,7 @@ pub mod config;
 pub mod cpu;
 pub mod debug;
 pub mod emulator;
+pub mod fds;
 pub mod input;
 pub mod ips;
 pub mod joypad;

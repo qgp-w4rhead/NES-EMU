@@ -356,6 +356,6 @@ fn emulator_expansion_audio_zero_for_non_audio_cart() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn save_state_version_is_five() {
-    assert_eq!(SAVE_STATE_VERSION, 5);
+fn save_state_version_is_six() {
+    assert_eq!(SAVE_STATE_VERSION, 6);
 }

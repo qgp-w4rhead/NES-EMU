@@ -14,6 +14,7 @@ use crate::battery;
 use crate::cartridge::Cartridge;
 use crate::config::Config;
 use crate::emulator::EmulatorState;
+use crate::fds;
 use crate::rom_manager::{build_rom_info, file_name_from_path, RomInfo};
 
 /// The product of a successful ROM load: a fresh emulator ready to run,
@@ -38,9 +39,15 @@ pub struct LoadedRom {
 /// human-readable `String` for the main loop to print to stderr.
 pub fn load_rom(rom_path: &Path, config: &Config) -> Result<LoadedRom, String> {
     let file_size = std::fs::metadata(rom_path).map(|m| m.len()).unwrap_or(0);
-    let cartridge = Cartridge::from_path(rom_path)
-        .map_err(|e| format!("failed to load ROM '{}': {e}", rom_path.display()))?;
-    let mut cartridge = cartridge;
+
+    // M36: FDS disk images use a separate loading path (not iNES).
+    let mut cartridge = if fds::is_fds_file(rom_path) {
+        Cartridge::from_fds_path(rom_path)
+            .map_err(|e| format!("failed to load FDS disk '{}': {e}", rom_path.display()))?
+    } else {
+        Cartridge::from_path(rom_path)
+            .map_err(|e| format!("failed to load ROM '{}': {e}", rom_path.display()))?
+    };
 
     // Battery-backed PRG-RAM persistence (M21): load `.nessram` sidecar
     // if present. Missing file / errors are non-fatal.

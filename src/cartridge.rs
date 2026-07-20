@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::compression;
+use crate::fds::{self, FdsDisk, DISK_SIDE_SIZE};
 use crate::ips::IpsPatch;
 use crate::mappers::{from_ines, Mapper, Mirroring};
 use crate::region::Region;
@@ -49,6 +50,8 @@ pub enum CartridgeError {
     Decompress(String),
     /// An IPS patch file could not be parsed or applied.
     Ips(String),
+    /// An FDS-specific error (disk image parsing, BIOS loading).
+    Fds(String),
 }
 
 impl fmt::Display for CartridgeError {
@@ -64,6 +67,7 @@ impl fmt::Display for CartridgeError {
                 write!(f, "decompression error: {msg}")
             }
             CartridgeError::Ips(msg) => write!(f, "IPS patch error: {msg}"),
+            CartridgeError::Fds(msg) => write!(f, "FDS error: {msg}"),
         }
     }
 }
@@ -271,9 +275,65 @@ impl Cartridge {
         Ok(Self { header, mapper })
     }
 
+    /// Build an FDS cartridge from a `.fds` disk image file on disk.
+    ///
+    /// Loads the FDS BIOS (`disksys.rom`) from the standard search
+    /// paths (see [`fds::find_bios_path`]) and parses the disk image.
+    /// The FDS mapper (mapper 20) is constructed with the BIOS and
+    /// raw disk data; PRG-RAM and CHR-RAM start zeroed.
+    ///
+    /// `fds_path` is used to locate the BIOS (the BIOS is searched
+    /// for alongside the `.fds` file first).
+    pub fn from_fds_path<P: AsRef<Path>>(fds_path: P) -> Result<Self, CartridgeError> {
+        let path = fds_path.as_ref();
+        let bytes = std::fs::read(path)?;
+        let bios = fds::load_bios(Some(path)).map_err(|e| CartridgeError::Fds(e.to_string()))?;
+        Self::from_fds_bytes(&bytes, bios)
+    }
+
+    /// Build an FDS cartridge from raw `.fds` disk image bytes and
+    /// BIOS ROM data. The disk image is parsed to validate the format;
+    /// the raw disk side data (with the 16-byte FDS file header
+    /// stripped) is passed to the FDS mapper for sequential access via
+    /// the disk I/O registers.
+    pub fn from_fds_bytes(disk_data: &[u8], bios: Vec<u8>) -> Result<Self, CartridgeError> {
+        // Validate the disk image by parsing it.
+        let disk = FdsDisk::parse(disk_data)?;
+        // Concatenate all disk sides into a single raw data buffer
+        // (the FDS file header is stripped — the BIOS reads starting
+        // from the disk info block, not the file header).
+        let mut raw_disk = Vec::with_capacity(disk.sides.len() * DISK_SIDE_SIZE);
+        for side in &disk.sides {
+            raw_disk.extend_from_slice(side);
+        }
+        let mapper: Box<dyn Mapper> = Box::new(crate::mappers::fds::Fds::new(bios, raw_disk));
+        // Synthetic iNES header for FDS: mapper 20, no PRG/CHR ROM
+        // (the FDS uses PRG-RAM + BIOS, not PRG-ROM), vertical
+        // mirroring (switchable at runtime via $4025), no battery
+        // (disk writes are handled by the disk drive, not SRAM
+        // persistence — though we could add disk-image saving later).
+        let header = InesHeader {
+            prg_rom_banks: 0,
+            chr_rom_banks: 0,
+            mapper_number: 20,
+            mirroring: Mirroring::Vertical,
+            has_trainer: false,
+            has_battery: false,
+            tv_system: 0,
+        };
+        Ok(Self { header, mapper })
+    }
+
     /// Read a byte from the CPU-side PRG address space (`$6000..=$FFFF`).
     pub fn read_prg(&self, addr: u16) -> u8 {
         self.mapper.read_prg(addr)
+    }
+
+    /// Read a byte from the CPU-side PRG address space with potential
+    /// side effects (e.g. FDS disk-data read advancing the read pointer).
+    /// Used by the bus for `cart_read` so that read side-effects fire.
+    pub fn read_prg_mut(&mut self, addr: u16) -> u8 {
+        self.mapper.read_prg_mut(addr)
     }
 
     /// Write a byte to the CPU-side PRG address space (`$6000..=$FFFF`).

@@ -110,7 +110,10 @@ use crate::ppu::Ppu;
 ///   gained a `ym2149` field (Sunsoft 5B audio). The new `MapperState`
 ///   enum variants shift the bincode tag layout, so existing v4 save
 ///   states will fail the version check.
-pub const SAVE_STATE_VERSION: u32 = 5;
+/// - `6` — M36: new `Fds` mapper variant and `read_prg_mut` trait
+///   method. The new `MapperState::Fds` enum variant shifts the bincode
+///   tag layout, so existing v5 save states will fail the version check.
+pub const SAVE_STATE_VERSION: u32 = 6;
 
 /// Errors that can occur during save state serialisation or deserialisation.
 #[derive(Debug)]

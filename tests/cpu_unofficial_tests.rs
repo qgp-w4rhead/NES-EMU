@@ -1143,7 +1143,7 @@ fn disasm_decodes_unofficial_mnemonics() {
 // ===========================================================================
 
 #[test]
-fn save_state_version_is_five() {
+fn save_state_version_is_six() {
     use nes_emu::save_state::SAVE_STATE_VERSION;
-    assert_eq!(SAVE_STATE_VERSION, 5);
+    assert_eq!(SAVE_STATE_VERSION, 6);
 }
