@@ -184,6 +184,32 @@ impl Bus {
         });
     }
 
+    /// Advance the PPU by `cycles` PPU cycles, returning `true` if an NMI
+    /// was requested during any of those cycles.
+    ///
+    /// The main loop (M12) calls this 3× per `Cpu::step` (the PPU runs at
+    /// 3× the CPU clock). When this returns `true`, the caller should set
+    /// `Cpu::nmi_pending = true` (or call [`Ppu::take_nmi_request`]
+    /// directly).
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
+    pub fn step_ppu(&mut self, cycles: u32) -> bool {
+        let mut nmi = false;
+        for _ in 0..cycles {
+            if self.ppu.step() {
+                nmi = true;
+            }
+        }
+        nmi
+    }
+
+    /// Consume and return the PPU's pending NMI request flag. The main
+    /// loop (M12) polls this after stepping the PPU and raises
+    /// `Cpu::nmi_pending` when it returns `true`.
+    pub fn take_nmi_request(&mut self) -> bool {
+        self.ppu.take_nmi_request()
+    }
+
     /// Read a byte from the CPU address space.
     ///
     /// Takes `&mut self` because some reads have side effects: PPU

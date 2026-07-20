@@ -85,6 +85,49 @@ const STATUS_FLAG_MASK: u8 = 0b1110_0000;
 /// Mask for the open-bus bits in PPUSTATUS reads (bits 4-0).
 const STATUS_OPEN_BUS_MASK: u8 = 0b0001_1111;
 
+// ---- Scanline / cycle timing (M10) -------------------------------------
+//
+// The NTSC PPU runs 262 scanlines per frame, 341 PPU cycles per scanline.
+// Scanlines 0-239 are visible, 240 is post-render (idle), 241-260 are
+// VBlank, and 261 is the prerender scanline (sometimes labelled -1).
+//
+// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
+/// Number of scanlines in an NTSC frame (262).
+pub const SCANLINES_PER_FRAME: u16 = 262;
+/// Number of PPU cycles per scanline (341).
+pub const CYCLES_PER_SCANLINE: u16 = 341;
+/// Scanline on which VBlank begins (NMI asserted at cycle 1).
+pub const SCANLINE_VBLANK_START: u16 = 241;
+/// Prerender scanline (VBlank cleared + status flags cleared at cycle 1).
+pub const SCANLINE_PRERENDER: u16 = 261;
+/// PPU cycle within the scanline at which VBlank is asserted / cleared.
+const VBLANK_NMI_CYCLE: u16 = 1;
+/// PPU cycle at which the vertical scroll component is incremented (fine Y).
+const VERT_SCROLL_INC_CYCLE: u16 = 256;
+/// PPU cycle at which the horizontal `t→v` copy happens (end of visible line).
+const H_COPY_CYCLE: u16 = 257;
+/// First prerender cycle at which the vertical `t→v` copy happens.
+const V_COPY_CYCLE_START: u16 = 280;
+/// Last prerender cycle at which the vertical `t→v` copy happens.
+const V_COPY_CYCLE_END: u16 = 304;
+/// PPU cycle step between horizontal scroll increments during a scanline.
+const H_SCROLL_INC_STEP: u16 = 8;
+/// Last PPU cycle at which a horizontal scroll increment happens.
+const H_SCROLL_INC_LAST: u16 = 248;
+
+/// Mask for the nametable-select bits (10-11) of the `t` / `v` registers.
+const NT_SELECT_MASK: u16 = 0b0000_1100_0000_0000;
+/// Mask for the coarse-X bits (0-4) of the `t` / `v` registers.
+const COARSE_X_MASK: u16 = 0b0000_0000_0001_1111;
+/// Mask for the coarse-Y bits (5-9) of the `t` / `v` registers.
+const COARSE_Y_MASK: u16 = 0b0000_0011_1110_0000;
+/// Mask for the fine-Y bits (12-14) of the `t` / `v` registers.
+const FINE_Y_MASK: u16 = 0b0111_1000_0000_0000;
+/// Bit 0 of the nametable select (horizontal wrap).
+const NT_H_BIT: u16 = 0b0000_0100_0000_0000;
+/// Bit 1 of the nametable select (vertical wrap).
+const NT_V_BIT: u16 = 0b0000_1000_0000_0000;
+
 /// The Picture Processing Unit.
 ///
 /// Owns nametable VRAM, OAM, and palette RAM. CHR pattern data (`$0000-$1FFF`)
@@ -150,6 +193,17 @@ pub struct Ppu {
     /// (61 KB), filled by [`Ppu::render_background`].
     bg_pattern: Vec<u8>,
 
+    // ---- scanline / cycle timing (M10) ----
+    /// Current scanline within the frame (0..=261; 261 = prerender).
+    scanline: u16,
+    /// Current PPU cycle within the scanline (0..=340).
+    cycle: u16,
+    /// Set when VBlank begins and PPUCTRL bit 7 (NMI enable) is set.
+    /// The bus / emulator polls this via [`Ppu::take_nmi_request`] to
+    /// raise `Cpu::nmi_pending`. Latched (not auto-cleared) so a slow
+    /// consumer can't miss it — `take_nmi_request` clears it.
+    nmi_request: bool,
+
     // ---- configuration ----
     /// Nametable mirroring mode, set from the cartridge by the bus.
     mirroring: Mirroring,
@@ -179,6 +233,9 @@ impl Ppu {
             palette: [0u8; PALETTE_SIZE],
             framebuffer: vec![0u32; FRAMEBUFFER_SIZE],
             bg_pattern: vec![0u8; FRAMEBUFFER_SIZE],
+            scanline: 0,
+            cycle: 0,
+            nmi_request: false,
             mirroring: Mirroring::Horizontal,
         }
     }
@@ -221,7 +278,26 @@ impl Ppu {
     pub fn write_register(&mut self, reg: u16, value: u8) {
         self.open_bus = value;
         match reg & 0x07 {
-            0 => self.ppuctrl = value,
+            0 => {
+                // PPUCTRL: in addition to latching the register, writing it
+                // copies the base-nametable bits (0-1) into the `t`
+                // register's nametable-select bits (10-11). This is how the
+                // base nametable becomes part of the scroll position used
+                // during rendering.
+                //
+                // NMI-during-VBlank quirk: if the NMI-enable bit (bit 7)
+                // is set *while VBlank is active*, an NMI is generated
+                // immediately — not just at the VBlank-start edge. Games
+                // rely on this when they enable NMI inside the VBlank
+                // handler for the next frame.
+                // See: https://www.nesdev.org/wiki/PPU_registers#PPUCTRL
+                self.ppuctrl = value;
+                let nt = (value as u16) & 0b11;
+                self.t = (self.t & !NT_SELECT_MASK) | (nt << 10);
+                if (value & CTRL_NMI) != 0 && self.in_vblank() {
+                    self.nmi_request = true;
+                }
+            }
             1 => self.ppumask = value,
             2 => {} // PPUSTATUS is read-only; writes ignored (open-bus still latches)
             3 => self.oamaddr = value,
@@ -442,6 +518,200 @@ impl Ppu {
     /// True if the VBlank flag is currently set.
     pub fn in_vblank(&self) -> bool {
         (self.ppustatus & STATUS_VBLANK) != 0
+    }
+
+    // =================================================================
+    //  Scanline / cycle stepper (M10)
+    // =================================================================
+
+    /// Current scanline within the frame (`0..=261`; 261 is the prerender
+    /// scanline).
+    pub fn scanline(&self) -> u16 {
+        self.scanline
+    }
+
+    /// Current PPU cycle within the scanline (`0..=340`).
+    pub fn cycle(&self) -> u16 {
+        self.cycle
+    }
+
+    /// Consume and return the pending NMI request. The emulator main loop
+    /// (M12) calls this after each `step` batch and raises
+    /// `Cpu::nmi_pending` when it returns `true`.
+    pub fn take_nmi_request(&mut self) -> bool {
+        let r = self.nmi_request;
+        self.nmi_request = false;
+        r
+    }
+
+    /// Advance the PPU by one cycle, returning `true` if an NMI should be
+    /// raised this cycle (VBlank just started and PPUCTRL bit 7 is set).
+    ///
+    /// The PPU runs 3 cycles per CPU cycle; the main loop (M12) calls this
+    /// 3× per `Cpu::step`. This method handles:
+    ///
+    /// - **VBlank assertion** at scanline 241, cycle 1: sets the VBlank
+    ///   flag (PPUSTATUS bit 7) and, if PPUCTRL bit 7 is set, latches
+    ///   `nmi_request`.
+    /// - **VBlank clearing** at the prerender scanline (261), cycle 1:
+    ///   clears VBlank, sprite-overflow, and sprite-0-hit flags.
+    /// - **Scroll increments** during visible scanlines (0-239) when
+    ///   rendering is enabled (PPUMASK show-bg or show-sprites):
+    ///   - cycles 8, 16, ..., 248: horizontal scroll increment (fine X →
+    ///     coarse X → nametable horizontal wrap).
+    ///   - cycle 256: vertical scroll increment (fine Y → coarse Y →
+    ///     nametable vertical wrap).
+    ///   - cycle 257: copy horizontal bits of `t` into `v` (coarse X +
+    ///     nametable bits 0-1).
+    /// - **Vertical `t→v` copy** at the prerender scanline (261), cycles
+    ///   280-304: copies coarse Y, fine Y, and nametable bits from `t`
+    ///   into `v`.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
+    /// See: https://www.nesdev.org/wiki/PPU_scrolling
+    pub fn step(&mut self) -> bool {
+        let mut nmi = false;
+
+        // ---- Advance the cycle counter first ----
+        //
+        // Events are described in nesdev terms as happening at "dot N"
+        // (1-indexed within the scanline). We 0-index the counter but fire
+        // events *after* advancing, so "dot 1" = counter reads 1 after one
+        // step into the scanline, "dot 256" = counter reads 256, etc.
+        self.cycle += 1;
+        if self.cycle >= CYCLES_PER_SCANLINE {
+            self.cycle = 0;
+            self.scanline += 1;
+            if self.scanline >= SCANLINES_PER_FRAME {
+                self.scanline = 0;
+            }
+        }
+
+        // ---- Per-cycle events at the new (cycle, scanline) ----
+        match self.scanline {
+            SCANLINE_VBLANK_START if self.cycle == VBLANK_NMI_CYCLE => {
+                self.set_vblank(true);
+                if self.nmi_enabled() {
+                    self.nmi_request = true;
+                    nmi = true;
+                }
+            }
+            SCANLINE_PRERENDER if self.cycle == VBLANK_NMI_CYCLE => {
+                // Prerender: clear VBlank and the per-frame status flags.
+                self.set_vblank(false);
+                self.set_sprite_overflow(false);
+                self.set_sprite_zero_hit(false);
+            }
+            _ => {}
+        }
+
+        // ---- Rendering-only scroll updates ----
+        //
+        // Per NESdev, the scroll increments and t→v copies fire when
+        // rendering is enabled (PPUMASK show-bg or show-sprites). The
+        // prerender scanline (261) performs the same h/v scroll increments
+        // as a visible scanline (no pixels are output, but the scroll
+        // state is updated). The horizontal t→v copy at dot 257 fires on
+        // every scanline; the vertical t→v copy at dots 280-304 fires only
+        // on the prerender scanline.
+        // See: https://www.nesdev.org/wiki/PPU_scrolling#During_rendering
+        let rendering = (self.ppumask & (MASK_SHOW_BG | MASK_SHOW_SPRITES)) != 0;
+        if rendering {
+            let does_scroll_inc =
+                self.scanline < SCREEN_HEIGHT as u16 || self.scanline == SCANLINE_PRERENDER;
+            // Horizontal scroll increment at dots 8,16,...,248.
+            if does_scroll_inc
+                && self.cycle >= H_SCROLL_INC_STEP
+                && self.cycle <= H_SCROLL_INC_LAST
+                && (self.cycle % H_SCROLL_INC_STEP) == 0
+            {
+                self.increment_h_scroll();
+            }
+            // Vertical scroll increment at dot 256.
+            if does_scroll_inc && self.cycle == VERT_SCROLL_INC_CYCLE {
+                self.increment_v_scroll();
+            }
+            // Horizontal t→v copy at dot 257 — every scanline.
+            if self.cycle == H_COPY_CYCLE {
+                self.copy_h_t_to_v();
+            }
+            // Vertical t→v copy at prerender dots 280-304.
+            if self.scanline == SCANLINE_PRERENDER
+                && self.cycle >= V_COPY_CYCLE_START
+                && self.cycle <= V_COPY_CYCLE_END
+            {
+                self.copy_v_t_to_v();
+            }
+        }
+
+        nmi
+    }
+
+    /// Horizontal scroll increment: advance `fine_x`; on wrap, advance
+    /// coarse X (in `v`); on coarse-X wrap (past 31), toggle the
+    /// horizontal nametable bit.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_scrolling#Coarse_X_increment
+    fn increment_h_scroll(&mut self) {
+        if self.fine_x < 7 {
+            self.fine_x += 1;
+        } else {
+            self.fine_x = 0;
+            let coarse_x = self.v & COARSE_X_MASK;
+            if coarse_x == 31 {
+                // Wrap coarse X to 0 and toggle the horizontal nt bit.
+                self.v &= !COARSE_X_MASK;
+                self.v ^= NT_H_BIT;
+            } else {
+                self.v = (self.v & !COARSE_X_MASK) | (coarse_x + 1);
+            }
+        }
+    }
+
+    /// Vertical scroll increment: advance fine Y (in `v`); on wrap,
+    /// advance coarse Y; on coarse-Y wrap past 29, reset coarse Y to 0
+    /// and toggle the vertical nametable bit; on wrap past 31 (within the
+    /// same nametable's attribute region), just reset coarse Y.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_scrolling#Y_increment
+    fn increment_v_scroll(&mut self) {
+        let fine_y = (self.v & FINE_Y_MASK) >> 12;
+        if fine_y < 7 {
+            self.v = (self.v & !FINE_Y_MASK) | ((fine_y + 1) << 12);
+        } else {
+            self.v &= !FINE_Y_MASK; // fine Y → 0
+            let coarse_y = (self.v & COARSE_Y_MASK) >> 5;
+            if coarse_y == 29 {
+                // Wrap coarse Y to 0 and toggle the vertical nt bit.
+                self.v &= !COARSE_Y_MASK;
+                self.v ^= NT_V_BIT;
+            } else if coarse_y == 31 {
+                // Coarse Y wraps within the nametable (no nt toggle).
+                self.v &= !COARSE_Y_MASK;
+            } else {
+                self.v = (self.v & !COARSE_Y_MASK) | ((coarse_y + 1) << 5);
+            }
+        }
+    }
+
+    /// Copy the horizontal components of `t` (coarse X + nametable bits
+    /// 0-1) into `v`. Happens at cycle 257 of every visible scanline.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_scrolling#At_cycle_257
+    fn copy_h_t_to_v(&mut self) {
+        // Copy t bits 0-4 (coarse X) and 10-11 (nt) into v.
+        let h_bits = self.t & (COARSE_X_MASK | NT_SELECT_MASK);
+        self.v = (self.v & !(COARSE_X_MASK | NT_SELECT_MASK)) | h_bits;
+    }
+
+    /// Copy the vertical components of `t` (coarse Y, fine Y, nametable
+    /// bits 0-1) into `v`. Happens at prerender scanline cycles 280-304.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_scrolling#At_cycle_280_to_304
+    fn copy_v_t_to_v(&mut self) {
+        // Copy t bits 5-9 (coarse Y), 10-11 (nt), 12-14 (fine Y) into v.
+        let v_bits = self.t & (COARSE_Y_MASK | NT_SELECT_MASK | FINE_Y_MASK);
+        self.v = (self.v & !(COARSE_Y_MASK | NT_SELECT_MASK | FINE_Y_MASK)) | v_bits;
     }
 
     // =================================================================
@@ -798,5 +1068,397 @@ mod tests {
         ppu.set_vblank(true);
         let r = ppu.read_status();
         assert_eq!(r, 0x80 | 0x1F); // VBlank + open bus low 5 bits
+    }
+
+    // ---- M10: PPUCTRL → t nametable-select copy ----------------------
+
+    #[test]
+    fn ppuctrl_write_copies_base_nt_into_t() {
+        let mut ppu = Ppu::new();
+        // t starts at 0; writing PPUCTRL with base NT = 0b10 should set
+        // t bits 10-11 to 0b10 (= 0x800).
+        ppu.write_register(0, 0b0000_0010);
+        let t = ppu.temp_vram_addr();
+        assert_eq!(t & NT_SELECT_MASK, 0b10 << 10, "t nt bits = 0b10");
+        // Other t bits should be untouched (still 0 here).
+        assert_eq!(t & !NT_SELECT_MASK, 0);
+    }
+
+    #[test]
+    fn ppuctrl_write_preserves_other_t_bits() {
+        let mut ppu = Ppu::new();
+        // Set coarse X = 5 and fine Y = 3 via PPUSCROLL/PPUADDR first.
+        ppu.write_register(5, 0x28); // coarse X = 5, fine X = 0
+        ppu.write_register(5, 0x18); // coarse Y = 3, fine Y = 0
+        let t_before = ppu.temp_vram_addr();
+        // Now write PPUCTRL with base NT = 0b01.
+        ppu.write_register(0, 0b0000_0001);
+        let t_after = ppu.temp_vram_addr();
+        // nt bits changed to 0b01; coarse X / coarse Y preserved.
+        assert_eq!(t_after & NT_SELECT_MASK, 0b01 << 10);
+        assert_eq!(t_after & COARSE_X_MASK, t_before & COARSE_X_MASK);
+        assert_eq!(t_after & COARSE_Y_MASK, t_before & COARSE_Y_MASK);
+    }
+
+    // ---- M10: step() cycle / scanline advance -------------------------
+
+    #[test]
+    fn step_advances_cycle() {
+        let mut ppu = Ppu::new();
+        assert_eq!(ppu.scanline(), 0);
+        assert_eq!(ppu.cycle(), 0);
+        ppu.step();
+        assert_eq!(ppu.cycle(), 1);
+        assert_eq!(ppu.scanline(), 0);
+    }
+
+    #[test]
+    fn step_wraps_cycle_to_next_scanline() {
+        let mut ppu = Ppu::new();
+        // Advance to the last cycle of scanline 0.
+        for _ in 0..(CYCLES_PER_SCANLINE - 1) {
+            ppu.step();
+        }
+        assert_eq!(ppu.cycle(), CYCLES_PER_SCANLINE - 1);
+        assert_eq!(ppu.scanline(), 0);
+        ppu.step();
+        assert_eq!(ppu.cycle(), 0);
+        assert_eq!(ppu.scanline(), 1);
+    }
+
+    #[test]
+    fn step_wraps_scanline_to_zero_after_prerender() {
+        let mut ppu = Ppu::new();
+        // Advance to the last cycle of the prerender scanline (261).
+        let total: u32 = (SCANLINES_PER_FRAME as u32) * (CYCLES_PER_SCANLINE as u32);
+        for _ in 0..(total - 1) {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), SCANLINE_PRERENDER);
+        assert_eq!(ppu.cycle(), CYCLES_PER_SCANLINE - 1);
+        ppu.step();
+        assert_eq!(ppu.scanline(), 0);
+        assert_eq!(ppu.cycle(), 0);
+    }
+
+    // ---- M10: VBlank NMI timing ---------------------------------------
+
+    #[test]
+    fn vblank_set_at_scanline_241_cycle_1() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x00); // NMI disabled
+                                     // Advance to scanline 241, cycle 0.
+        let pre: u32 = (SCANLINE_VBLANK_START as u32) * (CYCLES_PER_SCANLINE as u32);
+        for _ in 0..pre {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), SCANLINE_VBLANK_START);
+        assert_eq!(ppu.cycle(), 0);
+        assert!(!ppu.in_vblank());
+        // One more step → cycle 1 → VBlank asserted.
+        let nmi = ppu.step();
+        assert_eq!(ppu.cycle(), 1);
+        assert!(ppu.in_vblank(), "VBlank set at scanline 241 cycle 1");
+        assert!(!nmi, "no NMI when PPUCTRL bit 7 clear");
+    }
+
+    #[test]
+    fn nmi_requested_when_vblank_starts_and_nmi_enabled() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x80); // NMI enabled
+        let pre: u32 = (SCANLINE_VBLANK_START as u32) * (CYCLES_PER_SCANLINE as u32);
+        for _ in 0..pre {
+            ppu.step();
+        }
+        let nmi = ppu.step();
+        assert!(nmi, "step returns true when NMI requested");
+        assert!(ppu.take_nmi_request(), "nmi_request latched");
+        assert!(!ppu.take_nmi_request(), "nmi_request cleared after take");
+    }
+
+    #[test]
+    fn nmi_not_requested_when_nmi_disabled() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x00); // NMI disabled
+        let pre: u32 = (SCANLINE_VBLANK_START as u32) * (CYCLES_PER_SCANLINE as u32);
+        for _ in 0..pre {
+            ppu.step();
+        }
+        let nmi = ppu.step();
+        assert!(!nmi);
+        assert!(!ppu.take_nmi_request());
+        // VBlank flag is still set even though NMI is disabled.
+        assert!(ppu.in_vblank());
+    }
+
+    #[test]
+    fn vblank_cleared_at_prerender_cycle_1() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x00);
+        // Advance into VBlank.
+        let to_vblank: u32 = (SCANLINE_VBLANK_START as u32) * (CYCLES_PER_SCANLINE as u32) + 5;
+        for _ in 0..to_vblank {
+            ppu.step();
+        }
+        assert!(ppu.in_vblank());
+        // Advance to prerender scanline, cycle 0.
+        let to_prerender: u32 =
+            (SCANLINE_PRERENDER as u32) * (CYCLES_PER_SCANLINE as u32) - to_vblank;
+        for _ in 0..to_prerender {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), SCANLINE_PRERENDER);
+        assert_eq!(ppu.cycle(), 0);
+        assert!(
+            ppu.in_vblank(),
+            "still in VBlank just before prerender cycle 1"
+        );
+        ppu.step();
+        assert!(!ppu.in_vblank(), "VBlank cleared at prerender cycle 1");
+    }
+
+    #[test]
+    fn sprite_flags_cleared_at_prerender_cycle_1() {
+        let mut ppu = Ppu::new();
+        ppu.set_sprite_overflow(true);
+        ppu.set_sprite_zero_hit(true);
+        // Advance to prerender scanline, cycle 0.
+        let pre: u32 = (SCANLINE_PRERENDER as u32) * (CYCLES_PER_SCANLINE as u32);
+        for _ in 0..pre {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), SCANLINE_PRERENDER);
+        assert_eq!(ppu.cycle(), 0);
+        // Flags still set just before cycle 1.
+        assert_eq!(ppu.ppustatus() & 0b0110_0000, 0b0110_0000);
+        ppu.step();
+        assert_eq!(ppu.ppustatus() & 0b0110_0000, 0, "sprite flags cleared");
+    }
+
+    #[test]
+    fn one_nmi_per_frame_even_if_vblank_flag_lingers() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x80);
+        // Run a full frame + 1 cycle into the next frame's VBlank.
+        let one_frame: u32 = (SCANLINES_PER_FRAME as u32) * (CYCLES_PER_SCANLINE as u32);
+        let mut nmi_count = 0u32;
+        for _ in 0..(one_frame + (SCANLINE_VBLANK_START as u32) * (CYCLES_PER_SCANLINE as u32) + 2)
+        {
+            if ppu.step() {
+                nmi_count += 1;
+            }
+        }
+        // Exactly 2 NMIs: one at the first frame's scanline 241, one at the
+        // second frame's scanline 241.
+        assert_eq!(nmi_count, 2);
+    }
+
+    // ---- M10: scroll increments during rendering ----------------------
+
+    #[test]
+    fn h_scroll_increment_advances_fine_x() {
+        let mut ppu = Ppu::new();
+        // Enable rendering so step() performs scroll increments.
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Advance to scanline 0, cycle 8 (first h-scroll increment).
+        for _ in 0..8 {
+            ppu.step();
+        }
+        assert_eq!(ppu.cycle(), 8);
+        // fine_x should have advanced from 0 to 1.
+        assert_eq!(ppu.fine_x(), 1);
+    }
+
+    #[test]
+    fn h_scroll_increment_wraps_coarse_x_and_nt_bit() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Set fine_x = 7 so the next increment wraps to coarse X.
+        // Use PPUSCROLL first write: value 0x07 → coarse X = 0, fine X = 7.
+        ppu.write_register(5, 0x07);
+        ppu.write_register(5, 0x00);
+        // Set v's coarse X = 31 via PPUADDR (so the wrap toggles nt bit 0).
+        // v = 0x001F (coarse X = 31, nt = 0).
+        ppu.write_register(6, 0x00);
+        ppu.write_register(6, 0x1F);
+        assert_eq!(ppu.vram_addr(), 0x001F);
+        // Advance to cycle 8 of scanline 0 (first h-scroll increment).
+        for _ in 0..8 {
+            ppu.step();
+        }
+        // fine_x wrapped 7 → 0, coarse X wrapped 31 → 0, nt bit 0 toggled.
+        assert_eq!(ppu.fine_x(), 0);
+        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 0);
+        assert_eq!(ppu.vram_addr() & NT_H_BIT, NT_H_BIT, "nt H bit toggled");
+    }
+
+    #[test]
+    fn v_scroll_increment_at_cycle_256_advances_fine_y() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Advance to scanline 0, cycle 256.
+        for _ in 0..256 {
+            ppu.step();
+        }
+        assert_eq!(ppu.cycle(), 256);
+        // fine Y (v bits 12-14) should have advanced from 0 to 1.
+        let fine_y = (ppu.vram_addr() & FINE_Y_MASK) >> 12;
+        assert_eq!(fine_y, 1);
+    }
+
+    #[test]
+    fn v_scroll_increment_wraps_coarse_y_and_nt_bit() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Set v directly: fine Y = 7, coarse Y = 29, nt = 0. (PPUADDR
+        // can't set fine Y bit 14 due to its 0x3F hi-byte mask, so we
+        // poke v directly — tests live in the same module.)
+        ppu.v = (7u16 << 12) | (29u16 << 5);
+        assert_eq!((ppu.vram_addr() & COARSE_Y_MASK) >> 5, 29);
+        assert_eq!((ppu.vram_addr() & FINE_Y_MASK) >> 12, 7);
+        // Advance to cycle 256 of scanline 0.
+        for _ in 0..256 {
+            ppu.step();
+        }
+        // fine Y wrapped 7 → 0, coarse Y wrapped 29 → 0, nt V bit toggled.
+        assert_eq!((ppu.vram_addr() & FINE_Y_MASK) >> 12, 0);
+        assert_eq!((ppu.vram_addr() & COARSE_Y_MASK) >> 5, 0);
+        assert_eq!(ppu.vram_addr() & NT_V_BIT, NT_V_BIT, "nt V bit toggled");
+    }
+
+    #[test]
+    fn h_t_to_v_copy_at_cycle_257() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Set t's coarse X = 10, nt = 0b11 via PPUCTRL + PPUSCROLL.
+        ppu.write_register(0, 0b11); // nt bits → 0b11
+        ppu.write_register(5, 0x50); // coarse X = 10, fine X = 0
+        ppu.write_register(5, 0x00); // coarse Y = 0, fine Y = 0
+                                     // v starts at 0. Advance to cycle 257 of scanline 0.
+        for _ in 0..257 {
+            ppu.step();
+        }
+        assert_eq!(ppu.cycle(), 257);
+        // v should now have t's coarse X (10) and nt bits (0b11).
+        // (Note: h-scroll increments during cycles 8..248 will have
+        // advanced v's coarse X, but the copy at 257 overwrites it.)
+        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 10);
+        assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b11 << 10);
+    }
+
+    #[test]
+    fn v_t_to_v_copy_at_prerender_cycles_280_304() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Set t's coarse Y = 15, fine Y = 5, nt = 0b10.
+        ppu.write_register(0, 0b10); // nt → 0b10
+                                     // PPUSCROLL second write: coarse Y = 15, fine Y = 5 → (15<<3)|5 = 0x7D.
+        ppu.write_register(5, 0x00);
+        ppu.write_register(5, 0x7D);
+        // Advance to prerender scanline, cycle 304 (last V-copy cycle).
+        let pre: u32 = (SCANLINE_PRERENDER as u32) * (CYCLES_PER_SCANLINE as u32) + 304;
+        for _ in 0..pre {
+            ppu.step();
+        }
+        // v should now have t's coarse Y (15), fine Y (5), nt (0b10).
+        assert_eq!((ppu.vram_addr() & COARSE_Y_MASK) >> 5, 15);
+        assert_eq!((ppu.vram_addr() & FINE_Y_MASK) >> 12, 5);
+        assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b10 << 10);
+    }
+
+    #[test]
+    fn no_scroll_increments_when_rendering_disabled() {
+        let mut ppu = Ppu::new();
+        // PPUMASK = 0 → rendering disabled.
+        // Advance through a full visible scanline.
+        for _ in 0..CYCLES_PER_SCANLINE {
+            ppu.step();
+        }
+        // v and fine_x should be unchanged.
+        assert_eq!(ppu.vram_addr(), 0);
+        assert_eq!(ppu.fine_x(), 0);
+    }
+
+    // ---- M10: NMI-during-VBlank quirk --------------------------------
+
+    #[test]
+    fn ppuctrl_nmi_enable_during_vblank_latches_nmi() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x00); // NMI disabled
+                                     // Force into VBlank.
+        ppu.set_vblank(true);
+        assert!(ppu.in_vblank());
+        assert!(!ppu.take_nmi_request());
+        // Enable NMI while VBlank is active → immediate NMI request.
+        ppu.write_register(0, 0x80);
+        assert!(
+            ppu.take_nmi_request(),
+            "NMI latched when enabled during VBlank"
+        );
+    }
+
+    #[test]
+    fn ppuctrl_nmi_enable_outside_vblank_no_immediate_nmi() {
+        let mut ppu = Ppu::new();
+        assert!(!ppu.in_vblank());
+        ppu.write_register(0, 0x80);
+        assert!(
+            !ppu.take_nmi_request(),
+            "no NMI when enabled outside VBlank"
+        );
+    }
+
+    #[test]
+    fn ppuctrl_nmi_enable_when_already_enabled_during_vblank_no_duplicate() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x80); // NMI enabled, not in VBlank → no request
+        assert!(!ppu.take_nmi_request());
+        ppu.set_vblank(true);
+        // Writing PPUCTRL again with bit 7 set while in VBlank → request.
+        ppu.write_register(0, 0x80);
+        assert!(ppu.take_nmi_request());
+        // A second write with bit 7 set while still in VBlank → another
+        // request (each qualifying write latches).
+        ppu.write_register(0, 0x80);
+        assert!(ppu.take_nmi_request());
+    }
+
+    // ---- M10: prerender scanline scroll increments -------------------
+
+    #[test]
+    fn prerender_scanline_performs_h_scroll_increments() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Advance to prerender scanline, cycle 8 (first h-scroll inc).
+        let pre: u32 = (SCANLINE_PRERENDER as u32) * (CYCLES_PER_SCANLINE as u32) + 8;
+        for _ in 0..pre {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), SCANLINE_PRERENDER);
+        assert_eq!(ppu.cycle(), 8);
+        // fine_x should have advanced (from 0 to 1, modulo prior frame
+        // drift — just check it's not stuck at 0).
+        assert_eq!(ppu.fine_x(), 1, "h-scroll increment fires on prerender");
+    }
+
+    #[test]
+    fn h_t_to_v_copy_fires_on_every_scanline_when_rendering() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        // Set t's coarse X = 20, nt = 0b01.
+        ppu.write_register(0, 0b0000_0001);
+        ppu.write_register(5, 0xA0); // coarse X = 20, fine X = 0
+        ppu.write_register(5, 0x00);
+        // Advance to post-render scanline 240, cycle 257 (a non-visible,
+        // non-prerender scanline). The H t→v copy should still fire.
+        let target: u32 = 240 * (CYCLES_PER_SCANLINE as u32) + 257;
+        for _ in 0..target {
+            ppu.step();
+        }
+        assert_eq!(ppu.scanline(), 240);
+        assert_eq!(ppu.cycle(), 257);
+        // v should have t's coarse X (20) and nt (0b01).
+        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 20);
+        assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b01 << 10);
     }
 }
