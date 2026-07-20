@@ -7,6 +7,8 @@
 //!
 //! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
 
+mod cartridge;
+mod mappers;
 mod video;
 
 use std::process::ExitCode;
