@@ -1,4 +1,6 @@
-//! PPU background rendering pipeline (M8).
+//! PPU rendering pipeline (M8 background + M9 sprites).
+//!
+//! # Background (M8)
 //!
 //! Renders the background layer from nametables, attribute tables, and
 //! pattern tables into the PPU's framebuffer (`256×240` ARGB pixels).
@@ -11,6 +13,15 @@
 //! from the current scroll position recorded in the `t` register and
 //! `fine_x`, which is sufficient to validate the decode against a static
 //! test screen.
+//!
+//! # Sprites (M9)
+//!
+//! Renders sprites from OAM in 8×8 mode with horizontal/vertical flip,
+//! palette selection (sprite palettes 4-7 at `$3F10-$3F1F`), and
+//! priority (in front of / behind the background). The hardware limit of
+//! 8 sprites per scanline is enforced; the sprite-overflow flag is set
+//! when more than 8 sprites are in range on any scanline. Sprite zero
+//! hit detection lands in M11. 8×16 sprite mode lands in M23.
 //!
 //! # Background pixel pipeline (per visible pixel)
 //!
@@ -39,8 +50,8 @@
 #![allow(dead_code)]
 
 use crate::ppu::{
-    Ppu, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, MASK_SHOW_BG, MASK_SHOW_BG_LEFT, SCREEN_HEIGHT,
-    SCREEN_WIDTH,
+    Ppu, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, CTRL_SPRITE_PATTERN_1000, MASK_SHOW_BG,
+    MASK_SHOW_BG_LEFT, MASK_SHOW_SPRITES, MASK_SHOW_SPRITES_LEFT, SCREEN_HEIGHT, SCREEN_WIDTH,
 };
 
 /// Nametable tile grid is 32×30 tiles (256×240 pixels).
@@ -53,6 +64,29 @@ const ATTR_TABLE_OFFSET: u16 = 0x03C0;
 const NT_BASE: u16 = 0x2000;
 /// Base address of palette RAM.
 const PAL_BASE: u16 = 0x3F00;
+/// Base address of sprite palettes in palette RAM (`$3F10-$3F1F`).
+const SPRITE_PAL_BASE: u16 = 0x3F10;
+
+/// Sprite attribute byte (OAM byte 2) bits.
+/// Bits 0-1: palette select (4-7).
+const ATTR_PALETTE_MASK: u8 = 0b0000_0011;
+/// Bit 5: priority (0 = in front of background, 1 = behind background).
+const ATTR_PRIORITY_BEHIND: u8 = 0b0010_0000;
+/// Bit 6: flip sprite horizontally.
+const ATTR_HFLIP: u8 = 0b0100_0000;
+/// Bit 7: flip sprite vertically.
+const ATTR_VFLIP: u8 = 0b1000_0000;
+
+/// Maximum number of sprites rendered on a single scanline (hardware limit).
+const MAX_SPRITES_PER_SCANLINE: usize = 8;
+/// Number of sprites in OAM (64).
+const SPRITE_COUNT: usize = 64;
+/// Sprite height in pixels (8x8 mode; 8x16 lands in M23).
+const SPRITE_HEIGHT: u16 = 8;
+/// Sprite width in pixels.
+const SPRITE_WIDTH: u16 = 8;
+/// OAM Y value at or above which a sprite is hidden ($EF-$FF = 239-255).
+const OAM_Y_HIDDEN: u8 = 0xEF;
 
 /// NES 2C02 (NTSC) reference palette — 64 entries × RGB.
 ///
@@ -178,6 +212,10 @@ impl Ppu {
 
         if !bg_enabled {
             self.framebuffer.fill(universal_bg);
+            // Background is fully transparent when disabled → bg_pattern = 0
+            // everywhere, so sprites with "behind background" priority show
+            // through.
+            self.bg_pattern.fill(0);
             return;
         }
 
@@ -213,11 +251,15 @@ impl Ppu {
                                              // Vertical nametable wrap: bit 1 of nt select toggles when
                                              // coarse Y crosses a 256px boundary (tile 32+).
             let nt_v = (gy >> 8) & 1;
+            let row_base = (py as usize) * SCREEN_WIDTH;
 
             for px in 0..SCREEN_WIDTH as u16 {
+                let col = row_base + px as usize;
+
                 // Left-column mask: pixels 0-7 are blanked if bit 1 clear.
                 if px < 8 && !bg_left_enabled {
-                    self.framebuffer[(py as usize) * SCREEN_WIDTH + px as usize] = universal_bg;
+                    self.framebuffer[col] = universal_bg;
+                    self.bg_pattern[col] = 0;
                     continue;
                 }
 
@@ -255,6 +297,9 @@ impl Ppu {
                 let shift = ((tile_row & 0x02) << 1) | (tile_col & 0x02);
                 let pal_select = (attr_byte >> shift) & 0x03;
 
+                // Record the background pattern value for sprite priority.
+                self.bg_pattern[col] = pattern;
+
                 // 4) Palette lookup.
                 let color_addr = if pattern == 0 {
                     PAL_BASE // universal background
@@ -264,8 +309,7 @@ impl Ppu {
                 let nes_index = self.read_palette(color_addr);
 
                 // 5) Convert to ARGB and write.
-                self.framebuffer[(py as usize) * SCREEN_WIDTH + px as usize] =
-                    nes_color_to_argb(nes_index);
+                self.framebuffer[col] = nes_color_to_argb(nes_index);
             }
         }
     }
@@ -275,6 +319,178 @@ impl Ppu {
     /// or when the left 8 pixels are masked.
     pub fn universal_bg_argb(&self) -> u32 {
         nes_color_to_argb(self.read_palette(PAL_BASE))
+    }
+
+    /// Render all sprites from OAM in 8×8 mode, compositing on top of the
+    /// existing framebuffer (which must have been produced by a prior
+    /// [`Ppu::render_background`] call — `render_frame` does this in the
+    /// right order).
+    ///
+    /// `chr_read` supplies pattern-table bytes from CHR (owned by the
+    /// cartridge and accessed via the bus).
+    ///
+    /// # Behaviour
+    ///
+    /// - Honours PPUMASK bit 4 (show sprites) and bit 2 (show left 8
+    ///   pixels of sprites).
+    /// - Uses PPUCTRL bit 3 to select the sprite pattern table
+    ///   (`$0000` or `$1000`).
+    /// - A sprite is visible on scanline `s` when its OAM Y byte `y`
+    ///   satisfies `y + 1 <= s <= y + 8` and `y < $EF` (matching the
+    ///   one-scanline delay documented on the NESdev wiki — "subtract 1
+    ///   from the sprite's Y coordinate before writing it here").
+    /// - At most 8 sprites are rendered per scanline (the first 8 in OAM
+    ///   order); if a 9th would be in range, the sprite-overflow flag
+    ///   (PPUSTATUS bit 5) is set. The hardware-accurate overflow bug is
+    ///   deferred to M11.
+    /// - Sprite-to-sprite priority: lower OAM index = in front. The
+    ///   first non-transparent sprite (scanning OAM 0 → 63) claims each
+    ///   pixel; no lower-priority sprite can override it.
+    /// - Background priority: if the claiming sprite's attribute bit 5
+    ///   is set ("behind background"), the sprite only shows where the
+    ///   background pattern is 0 (transparent); otherwise the background
+    ///   pixel is kept.
+    /// - Horizontal/vertical flip (attribute bits 6/7) mirror the
+    ///   8×8 tile pixels within the sprite's bounding box.
+    /// - Sprite palettes are at `$3F10-$3F1F` (palettes 4-7); the
+    ///   sprite's 2-bit palette select picks one of four 4-color
+    ///   palettes. Pattern 0 is always transparent.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_OAM
+    /// See: https://www.nesdev.org/wiki/PPU_rendering#Sprites
+    pub fn render_sprites(&mut self, chr_read: impl Fn(u16) -> u8) {
+        let sprites_enabled = (self.ppumask & MASK_SHOW_SPRITES) != 0;
+        if !sprites_enabled {
+            return;
+        }
+        let sprites_left_enabled = (self.ppumask & MASK_SHOW_SPRITES_LEFT) != 0;
+
+        // Clear the sprite-overflow flag at the start of the frame. On real
+        // hardware this happens at the prerender scanline (M10); without
+        // scanline timing we clear it here so the flag reflects the current
+        // frame's sprite count rather than sticking from a prior frame.
+        self.set_sprite_overflow(false);
+
+        // Sprite pattern table base: $0000 or $1000 (PPUCTRL bit 3).
+        let sprite_table: u16 = if (self.ppuctrl & CTRL_SPRITE_PATTERN_1000) != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+
+        // Per-scanline selected-sprite slots (OAM index, Y, tile, attr, X).
+        // Allocated once on the stack; reused for each scanline.
+        let mut selected: [(usize, u8, u8, u8, u8); MAX_SPRITES_PER_SCANLINE] =
+            [(0, 0, 0, 0, 0); MAX_SPRITES_PER_SCANLINE];
+        let mut overflow_this_frame = false;
+
+        for scanline in 0..SCREEN_HEIGHT as u16 {
+            // ---- Sprite evaluation: find first 8 sprites in range. ----
+            let mut count = 0usize;
+            for i in 0..SPRITE_COUNT {
+                let oam_idx = i * 4;
+                let y = self.oam[oam_idx];
+                if y >= OAM_Y_HIDDEN {
+                    continue;
+                }
+                // Visible on scanlines (y+1)..=(y+8). With y < 0xEF there
+                // is no u8 wraparound to worry about.
+                let top = y as u16 + 1;
+                if scanline < top || scanline >= top + SPRITE_HEIGHT {
+                    continue;
+                }
+                if count < MAX_SPRITES_PER_SCANLINE {
+                    selected[count] = (
+                        i,
+                        y,
+                        self.oam[oam_idx + 1],
+                        self.oam[oam_idx + 2],
+                        self.oam[oam_idx + 3],
+                    );
+                    count += 1;
+                } else {
+                    // 9th+ in-range sprite → overflow.
+                    overflow_this_frame = true;
+                }
+            }
+
+            // ---- Pixel rendering for this scanline. ----
+            let row_base = scanline as usize * SCREEN_WIDTH;
+            for px in 0..SCREEN_WIDTH as u16 {
+                // Left-column clip for sprites.
+                if px < 8 && !sprites_left_enabled {
+                    continue;
+                }
+
+                // Find the first non-transparent sprite (lowest OAM index
+                // = highest priority). It claims the pixel; no later
+                // sprite can override it.
+                for &(_oam_i, y, tile, attr, sx) in selected.iter().take(count) {
+                    let sx = sx as u16;
+                    if px < sx || px >= sx + SPRITE_WIDTH {
+                        continue;
+                    }
+                    let tile_col = (px - sx) as u8;
+                    // Row within the sprite (0..7). scanline - (y+1).
+                    let tile_row = (scanline - (y as u16 + 1)) as u8;
+                    let row = if (attr & ATTR_VFLIP) != 0 {
+                        7 - tile_row
+                    } else {
+                        tile_row
+                    };
+                    let col = if (attr & ATTR_HFLIP) != 0 {
+                        7 - tile_col
+                    } else {
+                        tile_col
+                    };
+
+                    let pattern_addr = sprite_table | ((tile as u16) << 4) | (row as u16);
+                    let plane0 = chr_read(pattern_addr);
+                    let plane1 = chr_read(pattern_addr | 0x08);
+                    let bit = 7 - col;
+                    let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
+
+                    if pattern == 0 {
+                        // Transparent — this sprite doesn't claim the pixel;
+                        // fall through to the next sprite.
+                        continue;
+                    }
+
+                    // This sprite claims the pixel.
+                    let col_idx = row_base + px as usize;
+                    let behind_bg = (attr & ATTR_PRIORITY_BEHIND) != 0;
+                    if behind_bg && self.bg_pattern[col_idx] != 0 {
+                        // Background is opaque here → sprite hidden. The
+                        // pixel keeps its background value. No lower
+                        // sprite may override.
+                        break;
+                    }
+
+                    let pal = (attr & ATTR_PALETTE_MASK) as u16;
+                    let color_addr = SPRITE_PAL_BASE | (pal << 2) | (pattern as u16);
+                    let nes_index = self.read_palette(color_addr);
+                    self.framebuffer[col_idx] = nes_color_to_argb(nes_index);
+                    break;
+                }
+            }
+        }
+
+        if overflow_this_frame {
+            self.set_sprite_overflow(true);
+        }
+    }
+
+    /// Render a full frame: background first, then sprites composited on
+    /// top. This is the M9 entry point for producing a complete visible
+    /// frame; the video layer (M12) uploads the resulting framebuffer to
+    /// an SDL2 texture.
+    ///
+    /// See: https://www.nesdev.org/wiki/PPU_rendering
+    pub fn render_frame(&mut self, chr_read: impl Fn(u16) -> u8) {
+        // Pass the closure by reference to both passes; `Fn` is called via
+        // `&self`, so `&chr_read` satisfies the `impl Fn(u16) -> u8` bound.
+        self.render_background(&chr_read);
+        self.render_sprites(&chr_read);
     }
 
     /// Clear the entire framebuffer to a single ARGB value.

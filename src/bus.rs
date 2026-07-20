@@ -155,6 +155,35 @@ impl Bus {
         });
     }
 
+    /// Render the sprite layer on top of the existing framebuffer.
+    ///
+    /// Delegates to [`Ppu::render_sprites`], supplying a CHR-read closure
+    /// that routes pattern-table fetches through the loaded cartridge.
+    /// Must be called after [`Bus::render_background`] (or use
+    /// [`Bus::render_frame`]).
+    pub fn render_sprites(&mut self) {
+        let ppu = &mut self.ppu;
+        let cart = self.cartridge.as_ref();
+        ppu.render_sprites(move |addr| match cart {
+            Some(c) => c.read_chr(addr),
+            None => 0,
+        });
+    }
+
+    /// Render a full frame: background first, then sprites.
+    ///
+    /// This is the M9 entry point for producing a complete visible frame;
+    /// the video layer (M12) uploads the resulting framebuffer to an SDL2
+    /// texture each frame.
+    pub fn render_frame(&mut self) {
+        let ppu = &mut self.ppu;
+        let cart = self.cartridge.as_ref();
+        ppu.render_frame(move |addr| match cart {
+            Some(c) => c.read_chr(addr),
+            None => 0,
+        });
+    }
+
     /// Read a byte from the CPU address space.
     ///
     /// Takes `&mut self` because some reads have side effects: PPU

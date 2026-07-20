@@ -61,12 +61,18 @@ const CTRL_NMI: u8 = 0b1000_0000;
 const CTRL_INCREMENT_32: u8 = 0b0000_0100;
 /// PPUCTRL bit: background pattern table select (0 = `$0000`, 1 = `$1000`).
 const CTRL_BG_PATTERN_1000: u8 = 0b0001_0000;
+/// PPUCTRL bit: sprite pattern table select (0 = `$0000`, 1 = `$1000`).
+const CTRL_SPRITE_PATTERN_1000: u8 = 0b0000_1000;
 /// PPUCTRL bits 0-1: base nametable address (`$2000`/`$2400`/`$2800`/`$2C00`).
 const CTRL_BASE_NT_MASK: u8 = 0b0000_0011;
 /// PPUMASK bit: show background (enable background rendering).
 const MASK_SHOW_BG: u8 = 0b0000_1000;
 /// PPUMASK bit: show leftmost 8 pixels of background.
 const MASK_SHOW_BG_LEFT: u8 = 0b0000_0010;
+/// PPUMASK bit: show sprites (enable sprite rendering).
+const MASK_SHOW_SPRITES: u8 = 0b0001_0000;
+/// PPUMASK bit: show leftmost 8 pixels of sprites.
+const MASK_SHOW_SPRITES_LEFT: u8 = 0b0000_0100;
 
 /// PPUSTATUS bit: VBlank (bit 7).
 const STATUS_VBLANK: u8 = 0b1000_0000;
@@ -136,6 +142,14 @@ pub struct Ppu {
     /// in the render path.
     framebuffer: Vec<u32>,
 
+    // ---- background pattern buffer (M9: sprite priority) ----
+    /// Per-pixel background pattern value (0-3) from the most recent
+    /// background render. Used by [`Ppu::render_sprites`] to resolve
+    /// sprite priority: a "behind background" sprite only shows where
+    /// the background is transparent (pattern 0). Heap-allocated
+    /// (61 KB), filled by [`Ppu::render_background`].
+    bg_pattern: Vec<u8>,
+
     // ---- configuration ----
     /// Nametable mirroring mode, set from the cartridge by the bus.
     mirroring: Mirroring,
@@ -164,6 +178,7 @@ impl Ppu {
             oam: [0u8; OAM_SIZE],
             palette: [0u8; PALETTE_SIZE],
             framebuffer: vec![0u32; FRAMEBUFFER_SIZE],
+            bg_pattern: vec![0u8; FRAMEBUFFER_SIZE],
             mirroring: Mirroring::Horizontal,
         }
     }
@@ -531,6 +546,10 @@ impl Ppu {
     /// Mutably borrow the output framebuffer.
     pub fn framebuffer_mut(&mut self) -> &mut [u32] {
         &mut self.framebuffer
+    }
+    /// Borrow the per-pixel background pattern buffer (0-3 per pixel).
+    pub fn bg_pattern(&self) -> &[u8] {
+        &self.bg_pattern
     }
     /// Screen dimensions (width, height) in pixels.
     pub fn screen_size() -> (usize, usize) {
