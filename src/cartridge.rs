@@ -14,6 +14,8 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::compression;
+use crate::ips::IpsPatch;
 use crate::mappers::{from_ines, Mapper, Mirroring};
 use crate::region::Region;
 
@@ -43,6 +45,10 @@ pub enum CartridgeError {
     BadMagic,
     /// Mapper number is not yet implemented.
     UnsupportedMapper(u16),
+    /// A compressed ROM archive (`.gz` / `.zip`) could not be decompressed.
+    Decompress(String),
+    /// An IPS patch file could not be parsed or applied.
+    Ips(String),
 }
 
 impl fmt::Display for CartridgeError {
@@ -54,6 +60,10 @@ impl fmt::Display for CartridgeError {
             CartridgeError::UnsupportedMapper(n) => {
                 write!(f, "mapper {n} not yet implemented")
             }
+            CartridgeError::Decompress(msg) => {
+                write!(f, "decompression error: {msg}")
+            }
+            CartridgeError::Ips(msg) => write!(f, "IPS patch error: {msg}"),
         }
     }
 }
@@ -173,9 +183,51 @@ pub struct Cartridge {
 
 impl Cartridge {
     /// Load and parse an iNES file from disk, then build the mapper.
+    ///
+    /// If the file is a Gzip (`.gz`) or ZIP (`.zip`) archive, it is
+    /// transparently decompressed first (M34). The first `.nes` entry in
+    /// a ZIP archive is used; if none is present, the first entry is
+    /// used as a fallback.
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, CartridgeError> {
         let bytes = std::fs::read(path.as_ref())?;
-        Self::from_bytes(&bytes)
+        Self::from_bytes_with_auto_decompress(&bytes)
+    }
+
+    /// Load and parse an iNES file from disk, then build the mapper,
+    /// applying an optional IPS patch to the ROM image before parsing
+    /// (M34). The patch is applied to the *decompressed* ROM image.
+    pub fn from_path_with_ips<P: AsRef<Path>>(
+        path: P,
+        ips_patch: Option<&IpsPatch>,
+    ) -> Result<Self, CartridgeError> {
+        let bytes = std::fs::read(path.as_ref())?;
+        let rom = if compression::is_compressed(&bytes) {
+            compression::decompress_auto(&bytes)
+                .map_err(|e| CartridgeError::Decompress(e.to_string()))?
+        } else {
+            bytes
+        };
+        let rom = if let Some(patch) = ips_patch {
+            patch
+                .apply(&rom)
+                .map_err(|e| CartridgeError::Ips(e.to_string()))?
+        } else {
+            rom
+        };
+        Self::from_bytes(&rom)
+    }
+
+    /// Build a cartridge from a raw byte slice, auto-detecting and
+    /// decompressing Gzip / ZIP archives (M34). For plain iNES images
+    /// this is equivalent to [`Cartridge::from_bytes`].
+    pub fn from_bytes_with_auto_decompress(data: &[u8]) -> Result<Self, CartridgeError> {
+        if compression::is_compressed(data) {
+            let decompressed = compression::decompress_auto(data)
+                .map_err(|e| CartridgeError::Decompress(e.to_string()))?;
+            Self::from_bytes(&decompressed)
+        } else {
+            Self::from_bytes(data)
+        }
     }
 
     /// Build a cartridge from a raw iNES file image already in memory.

@@ -138,6 +138,17 @@ impl Osd {
         if !self.enabled || fb.len() != (width * height) as usize {
             return;
         }
+        self.render_forced(fb, width, height, lines);
+    }
+
+    /// Render the OSD unconditionally, ignoring the `enabled` flag. Used
+    /// by one-shot overlays (e.g. the M34 ROM-info overlay) that want to
+    /// draw text without toggling the persistent OSD state. The
+    /// framebuffer size check is still enforced.
+    pub fn render_forced(&self, fb: &mut [u32], width: u32, height: u32, lines: &[&str]) {
+        if fb.len() != (width * height) as usize {
+            return;
+        }
         let mut y = 0u32;
         for line in lines {
             self.draw_line(fb, width, height, line, y);

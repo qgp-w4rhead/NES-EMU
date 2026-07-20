@@ -4,8 +4,9 @@
 //! runs a frame-locked main loop that steps the emulator one frame per
 //! vsync and presents the PPU framebuffer via SDL2. Key bindings and gamepad
 //! mappings come from `config.toml` (M22). Debug hotkeys (M27/M28), UI
-//! controls (M29), save-state/OSD (M30), audio volume/mute (M31), and region
-//! switching (M32) are dispatched before joypad routing.
+//! controls (M29), save-state/OSD (M30), audio volume/mute (M31), region
+//! switching (M32), and ROM management (M34 — drag-and-drop, recent list,
+//! ROM info overlay) are dispatched before joypad routing.
 //!
 //! See: https://www.nesdev.org/wiki/PPU (256x240) and
 //! https://www.nesdev.org/wiki/Cycle_reference (~29,830 CPU cycles/NTSC frame).
@@ -18,16 +19,15 @@ use sdl2::controller::GameController;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
+use nes_emu::app::{load_rom, save_battery_sram};
 use nes_emu::audio::AudioOutput;
 use nes_emu::audio_hotkeys::AudioHotkeys;
-use nes_emu::battery;
-use nes_emu::cartridge::Cartridge;
 use nes_emu::config::Config;
 use nes_emu::debug::{handle_debugger_key, print_debug_overlay, CpuDebugger, DebugHotkeys};
-use nes_emu::emulator::EmulatorState;
 use nes_emu::input::InputMapper;
 use nes_emu::osd::game_name_from_path;
 use nes_emu::region_hotkeys::RegionHotkeys;
+use nes_emu::rom_manager::{RomManager, ROM_INFO_HOTKEY};
 use nes_emu::save_state_hotkeys::SaveStateHotkeys;
 use nes_emu::ui_hotkeys::UiHotkeys;
 use nes_emu::video::Video;
@@ -144,12 +144,11 @@ fn open_initial_gamepads(
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let cli = parse_args(&args)?;
-    let rom_path = cli.rom_path;
+    let rom_path = PathBuf::from(cli.rom_path);
     let config_path = resolve_config_path(cli.config_path.as_deref());
 
-    // Load user config (M22). Missing/invalid config is non-fatal: we
-    // fall back to defaults and write a template `config.toml`.
-    let config = match Config::load_from_path(&config_path) {
+    // Load user config (M22). Missing/invalid config is non-fatal.
+    let mut config = match Config::load_from_path(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("nes-emu: warning: {e}; using default config");
@@ -160,38 +159,22 @@ fn run() -> Result<(), String> {
         eprintln!("nes-emu: warning: could not write default config: {e}");
     }
 
-    let cartridge = Cartridge::from_path(&rom_path)
-        .map_err(|e| format!("failed to load ROM '{rom_path}': {e}"))?;
+    // M34: ROM manager — drag-and-drop queue, recent list, ROM info overlay.
+    let mut rom_manager = RomManager::new(config.recent_roms.clone());
 
-    // Battery-backed PRG-RAM persistence (M21): load `.nessram` sidecar
-    // if present. Missing file / errors are non-fatal.
-    let rom_path_ref = std::path::Path::new(&rom_path);
-    let mut cartridge = cartridge;
-    if cartridge.has_battery() {
-        match battery::load_for_rom(rom_path_ref) {
-            Ok(Some(data)) => cartridge.load_battery_sram(&data),
-            Ok(None) => {}
-            Err(e) => eprintln!("nes-emu: warning: could not read battery SRAM: {e}"),
-        }
-    }
-
-    // M32: resolve region — config override wins, else iNES header hint, else NTSC.
-    let region = config.resolve_region(cartridge.header.region_hint());
-    eprintln!("nes-emu: region = {}", region.short_name());
-    let mut emulator = EmulatorState::new_with_region(cartridge, region);
-    emulator.reset();
-    // M31: apply per-channel APU volumes from config.
-    emulator
-        .bus_mut()
-        .apu_mut()
-        .apply_channel_volumes(&config.audio_channels.as_array());
+    // Initial ROM load (shared with drag-and-drop reload path).
+    let loaded = load_rom(&rom_path, &config)?;
+    let mut emulator = loaded.emulator;
+    let mut current_rom_path = loaded.rom_path.clone();
+    let mut current_rom_info = loaded.info;
+    let new_recent = rom_manager.record_loaded_rom(&rom_path.to_string_lossy());
+    config.recent_roms = new_recent;
 
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
     let audio_subsystem = sdl_context.audio()?;
     let game_controller_subsystem = sdl_context.game_controller()?;
 
-    // Window scale from config (M22); falls back to default if invalid.
     let scale = if (1..=8).contains(&config.window_scale) {
         config.window_scale
     } else {
@@ -201,32 +184,21 @@ fn run() -> Result<(), String> {
     let mut audio = AudioOutput::new(&audio_subsystem)?;
     audio.set_volume(config.audio_volume);
     let mut event_pump = sdl_context.event_pump()?;
+    // M34: enable SDL2 file-drop events for drag-and-drop ROM loading.
+    event_pump.enable_event(sdl2::event::EventType::DropFile);
 
-    // Open all connected SDL2 game controllers (M22). `gamepad_index_map`
-    // maps SDL2 instance IDs → sequential NES controller index.
     let (mut gamepads, mut gamepad_index_map) = open_initial_gamepads(&game_controller_subsystem);
     let mut next_seq: usize = gamepads.len();
-
     let mut mapper = InputMapper::from_config(&config);
 
-    // CPU debugger (M27): F1 pause/resume, F2 single-step, F3 run-to-BP.
     let mut debugger = CpuDebugger::new();
-    // M28 debug viewers: F4 PPU viewer, F6 memory dump, F8 trace logger,
-    // PageUp/PageDown navigate, `[`/`]` switch CPU/PPU region.
     let mut debug_hotkeys = DebugHotkeys::default();
-    // M29 UI controls: Ctrl+R reset, F9 screenshot, Alt+Enter fullscreen,
-    // Tab fast-forward.
     let mut ui_hotkeys = UiHotkeys::default();
-    // M30 save-state slots (F5/F7 + 1..=9,0), rewind (Backspace), OSD (F10).
-    let game_name = game_name_from_path(rom_path_ref);
-    let mut save_state_hotkeys = SaveStateHotkeys::new(game_name);
-    // M31 audio hotkeys (Alt+1..5, M, Up/Down, 0) + M32 region (F11).
+    let mut save_state_hotkeys = SaveStateHotkeys::new(game_name_from_path(&current_rom_path));
     let mut audio_hotkeys = AudioHotkeys::new();
     let mut region_hotkeys = RegionHotkeys::new();
 
     'running: loop {
-        // Drain all pending events each frame; ESC / Q / window-close
-        // terminate. NES buttons route through `InputMapper` (M22).
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -238,26 +210,36 @@ fn run() -> Result<(), String> {
                     keycode: Some(Keycode::Q),
                     ..
                 } => break 'running,
+                // M34: drag-and-drop — queue the path; reload between frames.
+                Event::DropFile { filename, .. } => {
+                    rom_manager.queue_drop(PathBuf::from(filename));
+                }
                 Event::KeyDown {
                     keycode: Some(k),
                     keymod,
                     ..
                 } => {
-                    // Intercept UI + debugger + save-state + audio +
-                    // region hotkeys (M27-M32) before joypad routing.
+                    // Intercept UI/debugger/save-state/audio/region/ROM-info
+                    // hotkeys (M27-M34) before joypad routing.
                     let consumed = ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
                         || handle_debugger_key(&mut debugger, k)
                         || debug_hotkeys.handle_key(emulator.bus(), k)
                         || save_state_hotkeys.handle_key(&mut emulator, k, keymod)
                         || audio_hotkeys.handle_key(emulator.bus_mut().apu_mut(), k, keymod)
-                        || region_hotkeys.handle_key(&mut emulator, k, keymod);
+                        || region_hotkeys.handle_key(&mut emulator, k, keymod)
+                        || (k == ROM_INFO_HOTKEY && {
+                            rom_manager.toggle_info_overlay();
+                            true
+                        });
                     if !consumed {
                         mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true);
                     }
                 }
                 Event::KeyUp {
                     keycode: Some(k), ..
-                } => mapper.handle_key(emulator.bus_mut().joypad_mut(), k, false),
+                } => {
+                    mapper.handle_key(emulator.bus_mut().joypad_mut(), k, false);
+                }
                 Event::ControllerButtonDown { which, button, .. } => {
                     if let Some(&seq) = gamepad_index_map.get(&which) {
                         mapper.handle_gamepad_button(
@@ -278,8 +260,7 @@ fn run() -> Result<(), String> {
                         );
                     }
                 }
-                // Gamepad hot-plug: `which` is the joystick device index
-                // (not instance ID) — that's what `open` expects.
+                // Gamepad hot-plug: `which` is the joystick device index.
                 Event::ControllerDeviceAdded { which, .. } => {
                     match game_controller_subsystem.open(which) {
                         Ok(c) => {
@@ -302,9 +283,6 @@ fn run() -> Result<(), String> {
                         }
                     }
                 }
-                // Gamepad hot-unplug: drop from the index map. The
-                // `GameController` stays in `gamepads` (dropping it would
-                // close the device); the slot stays reserved.
                 Event::ControllerDeviceRemoved { which, .. } => {
                     if gamepad_index_map.remove(&which).is_some() {
                         eprintln!("nes-emu: gamepad (instance {which}) removed");
@@ -314,13 +292,30 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Step the emulator. When paused, re-present the current
-        // framebuffer; a pending single-step (F2) runs one instruction.
-        // When not paused, run a full frame via `step_frame_debug`,
-        // which stops early if a breakpoint matches (F3). M29
-        // fast-forward (Tab): run `FAST_FORWARD_FRAMES` frames per
-        // vsync tick; intermediate frames' audio is drained to avoid
-        // flooding the queue (last frame's samples are kept).
+        // M34: process a pending drag-and-drop reload between frames.
+        if let Some(dropped_path) = rom_manager.take_pending_drop() {
+            save_battery_sram(&emulator, &current_rom_path);
+            match load_rom(&dropped_path, &config) {
+                Ok(loaded) => {
+                    emulator = loaded.emulator;
+                    current_rom_path = loaded.rom_path.clone();
+                    current_rom_info = loaded.info;
+                    let new_recent = rom_manager.record_loaded_rom(&dropped_path.to_string_lossy());
+                    config.recent_roms = new_recent;
+                    save_state_hotkeys =
+                        SaveStateHotkeys::new(game_name_from_path(&current_rom_path));
+                    debugger = CpuDebugger::new();
+                    eprintln!("nes-emu: loaded ROM: {}", current_rom_path.display());
+                }
+                Err(e) => eprintln!("nes-emu: {e}"),
+            }
+        }
+
+        // Step the emulator. When paused, a pending single-step (F2) runs
+        // one instruction. When running, execute a full frame (or
+        // `FAST_FORWARD_FRAMES` frames if Tab is held), stopping early if
+        // a breakpoint matches (F3). Intermediate fast-forward frames'
+        // audio is drained to avoid flooding the queue.
         if debugger.is_paused() {
             if debugger.consume_step_request() {
                 emulator.step_instruction();
@@ -333,13 +328,10 @@ fn run() -> Result<(), String> {
             };
             for i in 0..frames_this_tick {
                 if debug_hotkeys.trace_enabled() {
-                    // M28: trace logging — run via `step_frame_traced`.
                     emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
                 } else {
                     emulator.step_frame_debug(&mut debugger);
                 }
-                // Fast-forward: drain intermediate frames' audio; keep
-                // the last frame's samples for the post-loop push.
                 if ui_hotkeys.fast_forward() && i + 1 < frames_this_tick {
                     let _ = emulator.take_audio_samples();
                 }
@@ -351,12 +343,15 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        // M30: when the OSD is enabled, the overlay is blitted into the
-        // framebuffer *before* the single `video.present` call (inside
-        // `post_frame`), so we skip the present here to avoid a double-
-        // present that would halve the frame rate (the renderer is
-        // vsync-locked). When the OSD is off, we present here.
-        if !save_state_hotkeys.osd_enabled() {
+        // M30/M34: present logic. When neither the OSD nor the ROM-info
+        // overlay is enabled, present the raw framebuffer here. When
+        // either is enabled, the present is deferred to the post-frame
+        // hook (OSD) or the info-overlay blit below, so the overlay is
+        // drawn *before* the present (a double-present would halve the
+        // frame rate since the renderer is vsync-locked).
+        let osd_on = save_state_hotkeys.osd_enabled();
+        let info_on = rom_manager.info_overlay_enabled();
+        if !osd_on && !info_on {
             video.present(emulator.framebuffer())?;
         }
         let samples = emulator.take_audio_samples();
@@ -370,10 +365,26 @@ fn run() -> Result<(), String> {
         // M30: post-frame hook — capture a rewind snapshot, then (if the
         // OSD is enabled) blit the overlay into the framebuffer and
         // present. When the OSD is off, this only pushes the rewind
-        // snapshot and does not present (the present already happened
-        // above). Encapsulated in `SaveStateHotkeys::post_frame` to keep
-        // main.rs under the 400-line limit.
+        // snapshot and does not present. Encapsulated in
+        // `SaveStateHotkeys::post_frame` to keep main.rs compact.
         save_state_hotkeys.post_frame(&mut emulator, |fb| video.present(fb))?;
+
+        // M34: ROM-info overlay — when enabled, blit the info lines into
+        // the framebuffer and present. This runs after the save-state
+        // post_frame hook so the OSD + info overlay stack correctly; if
+        // the OSD already presented, we skip the present here to avoid a
+        // double-present.
+        if info_on {
+            rom_manager.render_info_overlay(
+                emulator.framebuffer_mut(),
+                256,
+                240,
+                &current_rom_info,
+            );
+            if !osd_on {
+                video.present(emulator.framebuffer())?;
+            }
+        }
 
         // While paused, render a console "overlay" — register snapshot +
         // disassembly window — to stderr each frame (M27 debug overlay).
@@ -385,16 +396,19 @@ fn run() -> Result<(), String> {
     // Battery-backed PRG-RAM persistence (M21): on exit, dump the
     // cartridge's PRG-RAM to the `.nessram` sidecar file next to the ROM.
     // Save errors are non-fatal — the emulator is already shutting down.
-    if emulator.has_battery() {
-        if let Some(sram) = emulator.battery_sram() {
-            if let Err(e) = battery::save_for_rom(rom_path_ref, &sram) {
-                eprintln!("nes-emu: warning: could not save battery SRAM: {e}");
-            }
-        }
+    save_battery_sram(&emulator, &current_rom_path);
+
+    // M34: persist the updated recent-ROM list to config.toml.
+    if let Err(e) = config.save_to_path(&config_path) {
+        eprintln!("nes-emu: warning: could not save config: {e}");
     }
 
     // M28: flush + close the trace log on exit so no lines are lost.
     debug_hotkeys.shutdown();
+
+    // Keep `gamepads` alive until after the loop so the SDL2 controller
+    // handles stay open for the duration of the session.
+    drop(gamepads);
 
     Ok(())
 }

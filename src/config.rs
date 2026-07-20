@@ -263,6 +263,14 @@ pub struct Config {
     /// falling back to NTSC when no hint is present.
     #[serde(default = "default_region")]
     pub region: String,
+
+    /// Recent ROM file paths (M34), most-recent-first. Capped at 10
+    /// entries by the ROM manager; persisted to `config.toml` as a TOML
+    /// array of strings. Updated by the main loop after each successful
+    /// ROM load (initial `--rom`, drag-and-drop, or recent-list
+    /// selection).
+    #[serde(default)]
+    pub recent_roms: Vec<String>,
 }
 
 fn default_region() -> String {
@@ -297,6 +305,7 @@ impl Default for Config {
             gamepad,
             audio_channels: ChannelVolumes::default(),
             region: default_region(),
+            recent_roms: Vec::new(),
         }
     }
 }
