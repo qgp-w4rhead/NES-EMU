@@ -358,7 +358,7 @@ mod tests {
         let mut bytes = make_ines(1, 1, 0, 0, 0);
         let chr_off = HEADER_SIZE + PRG_ROM_UNIT;
         for i in 0..CHR_ROM_UNIT {
-            bytes[chr_off + i] = ((i as u8).wrapping_add(0x40)) & 0xFF;
+            bytes[chr_off + i] = (i as u8).wrapping_add(0x40);
         }
         let cart = Cartridge::from_bytes(&bytes).expect("load");
         assert_eq!(cart.read_chr(0x0000), 0x40);

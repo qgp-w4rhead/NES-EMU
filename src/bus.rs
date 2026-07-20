@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn cart_space_routes_to_loaded_cartridge_prg() {
         let cart = make_test_cartridge(0x99);
-        let mut bus = Bus::with_cartridge(cart);
+        let bus = Bus::with_cartridge(cart);
         // $8000 is the first PRG-ROM byte (NROM 16K mirrors high half too).
         assert_eq!(bus.read(0x8000), 0x99);
         assert_eq!(bus.read(0xC000), 0x99); // mirror of $8000 for 16K PRG
@@ -375,7 +375,7 @@ mod tests {
         // that a 16K PRG ROM's $6000 reads 0 (cartridge's PRG-RAM region
         // answer) and $8000 reads the ROM fill (cartridge's PRG-ROM answer).
         let cart = make_test_cartridge(0x77);
-        let mut bus = Bus::with_cartridge(cart);
+        let bus = Bus::with_cartridge(cart);
         assert_eq!(bus.read(0x6000), 0x00); // PRG-RAM region: NROM returns 0
         assert_eq!(bus.read(0x8000), 0x77); // PRG-ROM: fill byte
     }
