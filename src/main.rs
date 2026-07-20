@@ -7,17 +7,12 @@
 //!
 //! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
 
-mod bus;
-mod cartridge;
-mod mappers;
-mod video;
-
 use std::process::ExitCode;
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
-use video::{new_framebuffer, Video, DEFAULT_SCALE};
+use nes_emu::video::{new_framebuffer, Video, DEFAULT_SCALE};
 
 /// Application entry point. Returns a process exit code so that SDL2 or
 /// initialization errors are reported cleanly without panicking in the
