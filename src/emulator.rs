@@ -306,7 +306,7 @@ impl EmulatorState {
         self.sample_accumulator += apu_cycles as f32;
         while self.sample_accumulator >= CPU_CYCLES_PER_SAMPLE {
             self.sample_accumulator -= CPU_CYCLES_PER_SAMPLE;
-            self.audio_buffer.push(self.bus.apu().output());
+            self.audio_buffer.push(self.bus.apu_mut().output());
         }
 
         // Advance the PPU by 3× the total CPU cycles this iteration

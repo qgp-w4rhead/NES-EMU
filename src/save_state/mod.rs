@@ -92,7 +92,7 @@ use crate::ppu::Ppu;
 /// layout changes in a backward-incompatible way. On load, a version
 /// mismatch returns [`SaveStateError::VersionMismatch`] rather than
 /// attempting to deserialise into a potentially incompatible layout.
-pub const SAVE_STATE_VERSION: u32 = 1;
+pub const SAVE_STATE_VERSION: u32 = 2;
 
 /// Errors that can occur during save state serialisation or deserialisation.
 #[derive(Debug)]

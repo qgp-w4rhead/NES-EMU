@@ -1197,6 +1197,30 @@ pub struct Apu {
     /// across `step` calls.
     cycle_accumulator: u32,
 
+    // ---- Per-channel volume / mute (M31) --------------------------------
+    /// Per-channel volume scalars in `[0.0, 1.0]`, indexed as
+    /// `[pulse1, pulse2, triangle, noise, dmc]`. Applied to each
+    /// channel's raw sample before the non-linear mix. `0.0` is
+    /// equivalent to mute (but distinct from `channel_muted` so a
+    /// "reset" can restore the configured volume). Defaults to `1.0`
+    /// (full volume). Set at startup from `config.toml`
+    /// `[audio_channels]` and adjustable at runtime via hotkeys.
+    channel_volumes: [f32; 5],
+    /// Per-channel mute flags. A muted channel contributes 0 to the
+    /// mix regardless of its volume scalar. Toggled at runtime via
+    /// `Alt+1`..`Alt+5` + `Alt+M` (M31).
+    channel_muted: [bool; 5],
+    /// Currently-selected channel index (0..4) for volume adjustment
+    /// hotkeys (`Alt+Up`/`Alt+Down`). Advanced by `Alt+1`..`Alt+5`.
+    selected_channel: u8,
+
+    // ---- Low-pass filter (M31) ------------------------------------------
+    /// Previous output sample held by the one-pole low-pass filter.
+    /// The LPF smooths harsh square-wave harmonics above ~12 kHz.
+    /// Updated each `output()` call; serialized so save states preserve
+    /// filter state.
+    lpf_prev: f32,
+
     // ---- Frame counter ($4017) -----------------------------------------
     /// `true` for 5-step mode (bit 7 of `$4017`), `false` for 4-step mode.
     frame_mode_5step: bool,
@@ -1225,6 +1249,13 @@ impl Apu {
             noise: NoiseChannel::new(),
             dmc: DmcChannel::new(),
             cycle_accumulator: 0,
+            channel_volumes: [1.0; 5],
+            channel_muted: [false; 5],
+            selected_channel: 0,
+            // Initialize to the silence level (-1.0) so a cold-boot APU
+            // (all channels off) produces a steady -1.0 immediately,
+            // with no startup transient ramping 0 → -1.0 (audible click).
+            lpf_prev: -1.0,
             frame_mode_5step: false,
             frame_irq_inhibit: false,
             frame_cycle: 0,
@@ -1495,12 +1526,11 @@ impl Apu {
         self.noise.clock_half_frame();
     }
 
-    /// Mix the current channel samples into a single 0..=15 value. For
-    /// M15 this is a simple sum (clamped); the non-linear mixer lands in
-    /// Tier 3. The triangle channel's full-volume output (0..=15) is
-    /// added directly; the noise channel contributes its envelope volume.
-    /// The DMC is not included in this 0..=15 mix; see [`Apu::output`]
-    /// for the full mix including DMC.
+    /// Mix the current channel samples into a single 0..=15 value (linear
+    /// sum, clamped). This is the simple linear mixer used for debug
+    /// inspection; the actual audio path uses the hardware-accurate
+    /// non-linear mixer in [`Apu::output`] (M31). The DMC is not included
+    /// here; see [`Apu::output`] for the full mix including DMC.
     pub fn mix(&self) -> u8 {
         let s = self.pulse1.sample() as u16
             + self.pulse2.sample() as u16
@@ -1514,15 +1544,150 @@ impl Apu {
     }
 
     /// Full audio output sample as an `f32` in `[-1.0, 1.0]`, including
-    /// the DMC channel. The pulse/triangle/noise mix (0..=15) is centered
-    /// at its midpoint (7.5) and scaled to `[-1.0, 1.0]`; the DMC output
-    /// (0..=127) is centered at its midpoint (63.5) and scaled to
-    /// `[-1.0, 1.0]`. The two are averaged, so silence (all channels off,
-    /// DMC = 0) produces 0.0. The non-linear mixer lands in Tier 3 (M31).
-    pub fn output(&self) -> f32 {
-        let ptn = (self.mix() as f32 - 7.5) / 7.5; // -1..=1
-        let dmc = (self.dmc.sample() as f32 - 63.5) / 63.5; // -1..=1
-        (ptn + dmc) / 2.0 // -1..=1
+    /// all five channels (M31: non-linear hardware-accurate mixing).
+    ///
+    /// The NES APU mixer is non-linear: the two pulse channels share one
+    /// mixing junction and the triangle/noise/DMC share another. The
+    /// formulas (from the NESdev wiki "APU Mixer" page) are:
+    ///
+    /// - `pulse_out = 95.52 / (8128.0 / (p1 + p2) + 100.0)` (0 if p1+p2 = 0)
+    /// - `tnd_out = 163.67 / (1.0 / (tri/8227 + noise/12241 + dmc/22638) + 100.0)`
+    ///   (0 if the inner sum is 0)
+    ///
+    /// Each channel's raw sample is first scaled by its per-channel
+    /// volume scalar and zeroed if muted (M31). The mixed value
+    /// (`pulse_out + tnd_out`, range ~0..1.017) is then mapped to
+    /// `[-1.0, 1.0]` via `out = mixed * 2.0 - 1.0` (so silence → -1.0,
+    /// matching the pre-M31 centered mapping for backward compatibility
+    /// with the DC-offset acceptance documented in M16) and run through
+    /// a one-pole low-pass filter (~12 kHz cutoff) to smooth harsh
+    /// square-wave harmonics.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Mixer
+    pub fn output(&mut self) -> f32 {
+        // Per-channel raw samples, scaled by volume and muted.
+        let p1 = self.scaled_sample(0, self.pulse1.sample());
+        let p2 = self.scaled_sample(1, self.pulse2.sample());
+        let tri = self.scaled_sample(2, self.triangle.sample());
+        let noise = self.scaled_sample(3, self.noise.sample());
+        let dmc = self.scaled_sample(4, self.dmc.sample());
+
+        // Non-linear pulse junction.
+        // https://www.nesdev.org/wiki/APU_Mixer
+        let pulse_sum = p1 + p2;
+        let pulse_out = if pulse_sum > 0.0 {
+            95.52 / (8128.0 / pulse_sum + 100.0)
+        } else {
+            0.0
+        };
+
+        // Non-linear triangle/noise/DMC junction.
+        let tnd_inner = tri / 8227.0 + noise / 12241.0 + dmc / 22638.0;
+        let tnd_out = if tnd_inner > 0.0 {
+            163.67 / (1.0 / tnd_inner + 100.0)
+        } else {
+            0.0
+        };
+
+        // Map [0, ~1.017] → [-1.0, ~1.034] and clamp to [-1.0, 1.0].
+        let mixed = (pulse_out + tnd_out) * 2.0 - 1.0;
+        let clamped = mixed.clamp(-1.0, 1.0);
+
+        // One-pole low-pass filter (cutoff ≈ 12 kHz at 44.1 kHz).
+        // y[n] = a * x[n] + (1 - a) * y[n-1], where
+        // a = 1 - exp(-2*pi*fc/fs) ≈ 0.8192 for fc=12kHz, fs=44.1kHz.
+        const LPF_ALPHA: f32 = 0.8192;
+        let filtered = LPF_ALPHA * clamped + (1.0 - LPF_ALPHA) * self.lpf_prev;
+        self.lpf_prev = filtered;
+        filtered
+    }
+
+    /// Return a channel's raw sample scaled by its per-channel volume
+    /// scalar and zeroed if muted. `idx` is 0=pulse1, 1=pulse2,
+    /// 2=triangle, 3=noise, 4=dmc. Out-of-range indices return 0.0.
+    fn scaled_sample(&self, idx: usize, raw: u8) -> f32 {
+        if idx >= self.channel_volumes.len() || self.channel_muted[idx] {
+            return 0.0;
+        }
+        raw as f32 * self.channel_volumes[idx]
+    }
+
+    // ---- Per-channel volume / mute accessors (M31) ---------------------
+
+    /// Per-channel volume scalars in `[0.0, 1.0]`, indexed as
+    /// `[pulse1, pulse2, triangle, noise, dmc]`.
+    pub fn channel_volumes(&self) -> [f32; 5] {
+        self.channel_volumes
+    }
+
+    /// Set the per-channel volume scalar for channel `idx` (0..4).
+    /// Out-of-range indices are ignored. Values are clamped to
+    /// `[0.0, 1.0]`.
+    pub fn set_channel_volume(&mut self, idx: usize, vol: f32) {
+        if idx < self.channel_volumes.len() {
+            self.channel_volumes[idx] = vol.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Get the volume scalar for channel `idx` (0..4). Out-of-range
+    /// indices return 0.0.
+    pub fn channel_volume(&self, idx: usize) -> f32 {
+        self.channel_volumes.get(idx).copied().unwrap_or(0.0)
+    }
+
+    /// Per-channel mute flags, indexed as `[pulse1, pulse2, triangle,
+    /// noise, dmc]`.
+    pub fn channel_muted(&self) -> [bool; 5] {
+        self.channel_muted
+    }
+
+    /// Whether channel `idx` (0..4) is muted. Out-of-range → true.
+    pub fn channel_muted_at(&self, idx: usize) -> bool {
+        self.channel_muted.get(idx).copied().unwrap_or(true)
+    }
+
+    /// Toggle the mute flag for channel `idx` (0..4). Out-of-range
+    /// indices are ignored. Returns the new muted state (or `None` if
+    /// the index was invalid).
+    pub fn toggle_channel_mute(&mut self, idx: usize) -> Option<bool> {
+        let m = self.channel_muted.get_mut(idx)?;
+        *m = !*m;
+        Some(*m)
+    }
+
+    /// Explicitly set the mute flag for channel `idx` (0..4).
+    pub fn set_channel_muted(&mut self, idx: usize, muted: bool) {
+        if let Some(m) = self.channel_muted.get_mut(idx) {
+            *m = muted;
+        }
+    }
+
+    /// Currently-selected channel index (0..4) for volume hotkeys.
+    pub fn selected_channel(&self) -> u8 {
+        self.selected_channel
+    }
+
+    /// Set the selected channel index. Clamped to 0..4.
+    pub fn set_selected_channel(&mut self, idx: u8) {
+        self.selected_channel = idx.min(4);
+    }
+
+    /// Reset all channels to unmuted with volume `1.0` (full). Used by
+    /// the `Alt+0` "reset all" hotkey (M31).
+    pub fn reset_channel_mix(&mut self) {
+        self.channel_volumes = [1.0; 5];
+        self.channel_muted = [false; 5];
+    }
+
+    /// Apply a set of per-channel volumes from config (M31). Each
+    /// entry is clamped to `[0.0, 1.0]`. Missing entries (if the
+    /// caller passes a shorter slice) leave the existing value.
+    pub fn apply_channel_volumes(&mut self, vols: &[f32]) {
+        for (i, &v) in vols.iter().enumerate() {
+            if i < self.channel_volumes.len() {
+                self.channel_volumes[i] = v.clamp(0.0, 1.0);
+            }
+        }
     }
 }
 
@@ -2858,12 +3023,18 @@ mod tests {
     #[test]
     fn apu_output_includes_dmc() {
         let mut apu = Apu::new();
-        // DMC output = 127, all other channels silent (mix = 0).
+        // DMC output = 127, all other channels silent.
         apu.dmc_mut().write_register(1, 0x7F);
         let out = apu.output();
-        // ptn = (0 - 7.5) / 7.5 = -1.0, dmc = (127 - 63.5) / 63.5 ≈ 1.0.
-        // combined = (-1.0 + 1.0) / 2 = 0.0.
-        assert!((out - 0.0).abs() < 1e-3);
+        // M31 non-linear mixer: pulse_out = 0 (no pulse), tnd_out with
+        // only DMC = 127 → 163.67 / (1/(127/22638) + 100) ≈ 0.5883.
+        // mixed = 0.5883 * 2 - 1 = 0.1766. LPF starts at -1.0 (silence)
+        // so first sample = 0.8192*0.1766 + 0.1808*(-1.0) ≈ -0.0359.
+        // Allow tolerance for the LPF transient from the silence init.
+        assert!(
+            (out - (-0.0359)).abs() < 2e-2,
+            "expected ~-0.0359 (non-linear DMC + LPF from silence), got {out}"
+        );
     }
 
     #[test]
@@ -2878,19 +3049,35 @@ mod tests {
         apu.pulse1_mut().write_register(3, 0x00); // length 10, timer high = 0
         apu.dmc_mut().write_register(1, 0x7F); // DMC = 127
         let out = apu.output();
-        // ptn = (15 - 7.5) / 7.5 = 1.0, dmc = (127 - 63.5) / 63.5 ≈ 1.0.
-        // combined = (1.0 + 1.0) / 2 = 1.0.
-        assert!((out - 1.0).abs() < 1e-3);
+        // M31 non-linear: pulse_out = 95.52/(8128/15+100) ≈ 0.1488,
+        // tnd_out ≈ 0.5883 (DMC only). mixed = (0.1488+0.5883)*2-1 ≈ 0.4742.
+        // LPF from silence (-1.0): 0.8192*0.4742 + 0.1808*(-1.0) ≈ 0.2081.
+        assert!(
+            (out - 0.2081).abs() < 2e-2,
+            "expected ~0.2081 (non-linear pulse+DMC + LPF from silence), got {out}"
+        );
     }
 
     #[test]
     fn apu_output_silence_is_negative_one() {
-        let apu = Apu::new();
-        // All channels off, DMC = 0. Centered mapping: both components at
-        // minimum → output = -1.0. A DC blocking filter would center this
-        // at 0.0; for M16 we accept the DC offset.
+        let mut apu = Apu::new();
+        // All channels off, DMC = 0. Non-linear mixer: pulse_out = 0,
+        // tnd_out = 0 → mixed = 0*2 - 1 = -1.0. The LPF is initialized
+        // to -1.0 (the silence level) so there is no boot transient —
+        // the very first sample is already -1.0.
         let out = apu.output();
-        assert!((out - (-1.0_f32)).abs() < 1e-6);
+        assert!(
+            (out - (-1.0_f32)).abs() < 1e-6,
+            "expected silence to be -1.0 from first sample, got {out}"
+        );
+        // Stays at -1.0.
+        for _ in 0..10 {
+            let out = apu.output();
+            assert!(
+                (out - (-1.0_f32)).abs() < 1e-6,
+                "silence should stay at -1.0, got {out}"
+            );
+        }
     }
 
     #[test]

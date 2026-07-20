@@ -158,6 +158,75 @@ pub struct GamepadBindings {
     pub buttons: BTreeMap<String, String>,
 }
 
+/// Per-channel APU volume scalars (M31). Each value is in `[0.0, 1.0]`;
+/// `0.0` silences that channel at the mix stage. Configured in
+/// `config.toml` under `[audio_channels]`:
+///
+/// ```toml
+/// [audio_channels]
+/// pulse1 = 1.0
+/// pulse2 = 1.0
+/// triangle = 1.0
+/// noise = 1.0
+/// dmc = 1.0
+/// ```
+///
+/// Missing fields default to `1.0` (full volume). At runtime the volumes
+/// can be adjusted via `Alt+Up`/`Alt+Down` hotkeys (see
+/// [`crate::audio_hotkeys::AudioHotkeys`]); `Alt+0` resets all channels
+/// to unmuted with volume `1.0` (not to the config values).
+///
+/// See: https://www.nesdev.org/wiki/APU_Mixer
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChannelVolumes {
+    /// Pulse channel 1 (`$4000-$4003`) volume scalar.
+    #[serde(default = "default_channel_volume")]
+    pub pulse1: f32,
+    /// Pulse channel 2 (`$4004-$4007`) volume scalar.
+    #[serde(default = "default_channel_volume")]
+    pub pulse2: f32,
+    /// Triangle channel (`$4008-$400B`) volume scalar.
+    #[serde(default = "default_channel_volume")]
+    pub triangle: f32,
+    /// Noise channel (`$400C-$400F`) volume scalar.
+    #[serde(default = "default_channel_volume")]
+    pub noise: f32,
+    /// DMC channel (`$4010-$4013`) volume scalar.
+    #[serde(default = "default_channel_volume")]
+    pub dmc: f32,
+}
+
+fn default_channel_volume() -> f32 {
+    1.0
+}
+
+impl Default for ChannelVolumes {
+    fn default() -> Self {
+        Self {
+            pulse1: 1.0,
+            pulse2: 1.0,
+            triangle: 1.0,
+            noise: 1.0,
+            dmc: 1.0,
+        }
+    }
+}
+
+impl ChannelVolumes {
+    /// Return the five volumes in APU channel-index order
+    /// `[pulse1, pulse2, triangle, noise, dmc]` (matching
+    /// [`crate::apu::Apu::apply_channel_volumes`]).
+    pub fn as_array(&self) -> [f32; 5] {
+        [
+            self.pulse1,
+            self.pulse2,
+            self.triangle,
+            self.noise,
+            self.dmc,
+        ]
+    }
+}
+
 /// Top-level user configuration.
 ///
 /// All fields default to sensible values; a missing `config.toml` yields
@@ -181,6 +250,12 @@ pub struct Config {
     /// Gamepad bindings (applied to every connected gamepad).
     #[serde(default)]
     pub gamepad: GamepadBindings,
+
+    /// Per-channel APU volume scalars (M31). Configured under
+    /// `[audio_channels]` in `config.toml`. Defaults to full volume
+    /// (`1.0`) on all five channels.
+    #[serde(default)]
+    pub audio_channels: ChannelVolumes,
 }
 
 fn default_audio_volume() -> f32 {
@@ -209,6 +284,7 @@ impl Default for Config {
             window_scale: default_window_scale(),
             keys,
             gamepad,
+            audio_channels: ChannelVolumes::default(),
         }
     }
 }

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use nes_emu::config::{Config, GamepadBindings, KeyBindings};
+use nes_emu::config::{ChannelVolumes, Config, GamepadBindings, KeyBindings};
 use nes_emu::input::InputMapper;
 use nes_emu::joypad::{button, Joypad};
 use sdl2::controller::Button;
@@ -404,6 +404,7 @@ fn config_with_empty_keys_yields_all_unbound() {
         window_scale: 2,
         keys: KeyBindings::default(),
         gamepad: GamepadBindings::default(),
+        audio_channels: ChannelVolumes::default(),
     };
     for b in 0..8u8 {
         assert_eq!(c.keycode_for(0, b), None);
@@ -412,4 +413,73 @@ fn config_with_empty_keys_yields_all_unbound() {
     }
     assert_eq!(c.audio_volume, 0.7);
     assert_eq!(c.window_scale, 2);
+}
+
+// ---- M31: per-channel APU volumes -------------------------------------
+
+#[test]
+fn channel_volumes_default_all_one() {
+    let cv = ChannelVolumes::default();
+    assert_eq!(cv.pulse1, 1.0);
+    assert_eq!(cv.pulse2, 1.0);
+    assert_eq!(cv.triangle, 1.0);
+    assert_eq!(cv.noise, 1.0);
+    assert_eq!(cv.dmc, 1.0);
+}
+
+#[test]
+fn channel_volumes_as_array_is_in_apu_index_order() {
+    let cv = ChannelVolumes {
+        pulse1: 0.1,
+        pulse2: 0.2,
+        triangle: 0.3,
+        noise: 0.4,
+        dmc: 0.5,
+    };
+    assert_eq!(cv.as_array(), [0.1, 0.2, 0.3, 0.4, 0.5]);
+}
+
+#[test]
+fn config_default_has_full_volume_channels() {
+    let c = Config::default();
+    assert_eq!(c.audio_channels.as_array(), [1.0; 5]);
+}
+
+#[test]
+fn channel_volumes_round_trip_through_toml() {
+    let mut c = Config::default();
+    c.audio_channels.pulse1 = 0.8;
+    c.audio_channels.pulse2 = 0.6;
+    c.audio_channels.triangle = 0.4;
+    c.audio_channels.noise = 0.2;
+    c.audio_channels.dmc = 0.0;
+    let text = c.to_toml().expect("serialize");
+    let parsed = Config::from_toml(&text).expect("parse");
+    assert!((parsed.audio_channels.pulse1 - 0.8).abs() < 1e-6);
+    assert!((parsed.audio_channels.pulse2 - 0.6).abs() < 1e-6);
+    assert!((parsed.audio_channels.triangle - 0.4).abs() < 1e-6);
+    assert!((parsed.audio_channels.noise - 0.2).abs() < 1e-6);
+    assert_eq!(parsed.audio_channels.dmc, 0.0);
+}
+
+#[test]
+fn partial_audio_channels_uses_defaults_for_missing_fields() {
+    let text = r#"
+[audio_channels]
+pulse1 = 0.5
+dmc = 0.25
+"#;
+    let c = Config::from_toml(text).expect("parse");
+    assert!((c.audio_channels.pulse1 - 0.5).abs() < 1e-6);
+    assert_eq!(c.audio_channels.pulse2, 1.0); // default
+    assert_eq!(c.audio_channels.triangle, 1.0); // default
+    assert_eq!(c.audio_channels.noise, 1.0); // default
+    assert!((c.audio_channels.dmc - 0.25).abs() < 1e-6);
+}
+
+#[test]
+fn missing_audio_channels_section_uses_all_defaults() {
+    let text = "audio_volume = 0.5\n";
+    let c = Config::from_toml(text).expect("parse");
+    assert_eq!(c.audio_channels.as_array(), [1.0; 5]);
 }

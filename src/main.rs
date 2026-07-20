@@ -3,9 +3,9 @@
 //! Loads an iNES ROM from `--rom <path>`, builds the `EmulatorState`, and
 //! runs a frame-locked main loop that steps the emulator one NTSC frame
 //! per vsync and presents the PPU framebuffer via SDL2. Key bindings and
-//! gamepad mappings come from `config.toml` (M22). Debug hotkeys (M27/M28)
-//! and UI controls (M29: Ctrl+R reset, F9 screenshot, Alt+Enter
-//! fullscreen, Tab fast-forward) are dispatched before joypad routing.
+//! gamepad mappings come from `config.toml` (M22). Debug hotkeys (M27/M28),
+//! UI controls (M29), save-state/OSD (M30), and per-channel audio
+//! volume/mute (M31) are dispatched before joypad routing.
 //!
 //! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
 //! See: https://www.nesdev.org/wiki/Cycle_reference — ~29,830 CPU cycles
@@ -20,6 +20,7 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
 use nes_emu::audio::AudioOutput;
+use nes_emu::audio_hotkeys::AudioHotkeys;
 use nes_emu::battery;
 use nes_emu::cartridge::Cartridge;
 use nes_emu::config::Config;
@@ -176,6 +177,11 @@ fn run() -> Result<(), String> {
 
     let mut emulator = EmulatorState::new(cartridge);
     emulator.reset();
+    // M31: apply per-channel APU volumes from config.
+    emulator
+        .bus_mut()
+        .apu_mut()
+        .apply_channel_volumes(&config.audio_channels.as_array());
 
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
@@ -211,6 +217,8 @@ fn run() -> Result<(), String> {
     // M30 save-state slots (F5/F7 + 1..=9,0), rewind (Backspace), OSD (F10).
     let game_name = game_name_from_path(rom_path_ref);
     let mut save_state_hotkeys = SaveStateHotkeys::new(game_name);
+    // M31 per-channel APU volume/mute hotkeys (Alt+1..5, M, Up/Down, 0).
+    let mut audio_hotkeys = AudioHotkeys::new();
 
     'running: loop {
         // Drain all pending events each frame; ESC / Q / window-close
@@ -231,14 +239,14 @@ fn run() -> Result<(), String> {
                     keymod,
                     ..
                 } => {
-                    // Intercept UI + debugger + viewer + save-state
-                    // hotkeys (M27/M28/M29/M30) before routing to the
-                    // joypad. Short-circuit: the first dispatcher that
-                    // consumes the key wins; the rest are not consulted.
+                    // Intercept UI + debugger + viewer + save-state +
+                    // audio hotkeys (M27-M31) before joypad routing.
+                    // First dispatcher to consume wins; rest skipped.
                     let consumed = ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
                         || handle_debugger_key(&mut debugger, k)
                         || debug_hotkeys.handle_key(emulator.bus(), k)
-                        || save_state_hotkeys.handle_key(&mut emulator, k, keymod);
+                        || save_state_hotkeys.handle_key(&mut emulator, k, keymod)
+                        || audio_hotkeys.handle_key(emulator.bus_mut().apu_mut(), k, keymod);
                     if !consumed {
                         mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true);
                     }
@@ -302,17 +310,13 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Step the emulator. When the debugger is paused, we do not advance
-        // the machine — we just re-present the current framebuffer so the
-        // window stays responsive. A pending single-step (F2) runs exactly
-        // one CPU instruction and then re-pauses. When not paused, we run
-        // a full frame via `step_frame_debug`, which stops early if a
-        // breakpoint matches (run-to-breakpoint mode, F3).
-        //
-        // M29 fast-forward (Tab): when active, run `FAST_FORWARD_FRAMES`
-        // frames per vsync tick instead of one. Audio samples are still
-        // drained once per tick (we drop the intermediate frames' samples
-        // to avoid flooding the audio queue and drifting the sound).
+        // Step the emulator. When paused, re-present the current
+        // framebuffer; a pending single-step (F2) runs one instruction.
+        // When not paused, run a full frame via `step_frame_debug`,
+        // which stops early if a breakpoint matches (F3). M29
+        // fast-forward (Tab): run `FAST_FORWARD_FRAMES` frames per
+        // vsync tick; intermediate frames' audio is drained to avoid
+        // flooding the queue (last frame's samples are kept).
         if debugger.is_paused() {
             if debugger.consume_step_request() {
                 emulator.step_instruction();
@@ -325,18 +329,13 @@ fn run() -> Result<(), String> {
             };
             for i in 0..frames_this_tick {
                 if debug_hotkeys.trace_enabled() {
-                    // M28: when trace logging is on, run the frame through
-                    // `step_frame_traced` so every executed instruction is
-                    // written to the trace file.
+                    // M28: trace logging — run via `step_frame_traced`.
                     emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
                 } else {
                     emulator.step_frame_debug(&mut debugger);
                 }
-                // During fast-forward, drain *intermediate* frames' audio
-                // to keep the queue bounded. The final iteration's
-                // samples are left in the buffer for the post-loop
-                // `take_audio_samples` → `push_samples` call so
-                // fast-forward is not silent.
+                // Fast-forward: drain intermediate frames' audio; keep
+                // the last frame's samples for the post-loop push.
                 if ui_hotkeys.fast_forward() && i + 1 < frames_this_tick {
                     let _ = emulator.take_audio_samples();
                 }
