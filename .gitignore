@@ -8,3 +8,10 @@ secrets.local.example
 .agent/pause
 .agent/daemon.pid
 .agent/journal.md
+
+# Rust build artifacts
+/target/
+
+# Emulator runtime artifacts
+*.nessav
+*.nessram
