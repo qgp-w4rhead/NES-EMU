@@ -405,6 +405,7 @@ fn config_with_empty_keys_yields_all_unbound() {
         keys: KeyBindings::default(),
         gamepad: GamepadBindings::default(),
         audio_channels: ChannelVolumes::default(),
+        region: "auto".to_string(),
     };
     for b in 0..8u8 {
         assert_eq!(c.keycode_for(0, b), None);

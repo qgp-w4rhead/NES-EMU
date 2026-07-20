@@ -185,18 +185,121 @@ pub const NES_PALETTE: [[u8; 3]; 64] = [
     [0x00, 0x00, 0x00],
 ];
 
+/// NES 2C07 (PAL) reference palette — 64 entries × RGB.
+///
+/// The PAL NES uses a different PPU (2C07) whose colour generator
+/// produces a slightly different gamut from the NTSC 2C02. This table
+/// is a widely-used approximation (see the "2C07" palette on the nesdev
+/// wiki). The most visible differences from NTSC are: colour `$0D` is
+/// not pure black (it is a very dark blue on PAL), and several hues
+/// shift slightly. Dendy uses the NTSC 2C02 palette despite PAL timing,
+/// so this table is only selected for [`Region::Pal`].
+///
+/// See: https://www.nesdev.org/wiki/PPU_palettes#Palettes
+pub const PAL_PALETTE: [[u8; 3]; 64] = [
+    // 0x00-0x0F
+    [0x84, 0x84, 0x84],
+    [0x00, 0x1D, 0x2C],
+    [0x0C, 0x0C, 0x44],
+    [0x24, 0x04, 0x54],
+    [0x3C, 0x00, 0x4C],
+    [0x4C, 0x00, 0x34],
+    [0x4C, 0x00, 0x18],
+    [0x40, 0x0C, 0x00],
+    [0x2C, 0x18, 0x00],
+    [0x18, 0x28, 0x00],
+    [0x08, 0x3C, 0x00],
+    [0x00, 0x40, 0x00],
+    [0x00, 0x3C, 0x1C],
+    [0x00, 0x38, 0x3C],
+    [0x04, 0x04, 0x04],
+    [0x00, 0x00, 0x00],
+    // 0x10-0x1F
+    [0xB4, 0xB4, 0xB4],
+    [0x30, 0x60, 0xA4],
+    [0x48, 0x48, 0xC8],
+    [0x60, 0x38, 0xD8],
+    [0x80, 0x30, 0xC8],
+    [0x98, 0x2C, 0xAC],
+    [0xA8, 0x2C, 0x70],
+    [0xB0, 0x2C, 0x38],
+    [0xB4, 0x38, 0x10],
+    [0xB8, 0x48, 0x00],
+    [0x98, 0x58, 0x00],
+    [0x78, 0x68, 0x00],
+    [0x5C, 0x78, 0x00],
+    [0x38, 0x80, 0x00],
+    [0x00, 0x8C, 0x00],
+    [0x04, 0x04, 0x04],
+    // 0x20-0x2F
+    [0xFF, 0xFF, 0xFF],
+    [0x8C, 0xCC, 0xFF],
+    [0xA8, 0xA8, 0xFF],
+    [0xC0, 0xA8, 0xFF],
+    [0xE8, 0xA4, 0xF0],
+    [0xE8, 0xA0, 0xD8],
+    [0xE8, 0x9C, 0xB8],
+    [0xE8, 0x98, 0x88],
+    [0xE0, 0x8C, 0x54],
+    [0xD8, 0x98, 0x38],
+    [0xC0, 0xA0, 0x24],
+    [0xA0, 0xA8, 0x18],
+    [0x84, 0xB0, 0x18],
+    [0x60, 0xB8, 0x18],
+    [0x44, 0xC0, 0x2C],
+    [0x04, 0x04, 0x04],
+    // 0x30-0x3F — mirrors of 0x20-0x2F (PAL 2C07 also produces 56 unique
+    // colours; the $3x row is a bright variant of $2x).
+    [0xFF, 0xFF, 0xFF],
+    [0x8C, 0xCC, 0xFF],
+    [0xA8, 0xA8, 0xFF],
+    [0xC0, 0xA8, 0xFF],
+    [0xE8, 0xA4, 0xF0],
+    [0xE8, 0xA0, 0xD8],
+    [0xE8, 0x9C, 0xB8],
+    [0xE8, 0x98, 0x88],
+    [0xE0, 0x8C, 0x54],
+    [0xD8, 0x98, 0x38],
+    [0xC0, 0xA0, 0x24],
+    [0xA0, 0xA8, 0x18],
+    [0x84, 0xB0, 0x18],
+    [0x60, 0xB8, 0x18],
+    [0x44, 0xC0, 0x2C],
+    [0x04, 0x04, 0x04],
+];
+
 /// Alpha value for all framebuffer pixels (fully opaque).
 const ALPHA: u32 = 0xFF;
 
-/// Convert a 6-bit NES color index to an ARGB (`0xAARRGGBB`) pixel.
+/// Convert a 6-bit NES color index to an ARGB (`0xAARRGGBB`) pixel
+/// using the region-appropriate palette (M32).
+///
+/// `Region::Pal` uses [`PAL_PALETTE`] (2C07); `Ntsc` and `Dendy` use
+/// [`NES_PALETTE`] (2C02 — Dendy keeps the NTSC palette despite PAL
+/// timing).
 ///
 /// The index is masked to 6 bits (`& 0x3F`) — the upper two bits of
 /// palette RAM reads are open-bus garbage on real hardware and are
 /// discarded here.
-pub fn nes_color_to_argb(index: u8) -> u32 {
+pub fn nes_color_to_argb_for(index: u8, region: crate::region::Region) -> u32 {
     let idx = (index & 0x3F) as usize;
-    let [r, g, b] = NES_PALETTE[idx];
+    let [r, g, b] = if region.is_pal_palette() {
+        PAL_PALETTE[idx]
+    } else {
+        NES_PALETTE[idx]
+    };
     (ALPHA << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Convert a 6-bit NES color index to an ARGB (`0xAARRGGBB`) pixel
+/// using the NTSC palette. Equivalent to
+/// [`nes_color_to_argb_for`]`(index, `[`Region::Ntsc`]`)`.
+///
+/// Kept for backward compatibility with code that does not track the
+/// current region (e.g. the debug PPU viewer, which always renders with
+/// the NTSC palette for consistency).
+pub fn nes_color_to_argb(index: u8) -> u32 {
+    nes_color_to_argb_for(index, crate::region::Region::Ntsc)
 }
 
 impl Ppu {
@@ -322,7 +425,7 @@ impl Ppu {
                 let nes_index = self.read_palette(color_addr);
 
                 // 5) Convert to ARGB and write.
-                self.framebuffer[col] = nes_color_to_argb(nes_index);
+                self.framebuffer[col] = self.color_to_argb(nes_index);
             }
         }
     }
@@ -331,7 +434,14 @@ impl Ppu {
     /// Used to fill the framebuffer when background rendering is disabled
     /// or when the left 8 pixels are masked.
     pub fn universal_bg_argb(&self) -> u32 {
-        nes_color_to_argb(self.read_palette(PAL_BASE))
+        self.color_to_argb(self.read_palette(PAL_BASE))
+    }
+
+    /// Convert a 6-bit NES color index to an ARGB pixel using the PPU's
+    /// current region (M32). NTSC/Dendy use [`NES_PALETTE`]; PAL uses
+    /// [`PAL_PALETTE`].
+    fn color_to_argb(&self, index: u8) -> u32 {
+        nes_color_to_argb_for(index, self.region)
     }
 
     /// Render all sprites from OAM in 8×8 mode, compositing on top of the
@@ -577,7 +687,7 @@ impl Ppu {
                     let pal = (attr & ATTR_PALETTE_MASK) as u16;
                     let color_addr = SPRITE_PAL_BASE | (pal << 2) | (pattern as u16);
                     let nes_index = self.read_palette(color_addr);
-                    self.framebuffer[col_idx] = nes_color_to_argb(nes_index);
+                    self.framebuffer[col_idx] = self.color_to_argb(nes_index);
                     break;
                 }
             }
@@ -665,7 +775,7 @@ impl Ppu {
                 PAL_BASE | ((pal_select as u16) << 2) | (pattern as u16)
             };
             let nes_index = self.read_palette(color_addr);
-            pixel_argb = nes_color_to_argb(nes_index);
+            pixel_argb = self.color_to_argb(nes_index);
         }
 
         // ---- Composite sprite pixel on top ----
@@ -677,7 +787,7 @@ impl Ppu {
                 let color_addr =
                     SPRITE_PAL_BASE | ((sprite_pal as u16) << 2) | (sprite_pattern as u16);
                 let nes_index = self.read_palette(color_addr);
-                pixel_argb = nes_color_to_argb(nes_index);
+                pixel_argb = self.color_to_argb(nes_index);
             }
         }
 

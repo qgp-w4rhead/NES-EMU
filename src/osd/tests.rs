@@ -144,9 +144,17 @@ fn render_no_op_on_size_mismatch() {
 
 #[test]
 fn build_lines_format() {
-    let lines = build_lines(60.1, 4, "Megaman2", 2, true, 42);
+    let lines = build_lines(
+        60.1,
+        4,
+        "Megaman2",
+        2,
+        true,
+        42,
+        crate::region::Region::Ntsc,
+    );
     assert_eq!(lines.len(), 4);
-    assert_eq!(lines[0], "FPS:60.1 MAP:4");
+    assert_eq!(lines[0], "FPS:60.1 MAP:4 NTSC");
     assert_eq!(lines[1], "GAME:Megaman2");
     assert_eq!(lines[2], "SLOT:3/10 OCCUPIED");
     assert_eq!(lines[3], "REWIND:42");
@@ -154,7 +162,7 @@ fn build_lines_format() {
 
 #[test]
 fn build_lines_empty_slot() {
-    let lines = build_lines(0.0, 0, "?", 0, false, 0);
+    let lines = build_lines(0.0, 0, "?", 0, false, 0, crate::region::Region::Ntsc);
     assert_eq!(lines[2], "SLOT:1/10 EMPTY");
 }
 

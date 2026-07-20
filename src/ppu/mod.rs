@@ -38,6 +38,7 @@
 pub mod render;
 
 use crate::mappers::Mirroring;
+use crate::region::Region;
 
 /// Visible screen width in pixels.
 pub const SCREEN_WIDTH: usize = 256;
@@ -241,6 +242,12 @@ pub struct Ppu {
     // ---- configuration ----
     /// Nametable mirroring mode, set from the cartridge by the bus.
     mirroring: Mirroring,
+    /// TV system / region (M32). Controls scanline count, prerender
+    /// scanline, and palette selection (NTSC vs PAL). Defaults to NTSC.
+    /// Set via [`Ppu::set_region`] when the emulator resolves the region
+    /// from the iNES header hint or user config.
+    #[serde(default)]
+    region: Region,
 
     // ---- M25: per-pixel (cycle-accurate) rendering pipeline ----
     //
@@ -363,6 +370,7 @@ impl Ppu {
             cycle: 0,
             nmi_request: false,
             mirroring: Mirroring::Horizontal,
+            region: Region::default(),
             fetch_nt: 0,
             fetch_at: 0,
             fetch_pt0: 0,
@@ -387,6 +395,28 @@ impl Ppu {
     /// Set the nametable mirroring mode (from the cartridge, via the bus).
     pub fn set_mirroring(&mut self, mirroring: Mirroring) {
         self.mirroring = mirroring;
+    }
+
+    /// Current TV system / region (M32). Controls scanline count,
+    /// prerender scanline, and palette selection.
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Set the TV system / region (M32). Updates the scanline count and
+    /// prerender scanline used by [`Ppu::step`]. The palette is selected
+    /// at render time via [`crate::ppu::render::nes_color_to_argb_for`].
+    /// If the new region has fewer scanlines than the current scanline
+    /// position (e.g. switching PAL→NTSC while past scanline 261), the
+    /// scanline is clamped into range to avoid a missed frame-boundary.
+    pub fn set_region(&mut self, region: Region) {
+        self.region = region;
+        // Clamp scanline into the new region's range so the stepper
+        // cannot get stuck past the prerender scanline.
+        let max_sl = region.scanlines_per_frame();
+        if self.scanline >= max_sl {
+            self.scanline = max_sl.saturating_sub(1);
+        }
     }
 
     // =================================================================
@@ -761,6 +791,13 @@ impl Ppu {
     pub fn step(&mut self) -> bool {
         let mut nmi = false;
 
+        // M32: region-aware scanline count + prerender scanline. NTSC
+        // uses 262 scanlines / prerender 261; PAL and Dendy use 312 /
+        // 311. The VBlank start scanline (241) and cycles-per-scanline
+        // (341) are the same across regions.
+        let scanlines_per_frame = self.region.scanlines_per_frame();
+        let prerender = self.region.scanline_prerender();
+
         // ---- Advance the cycle counter first ----
         //
         // Events are described in nesdev terms as happening at "dot N"
@@ -771,7 +808,7 @@ impl Ppu {
         if self.cycle >= CYCLES_PER_SCANLINE {
             self.cycle = 0;
             self.scanline += 1;
-            if self.scanline >= SCANLINES_PER_FRAME {
+            if self.scanline >= scanlines_per_frame {
                 self.scanline = 0;
             }
         }
@@ -785,7 +822,7 @@ impl Ppu {
                     nmi = true;
                 }
             }
-            SCANLINE_PRERENDER if self.cycle == VBLANK_NMI_CYCLE => {
+            s if s == prerender && self.cycle == VBLANK_NMI_CYCLE => {
                 // Prerender: clear VBlank and the per-frame status flags.
                 self.set_vblank(false);
                 self.set_sprite_overflow(false);
@@ -801,7 +838,7 @@ impl Ppu {
         //
         // Per NESdev, the scroll increments and t→v copies fire when
         // rendering is enabled (PPUMASK show-bg or show-sprites). The
-        // prerender scanline (261) performs the same h/v scroll increments
+        // prerender scanline performs the same h/v scroll increments
         // as a visible scanline (no pixels are output, but the scroll
         // state is updated). The horizontal t→v copy at dot 257 fires on
         // every scanline; the vertical t→v copy at dots 280-304 fires only
@@ -810,7 +847,7 @@ impl Ppu {
         let rendering = (self.ppumask & (MASK_SHOW_BG | MASK_SHOW_SPRITES)) != 0;
         if rendering {
             let does_scroll_inc =
-                self.scanline < SCREEN_HEIGHT as u16 || self.scanline == SCANLINE_PRERENDER;
+                self.scanline < SCREEN_HEIGHT as u16 || self.scanline == prerender;
             // Horizontal scroll increment at dots 8,16,...,248.
             if does_scroll_inc
                 && self.cycle >= H_SCROLL_INC_STEP
@@ -828,7 +865,7 @@ impl Ppu {
                 self.copy_h_t_to_v();
             }
             // Vertical t→v copy at prerender dots 280-304.
-            if self.scanline == SCANLINE_PRERENDER
+            if self.scanline == prerender
                 && self.cycle >= V_COPY_CYCLE_START
                 && self.cycle <= V_COPY_CYCLE_END
             {

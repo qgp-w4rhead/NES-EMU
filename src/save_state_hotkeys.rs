@@ -110,7 +110,14 @@ impl SaveStateHotkeys {
     /// `mapper_number` is passed in by the caller (rather than borrowed
     /// from the emulator) so the caller can take the mutable framebuffer
     /// borrow without conflicting with an immutable emulator borrow.
-    pub fn render_osd(&self, mapper_number: u16, fb: &mut [u32], width: u32, height: u32) {
+    pub fn render_osd(
+        &self,
+        mapper_number: u16,
+        region: crate::region::Region,
+        fb: &mut [u32],
+        width: u32,
+        height: u32,
+    ) {
         if !self.osd.enabled() {
             return;
         }
@@ -123,6 +130,7 @@ impl SaveStateHotkeys {
             slot,
             slot_occupied,
             self.rewind.len(),
+            region,
         );
         let lines: Vec<&str> = lines_str.iter().map(|s| s.as_str()).collect();
         self.osd.render(fb, width, height, &lines);
@@ -153,9 +161,11 @@ impl SaveStateHotkeys {
         if self.osd_enabled() {
             self.osd.record_frame(std::time::Instant::now());
             let mapper_number = emulator.mapper_number();
+            let region = emulator.region();
             let fb = emulator.framebuffer_mut();
             self.render_osd(
                 mapper_number,
+                region,
                 fb,
                 crate::video::NES_WIDTH,
                 crate::video::NES_HEIGHT,

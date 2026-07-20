@@ -256,6 +256,17 @@ pub struct Config {
     /// (`1.0`) on all five channels.
     #[serde(default)]
     pub audio_channels: ChannelVolumes,
+
+    /// TV system / region override (M32). Accepts `"auto"`, `"ntsc"`,
+    /// `"pal"`, or `"dendy"` (case-insensitive). `"auto"` (the default)
+    /// auto-detects from the iNES header's TV-system hint (byte 9),
+    /// falling back to NTSC when no hint is present.
+    #[serde(default = "default_region")]
+    pub region: String,
+}
+
+fn default_region() -> String {
+    "auto".to_string()
 }
 
 fn default_audio_volume() -> f32 {
@@ -285,6 +296,7 @@ impl Default for Config {
             keys,
             gamepad,
             audio_channels: ChannelVolumes::default(),
+            region: default_region(),
         }
     }
 }
@@ -389,6 +401,27 @@ impl Config {
             return None;
         }
         Button::from_string(btn_name)
+    }
+
+    /// Resolve the configured region (M32). If `config.region` is
+    /// `"auto"` (the default), the `hint` (typically the cartridge's
+    /// [`crate::cartridge::InesHeader::region_hint`]) is used; if the
+    /// hint is `None`, NTSC is the fallback. If `config.region` is a
+    /// concrete region name (`"ntsc"` / `"pal"` / `"dendy"`), that
+    /// region is used and the hint is ignored. An invalid region string
+    /// falls back to NTSC (with the hint still honoured as a secondary
+    /// fallback).
+    pub fn resolve_region(&self, hint: Option<crate::region::Region>) -> crate::region::Region {
+        match crate::region::Region::from_config_str(&self.region) {
+            Ok(Some(r)) => r,
+            Ok(None) => hint.unwrap_or(crate::region::Region::Ntsc),
+            Err(_) => {
+                // Invalid config string — fall back to hint, then NTSC.
+                // The caller should have warned about the invalid string
+                // at load time; here we just pick a sane default.
+                hint.unwrap_or(crate::region::Region::Ntsc)
+            }
+        }
     }
 }
 

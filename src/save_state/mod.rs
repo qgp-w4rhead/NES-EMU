@@ -92,7 +92,17 @@ use crate::ppu::Ppu;
 /// layout changes in a backward-incompatible way. On load, a version
 /// mismatch returns [`SaveStateError::VersionMismatch`] rather than
 /// attempting to deserialise into a potentially incompatible layout.
-pub const SAVE_STATE_VERSION: u32 = 2;
+///
+/// History:
+/// - `1` — initial (M20).
+/// - `2` — M31: APU gained per-channel volume/mute/selected/lpf_prev.
+/// - `3` — M32: PPU and APU gained a `region` field; EmulatorState
+///   gained a `region` field. The region is `#[serde(default)]` on the
+///   PPU/APU so a v2 save state with NTSC defaults would still
+///   deserialise, but the EmulatorState's region is not part of the
+///   serialised `SaveState` (it is derived from the cartridge hint /
+///   config at load time), so the version bump is conservative.
+pub const SAVE_STATE_VERSION: u32 = 3;
 
 /// Errors that can occur during save state serialisation or deserialisation.
 #[derive(Debug)]
@@ -270,6 +280,15 @@ impl EmulatorState {
         // ---- Emulator-level state ----
         self.set_sample_accumulator(state.sample_accumulator);
         self.set_audio_buffer(state.audio_buffer);
+
+        // M32: sync the EmulatorState's region from the restored PPU
+        // region (the PPU's `region` field is serialised with
+        // `#[serde(default)]`, so a v3 save state carries the region
+        // forward). This keeps the emulator's region-aware timing
+        // (cpu_cycles_per_sample, prerender scanline) consistent with
+        // the restored PPU/APU state.
+        let restored_region = self.bus().ppu().region();
+        self.set_region(restored_region);
 
         Ok(())
     }

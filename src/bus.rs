@@ -29,7 +29,7 @@
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
-use crate::ppu::{Ppu, SCANLINE_PRERENDER, SCREEN_HEIGHT};
+use crate::ppu::{Ppu, SCREEN_HEIGHT};
 
 /// Size of the CPU internal RAM in bytes (2 KB).
 pub const RAM_SIZE: usize = 0x0800;
@@ -309,13 +309,15 @@ impl Bus {
             // Clock mapper IRQ counter (MMC3 and similar) on the
             // approximate PPU A12 rising edge. A12 only rises during
             // active rendering (background or sprites enabled) on visible
-            // scanlines (0-239) and the prerender scanline (261).
+            // scanlines (0-239) and the prerender scanline (261 NTSC /
+            // 311 PAL/Dendy — M32 region-aware).
             let ppu_cycle = self.ppu.cycle();
             let scanline = self.ppu.scanline();
             let rendering = self.ppu.is_rendering();
+            let prerender = self.ppu.region().scanline_prerender();
             if rendering
                 && ppu_cycle == MMC3_IRQ_CLOCK_CYCLE
-                && (scanline < SCREEN_HEIGHT as u16 || scanline == SCANLINE_PRERENDER)
+                && (scanline < SCREEN_HEIGHT as u16 || scanline == prerender)
             {
                 if let Some(cart) = self.cartridge.as_mut() {
                     cart.clock_irq();
@@ -325,7 +327,7 @@ impl Bus {
             // Reset the mapper's per-frame scanline counter at the start
             // of the prerender scanline (beginning of a new frame). Used
             // by MMC5 to keep its scanline IRQ comparison correct.
-            if scanline == SCANLINE_PRERENDER && ppu_cycle == 1 {
+            if scanline == prerender && ppu_cycle == 1 {
                 if let Some(cart) = self.cartridge.as_mut() {
                     cart.reset_scanline_counter();
                 }

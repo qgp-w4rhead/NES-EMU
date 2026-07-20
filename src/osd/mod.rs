@@ -211,10 +211,16 @@ pub fn build_lines(
     slot: usize,
     slot_occupied: bool,
     rewind_len: usize,
+    region: crate::region::Region,
 ) -> Vec<String> {
     let slot_state = if slot_occupied { "OCCUPIED" } else { "EMPTY" };
     vec![
-        format!("FPS:{:.1} MAP:{}", fps, mapper_number),
+        format!(
+            "FPS:{:.1} MAP:{} {}",
+            fps,
+            mapper_number,
+            region.short_name()
+        ),
         format!("GAME:{}", game_name),
         format!(
             "SLOT:{}/{} {}",

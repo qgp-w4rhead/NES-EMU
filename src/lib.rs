@@ -20,6 +20,8 @@ pub mod joypad;
 pub mod mappers;
 pub mod osd;
 pub mod ppu;
+pub mod region;
+pub mod region_hotkeys;
 pub mod save_state;
 pub mod save_state_hotkeys;
 pub mod screenshot;

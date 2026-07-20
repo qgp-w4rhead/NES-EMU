@@ -1,15 +1,14 @@
 //! NES emulator entry point.
 //!
 //! Loads an iNES ROM from `--rom <path>`, builds the `EmulatorState`, and
-//! runs a frame-locked main loop that steps the emulator one NTSC frame
-//! per vsync and presents the PPU framebuffer via SDL2. Key bindings and
-//! gamepad mappings come from `config.toml` (M22). Debug hotkeys (M27/M28),
-//! UI controls (M29), save-state/OSD (M30), and per-channel audio
-//! volume/mute (M31) are dispatched before joypad routing.
+//! runs a frame-locked main loop that steps the emulator one frame per
+//! vsync and presents the PPU framebuffer via SDL2. Key bindings and gamepad
+//! mappings come from `config.toml` (M22). Debug hotkeys (M27/M28), UI
+//! controls (M29), save-state/OSD (M30), audio volume/mute (M31), and region
+//! switching (M32) are dispatched before joypad routing.
 //!
-//! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
-//! See: https://www.nesdev.org/wiki/Cycle_reference — ~29,830 CPU cycles
-//! per NTSC frame at 60.0988 Hz.
+//! See: https://www.nesdev.org/wiki/PPU (256x240) and
+//! https://www.nesdev.org/wiki/Cycle_reference (~29,830 CPU cycles/NTSC frame).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +27,7 @@ use nes_emu::debug::{handle_debugger_key, print_debug_overlay, CpuDebugger, Debu
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::InputMapper;
 use nes_emu::osd::game_name_from_path;
+use nes_emu::region_hotkeys::RegionHotkeys;
 use nes_emu::save_state_hotkeys::SaveStateHotkeys;
 use nes_emu::ui_hotkeys::UiHotkeys;
 use nes_emu::video::Video;
@@ -175,7 +175,10 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let mut emulator = EmulatorState::new(cartridge);
+    // M32: resolve region — config override wins, else iNES header hint, else NTSC.
+    let region = config.resolve_region(cartridge.header.region_hint());
+    eprintln!("nes-emu: region = {}", region.short_name());
+    let mut emulator = EmulatorState::new_with_region(cartridge, region);
     emulator.reset();
     // M31: apply per-channel APU volumes from config.
     emulator
@@ -217,8 +220,9 @@ fn run() -> Result<(), String> {
     // M30 save-state slots (F5/F7 + 1..=9,0), rewind (Backspace), OSD (F10).
     let game_name = game_name_from_path(rom_path_ref);
     let mut save_state_hotkeys = SaveStateHotkeys::new(game_name);
-    // M31 per-channel APU volume/mute hotkeys (Alt+1..5, M, Up/Down, 0).
+    // M31 audio hotkeys (Alt+1..5, M, Up/Down, 0) + M32 region (F11).
     let mut audio_hotkeys = AudioHotkeys::new();
+    let mut region_hotkeys = RegionHotkeys::new();
 
     'running: loop {
         // Drain all pending events each frame; ESC / Q / window-close
@@ -239,14 +243,14 @@ fn run() -> Result<(), String> {
                     keymod,
                     ..
                 } => {
-                    // Intercept UI + debugger + viewer + save-state +
-                    // audio hotkeys (M27-M31) before joypad routing.
-                    // First dispatcher to consume wins; rest skipped.
+                    // Intercept UI + debugger + save-state + audio +
+                    // region hotkeys (M27-M32) before joypad routing.
                     let consumed = ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
                         || handle_debugger_key(&mut debugger, k)
                         || debug_hotkeys.handle_key(emulator.bus(), k)
                         || save_state_hotkeys.handle_key(&mut emulator, k, keymod)
-                        || audio_hotkeys.handle_key(emulator.bus_mut().apu_mut(), k, keymod);
+                        || audio_hotkeys.handle_key(emulator.bus_mut().apu_mut(), k, keymod)
+                        || region_hotkeys.handle_key(&mut emulator, k, keymod);
                     if !consumed {
                         mapper.handle_key(emulator.bus_mut().joypad_mut(), k, true);
                     }
@@ -372,17 +376,15 @@ fn run() -> Result<(), String> {
         save_state_hotkeys.post_frame(&mut emulator, |fb| video.present(fb))?;
 
         // While paused, render a console "overlay" — register snapshot +
-        // disassembly window — to stderr each frame. This is the M27
-        // debug overlay (a graphical egui overlay lands in M28).
+        // disassembly window — to stderr each frame (M27 debug overlay).
         if debugger.is_paused() {
             print_debug_overlay(&emulator, &debugger);
         }
     }
 
     // Battery-backed PRG-RAM persistence (M21): on exit, dump the
-    // cartridge's PRG-RAM to the `.nessram` sidecar file next to the ROM so
-    // the game's save data survives. Save errors are reported but non-fatal
-    // — the emulator is already shutting down.
+    // cartridge's PRG-RAM to the `.nessram` sidecar file next to the ROM.
+    // Save errors are non-fatal — the emulator is already shutting down.
     if emulator.has_battery() {
         if let Some(sram) = emulator.battery_sram() {
             if let Err(e) = battery::save_for_rom(rom_path_ref, &sram) {

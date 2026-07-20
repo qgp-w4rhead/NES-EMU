@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::mappers::{from_ines, Mapper, Mirroring};
+use crate::region::Region;
 
 /// iNES file magic: bytes 0..=3 are `"NES\x1A"`.
 const INES_MAGIC: [u8; 4] = [b'N', b'E', b'S', 0x1A];
@@ -80,6 +81,11 @@ pub struct InesHeader {
     pub has_trainer: bool,
     /// True if the cartridge has battery-backed PRG-RAM.
     pub has_battery: bool,
+    /// TV system / region hint from header byte 9 (iNES 1.0 reserved /
+    /// NES 2.0 TV system bits). `0` = NTSC, `1` = PAL, `2` = Dendy
+    /// (NES 2.0 "PAL + dual-region"), `3` = dual-region. Used by
+    /// [`InesHeader::region_hint`] to auto-detect the region.
+    pub tv_system: u8,
 }
 
 impl InesHeader {
@@ -117,6 +123,14 @@ impl InesHeader {
         // flags 7 high nibble. (iNES 1.0 form.)
         let mapper_number = ((flags6 >> 4) as u16) | (((flags7 >> 4) as u16) << 4);
 
+        // TV system hint from header byte 9. In iNES 1.0 this byte is
+        // officially reserved (should be 0), but many PAL ROMs in the
+        // wild set bit 0 to indicate PAL. In NES 2.0 (header byte 7
+        // bits 0-1 == 2), byte 9 bits 0-1 are the official TV system
+        // field: 0=NTSC, 1=PAL, 2=Dendy/SECAM, 3=dual-region.
+        // See: https://www.nesdev.org/wiki/INES#TV_System
+        let tv_system = bytes[9] & 0x03;
+
         Ok(Self {
             prg_rom_banks,
             chr_rom_banks,
@@ -124,7 +138,29 @@ impl InesHeader {
             mirroring,
             has_trainer,
             has_battery,
+            tv_system,
         })
+    }
+
+    /// Auto-detect the region from the iNES header's TV-system hint
+    /// (byte 9). Returns `None` when no hint is present (byte 9 == 0,
+    /// the iNES 1.0 default), in which case the caller should fall back
+    /// to NTSC or a user-configured override.
+    ///
+    /// Mapping (NES 2.0 byte 9 bits 0-1):
+    /// - `0` → `None` (NTSC / unspecified)
+    /// - `1` → `Some(Region::Pal)`
+    /// - `2` → `Some(Region::Dendy)` (NES 2.0 "PAL + dual-region"; we
+    ///   treat it as Dendy since that is the practical hybrid mode)
+    /// - `3` → `None` (dual-region — fall back to NTSC default)
+    ///
+    /// See: https://www.nesdev.org/wiki/INES#TV_System
+    pub fn region_hint(&self) -> Option<Region> {
+        match self.tv_system {
+            1 => Some(Region::Pal),
+            2 => Some(Region::Dendy),
+            _ => None,
+        }
     }
 }
 

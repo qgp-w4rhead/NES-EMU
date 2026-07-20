@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use nes_emu::osd::{
     build_lines, game_name_from_path, Osd, FPS_WINDOW, GLYPH_H, GLYPH_W, OSD_BG_ARGB, OSD_FG_ARGB,
 };
+use nes_emu::region::Region;
 
 #[test]
 fn osd_default_disabled() {
@@ -323,65 +324,76 @@ fn osd_render_does_not_overwrite_pixels_outside_cells() {
 
 #[test]
 fn build_lines_returns_four_lines() {
-    let lines = build_lines(60.0, 4, "Megaman2", 2, true, 42);
+    let lines = build_lines(60.0, 4, "Megaman2", 2, true, 42, Region::Ntsc);
     assert_eq!(lines.len(), 4);
 }
 
 #[test]
 fn build_lines_fps_line_format() {
-    let lines = build_lines(59.94, 0, "Test", 0, false, 0);
-    assert_eq!(lines[0], "FPS:59.9 MAP:0");
+    let lines = build_lines(59.94, 0, "Test", 0, false, 0, Region::Ntsc);
+    assert_eq!(lines[0], "FPS:59.9 MAP:0 NTSC");
 }
 
 #[test]
 fn build_lines_fps_one_decimal_place() {
-    let lines = build_lines(60.123, 0, "X", 0, false, 0);
-    assert_eq!(lines[0], "FPS:60.1 MAP:0");
+    let lines = build_lines(60.123, 0, "X", 0, false, 0, Region::Ntsc);
+    assert_eq!(lines[0], "FPS:60.1 MAP:0 NTSC");
 }
 
 #[test]
 fn build_lines_game_line() {
-    let lines = build_lines(60.0, 0, "Super Mario Bros", 0, false, 0);
+    let lines = build_lines(60.0, 0, "Super Mario Bros", 0, false, 0, Region::Ntsc);
     assert_eq!(lines[1], "GAME:Super Mario Bros");
 }
 
 #[test]
 fn build_lines_slot_occupied() {
-    let lines = build_lines(60.0, 0, "X", 3, true, 0);
+    let lines = build_lines(60.0, 0, "X", 3, true, 0, Region::Ntsc);
     assert_eq!(lines[2], "SLOT:4/10 OCCUPIED");
 }
 
 #[test]
 fn build_lines_slot_empty() {
-    let lines = build_lines(60.0, 0, "X", 0, false, 0);
+    let lines = build_lines(60.0, 0, "X", 0, false, 0, Region::Ntsc);
     assert_eq!(lines[2], "SLOT:1/10 EMPTY");
 }
 
 #[test]
 fn build_lines_slot_index_is_one_based() {
     // slot 0 → "SLOT:1/10", slot 9 → "SLOT:10/10"
-    let lines = build_lines(60.0, 0, "X", 9, true, 0);
+    let lines = build_lines(60.0, 0, "X", 9, true, 0, Region::Ntsc);
     assert_eq!(lines[2], "SLOT:10/10 OCCUPIED");
 }
 
 #[test]
 fn build_lines_rewind_line() {
-    let lines = build_lines(60.0, 0, "X", 0, false, 60);
+    let lines = build_lines(60.0, 0, "X", 0, false, 60, Region::Ntsc);
     assert_eq!(lines[3], "REWIND:60");
 }
 
 #[test]
 fn build_lines_rewind_zero() {
-    let lines = build_lines(60.0, 0, "X", 0, false, 0);
+    let lines = build_lines(60.0, 0, "X", 0, false, 0, Region::Ntsc);
     assert_eq!(lines[3], "REWIND:0");
 }
 
 #[test]
 fn build_lines_mapper_number_displayed() {
-    let lines = build_lines(60.0, 4, "X", 0, false, 0);
+    let lines = build_lines(60.0, 4, "X", 0, false, 0, Region::Ntsc);
     assert!(lines[0].contains("MAP:4"));
-    let lines2 = build_lines(60.0, 255, "X", 0, false, 0);
+    let lines2 = build_lines(60.0, 255, "X", 0, false, 0, Region::Ntsc);
     assert!(lines2[0].contains("MAP:255"));
+}
+
+#[test]
+fn build_lines_region_displayed() {
+    // M32: the region short name is appended to the FPS/MAP line.
+    let ntsc = build_lines(60.0, 0, "X", 0, false, 0, Region::Ntsc);
+    assert!(ntsc[0].ends_with("NTSC"));
+    let pal = build_lines(50.0, 0, "X", 0, false, 0, Region::Pal);
+    assert!(pal[0].ends_with("PAL"));
+    let dendy = build_lines(50.0, 0, "X", 0, false, 0, Region::Dendy);
+    assert!(dendy[0].ends_with("DENDY"));
 }
 
 // ---------------------------------------------------------------------------

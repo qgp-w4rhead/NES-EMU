@@ -338,10 +338,10 @@ fn load_state_rejects_empty_data() {
 }
 
 #[test]
-fn save_state_version_is_two() {
-    // M31 bumped the version: the Apu struct gained per-channel volume
-    // / mute / LPF fields, which changes the bincode layout.
-    assert_eq!(SAVE_STATE_VERSION, 2);
+fn save_state_version_is_three() {
+    // M32 bumped the version: the Ppu and Apu structs gained a `region`
+    // field, which changes the bincode layout.
+    assert_eq!(SAVE_STATE_VERSION, 3);
 }
 
 // ---- No-cartridge save/restore -----------------------------------------

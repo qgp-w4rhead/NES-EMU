@@ -1237,6 +1237,14 @@ pub struct Apu {
     /// counter resets after ~3-4 CPU cycles; this counts down that delay.
     /// A value of 0 means no pending reset.
     frame_reset_delay: u32,
+
+    // ---- Region / TV system (M32) --------------------------------------
+    /// TV system / region. Controls the APU frame-counter thresholds
+    /// (NTSC/Dendy use 7457/14913/22371/29828; PAL uses
+    /// 8314/16627/24941/33255). Defaults to NTSC. Dendy uses NTSC
+    /// thresholds (its APU is NTSC-style despite the 50 Hz video frame).
+    #[serde(default)]
+    region: crate::region::Region,
 }
 
 impl Apu {
@@ -1261,6 +1269,7 @@ impl Apu {
             frame_cycle: 0,
             frame_irq: false,
             frame_reset_delay: 0,
+            region: crate::region::Region::default(),
         }
     }
 
@@ -1401,6 +1410,19 @@ impl Apu {
         self.frame_irq || self.dmc.irq_flag
     }
 
+    /// Current TV system / region (M32). Controls the APU frame-counter
+    /// thresholds.
+    pub fn region(&self) -> crate::region::Region {
+        self.region
+    }
+
+    /// Set the TV system / region (M32). The frame-counter thresholds
+    /// and reset point are derived from the region on each
+    /// `step_frame_counter` call, so no state rebasing is needed.
+    pub fn set_region(&mut self, region: crate::region::Region) {
+        self.region = region;
+    }
+
     /// Advance the APU by `cpu_cycles` CPU cycles. All channel timers
     /// (including the DMC) tick once per APU cycle (every 2 CPU cycles).
     /// The frame counter advances at the CPU clock rate and triggers
@@ -1467,21 +1489,16 @@ impl Apu {
         // pre/post cycle count so that a large batch (e.g. DMA stall)
         // doesn't skip a threshold.
         let prev = self.frame_cycle.saturating_sub(cpu_cycles);
+        // M32: region-aware thresholds. NTSC/Dendy use 7457/14913/22371/
+        // 29828 (4-step) or 37281 (5-step); PAL uses 8314/16627/24941/
+        // 33255 (4-step) or 41568 (5-step). Dendy uses NTSC thresholds
+        // (its APU is NTSC-style).
         let thresholds: [(u32, bool, bool); 4] = if self.frame_mode_5step {
-            [
-                (7457, true, false),
-                (14913, true, true),
-                (22371, true, false),
-                (37281, true, true),
-            ]
+            self.region.apu_5step_thresholds()
         } else {
-            [
-                (7457, true, false),
-                (14913, true, true),
-                (22371, true, false),
-                (29828, true, true),
-            ]
+            self.region.apu_4step_thresholds()
         };
+        let irq_threshold = self.region.apu_4step_irq_threshold();
 
         for &(threshold, quarter, half) in thresholds.iter() {
             if prev < threshold && self.frame_cycle >= threshold {
@@ -1492,14 +1509,14 @@ impl Apu {
                     self.clock_half_frame();
                 }
                 // IRQ only in 4-step mode, at the 4th step, if not inhibited.
-                if !self.frame_mode_5step && threshold == 29828 && !self.frame_irq_inhibit {
+                if !self.frame_mode_5step && threshold == irq_threshold && !self.frame_irq_inhibit {
                     self.frame_irq = true;
                 }
             }
         }
 
         // Reset the counter at the end of the period.
-        let reset_at: u32 = if self.frame_mode_5step { 37282 } else { 29830 };
+        let reset_at: u32 = self.region.apu_reset_at(self.frame_mode_5step);
         if self.frame_cycle >= reset_at {
             self.frame_cycle -= reset_at;
         }

@@ -22,11 +22,11 @@
 
 #![allow(dead_code)]
 
-use crate::audio::CPU_CYCLES_PER_SAMPLE;
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::cpu::Cpu;
-use crate::ppu::{CYCLES_PER_SCANLINE, SCANLINES_PER_FRAME, SCANLINE_PRERENDER};
+use crate::ppu::{CYCLES_PER_SCANLINE, SCANLINES_PER_FRAME};
+use crate::region::Region;
 
 /// The complete NES emulator state — CPU + bus (which owns the PPU, APU,
 /// and cartridge) + audio sample accumulation.
@@ -44,20 +44,61 @@ pub struct EmulatorState {
     /// Pre-allocated buffer of audio samples produced during the current
     /// frame. Drained by the main loop via [`take_audio_samples`].
     audio_buffer: Vec<f32>,
+    /// TV system / region (M32). Controls PPU scanline count + prerender
+    /// scanline, APU frame-counter thresholds, palette selection, and
+    /// the CPU-cycles-per-audio-sample ratio. Propagated to the PPU and
+    /// APU via [`EmulatorState::set_region`].
+    region: Region,
 }
 
 impl EmulatorState {
     /// Build an emulator with a loaded cartridge. The CPU is left in its
     /// `Cpu::new` power-on state; call [`EmulatorState::reset`] to load
-    /// PC from the cartridge's RESET vector.
+    /// PC from the cartridge's RESET vector. The region defaults to NTSC;
+    /// use [`EmulatorState::new_with_region`] or [`EmulatorState::set_region`]
+    /// to switch to PAL or Dendy.
     pub fn new(cartridge: Cartridge) -> Self {
+        Self::new_with_region(cartridge, Region::default())
+    }
+
+    /// Build an emulator with a loaded cartridge and an explicit region
+    /// (M32). The PPU and APU are configured for the given region's
+    /// timing and palette. The CPU is left in its `Cpu::new` power-on
+    /// state; call [`EmulatorState::reset`] to load PC from the
+    /// cartridge's RESET vector.
+    pub fn new_with_region(cartridge: Cartridge, region: Region) -> Self {
+        let mut bus = Bus::with_cartridge(cartridge);
+        bus.ppu_mut().set_region(region);
+        bus.apu_mut().set_region(region);
+        // PAL produces ~882 samples/frame (44100/50) vs NTSC's ~735;
+        // reserve headroom for either.
+        let audio_capacity = if region.scanlines_per_frame() > 262 {
+            950
+        } else {
+            800
+        };
         Self {
             cpu: Cpu::new(),
-            bus: Bus::with_cartridge(cartridge),
+            bus,
             sample_accumulator: 0.0,
-            // Pre-allocate for ~735 samples/frame (44100/60) + headroom.
-            audio_buffer: Vec::with_capacity(800),
+            audio_buffer: Vec::with_capacity(audio_capacity),
+            region,
         }
+    }
+
+    /// Current TV system / region (M32).
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Set the TV system / region (M32). Propagates to the PPU (scanline
+    /// count + prerender scanline + palette) and APU (frame-counter
+    /// thresholds). The audio sample accumulator ratio is derived from
+    /// the region on each `step_one_cpu_tick` call.
+    pub fn set_region(&mut self, region: Region) {
+        self.region = region;
+        self.bus.ppu_mut().set_region(region);
+        self.bus.apu_mut().set_region(region);
     }
 
     /// Perform the 6502 RESET sequence: load PC from `$FFFC/$FFFD`, set
@@ -302,18 +343,24 @@ impl EmulatorState {
         }
 
         // Generate audio samples at 44.1 kHz from the APU output.
-        // One sample every ~40.585 CPU cycles.
+        // M32: the CPU-cycles-per-sample ratio is region-dependent
+        // (NTSC/Dendy ≈ 40.585, PAL ≈ 37.7) because the PAL CPU clock
+        // is slower.
+        let cycles_per_sample = self.region.cpu_cycles_per_sample();
         self.sample_accumulator += apu_cycles as f32;
-        while self.sample_accumulator >= CPU_CYCLES_PER_SAMPLE {
-            self.sample_accumulator -= CPU_CYCLES_PER_SAMPLE;
+        while self.sample_accumulator >= cycles_per_sample {
+            self.sample_accumulator -= cycles_per_sample;
             self.audio_buffer.push(self.bus.apu_mut().output());
         }
 
         // Advance the PPU by 3× the total CPU cycles this iteration
         // (instruction + DMA stall), maintaining the 1:3 CPU:PPU clock
         // ratio. Step in chunks of at most one scanline (341 cycles)
-        // so the 261→0 wrap can be detected even when a DMA stall
+        // so the prerender→0 wrap can be detected even when a DMA stall
         // pushes the batch past multiple scanlines.
+        // M32: the prerender scanline is region-dependent (261 NTSC /
+        // 311 PAL/Dendy).
+        let prerender = self.region.scanline_prerender();
         let ppu_cycles = 3 * apu_cycles;
         let mut remaining = ppu_cycles;
         let mut frame_done = false;
@@ -328,12 +375,12 @@ impl EmulatorState {
             }
 
             // Detect frame completion: the PPU scanline wrapped from
-            // the prerender scanline (261) to scanline 0 (start of a
-            // new frame). `prev_scanline == SCANLINE_PRERENDER`
-            // guards against breaking on the very first iteration
-            // when the PPU starts at scanline 0.
+            // the prerender scanline (261 NTSC / 311 PAL/Dendy) to
+            // scanline 0 (start of a new frame).
+            // `prev_scanline == prerender` guards against breaking on
+            // the very first iteration when the PPU starts at scanline 0.
             let curr_scanline = self.bus.ppu().scanline();
-            if curr_scanline == 0 && prev_scanline == SCANLINE_PRERENDER {
+            if curr_scanline == 0 && prev_scanline == prerender {
                 // Any remaining PPU cycles belong to the next frame;
                 // they are discarded here and the PPU resumes a few
                 // cycles into scanline 0 on the next `step_frame`.
@@ -482,6 +529,9 @@ impl EmulatorState {
 
 impl EmulatorState {
     /// Total scanlines per NTSC frame (262). Exposed for tests.
+    ///
+    /// For the actual frame length of the current region, use
+    /// [`EmulatorState::region`]`().scanlines_per_frame()`.
     pub fn scanlines_per_frame() -> u16 {
         SCANLINES_PER_FRAME
     }
