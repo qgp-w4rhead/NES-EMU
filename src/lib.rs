@@ -10,6 +10,7 @@ pub mod audio;
 pub mod battery;
 pub mod bus;
 pub mod cartridge;
+pub mod config;
 pub mod cpu;
 pub mod emulator;
 pub mod input;
