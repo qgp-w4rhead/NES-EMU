@@ -896,17 +896,318 @@ impl NoiseChannel {
     }
 }
 
-/// The APU — owns the two pulse channels, the triangle channel, and the
-/// noise channel. The DMC channel and frame counter are added in M16.
+/// DMC rate table (NTSC) — timer period in APU cycles (CPU clock / 2).
+/// The NESdev wiki lists these in CPU cycles: [428, 380, 340, 320, 298,
+/// 276, 254, 226, 214, 190, 170, 160, 142, 126, 108, 84]. Dividing by 2
+/// gives the APU-cycle period since the DMC timer is clocked at the APU
+/// rate alongside the other channel timers.
+///
+/// See: https://www.nesdev.org/wiki/APU_DMC#Rate_table
+const DMC_RATE_TABLE: [u16; 16] = [
+    214, 190, 170, 160, 149, 138, 127, 113, 107, 95, 85, 80, 71, 63, 54, 42,
+];
+
+/// The NES DMC (Delta Modulation Channel) — plays DMA-fetched 1-bit delta
+/// samples from CPU memory at a configurable rate. The output is a 7-bit
+/// DAC counter (0..=127) that increments by 2 on a `1` bit and decrements
+/// by 2 on a `0` bit (saturating at both ends).
+///
+/// The channel has no length counter; instead it plays a fixed-length
+/// sample (1..=4081 bytes) starting at a configurable address
+/// (`$C000 + ($4012 << 6)`). When the sample completes, the channel
+/// optionally raises an IRQ (if `$4010` bit 7 is set) or loops.
+///
+/// Register map (see <https://www.nesdev.org/wiki/APU_DMC>):
+///
+/// | Register  | Bits          | Function                                     |
+/// |-----------|---------------|----------------------------------------------|
+/// | `$4010`   | `IL-- RRRR`   | IRQ enable, loop, rate index                 |
+/// | `$4011`   | `-DDD DDDD`   | Direct DAC load (bits 0-6; bit 7 ignored)    |
+/// | `$4012`   | `AAAA AAAA`   | Sample address (base = value << 6 + $C000)   |
+/// | `$4013`   | `LLLL LLLL`   | Sample length (value << 4 + 1 bytes)         |
+///
+/// See: https://www.nesdev.org/wiki/APU_DMC
+pub struct DmcChannel {
+    // ---- $4010: rate + control ------------------------------------------
+    /// IRQ enable (bit 7 of `$4010`). When set, the DMC raises an IRQ when
+    /// a sample completes without the loop flag set.
+    irq_enable: bool,
+    /// Loop flag (bit 6 of `$4010`). When set, the sample restarts from
+    /// the beginning when it completes.
+    loop_flag: bool,
+    /// Rate index (bits 0-3 of `$4010`) into `DMC_RATE_TABLE`.
+    rate_index: u8,
+
+    // ---- Timer ----------------------------------------------------------
+    /// Timer reload value (from `DMC_RATE_TABLE[rate_index]`, in APU cycles).
+    timer_period: u16,
+    /// Running timer counter.
+    timer: u16,
+
+    // ---- Output unit ----------------------------------------------------
+    /// 7-bit output counter (0..=127). This is the DAC value directly.
+    output_counter: u8,
+    /// Current byte being shifted out (filled from memory).
+    sample_buffer: u8,
+    /// Number of bits remaining in `sample_buffer` (0 = buffer empty).
+    buffer_bits: u8,
+
+    // ---- Sample pointer -------------------------------------------------
+    /// Sample address base (reloaded on restart/loop). Set by `$4012`:
+    /// `base = (value << 6) + $C000`.
+    sample_addr_base: u16,
+    /// Current fetch address (increments per byte, wraps `$FFFF` → `$8000`).
+    sample_address: u16,
+    /// Total sample length in bytes (reloaded on restart/loop). Set by
+    /// `$4013`: `length = (value << 4) + 1`.
+    sample_length: u16,
+    /// Bytes remaining to fetch in the current sample.
+    bytes_remaining: u16,
+
+    // ---- Channel enable + IRQ -------------------------------------------
+    /// Channel enable from `$4015` bit 4.
+    enabled: bool,
+    /// DMC IRQ flag (read at `$4015` bit 7, cleared by reading `$4015`).
+    irq_flag: bool,
+}
+
+impl DmcChannel {
+    /// Create a new, fully-reset DMC channel. The output counter starts
+    /// at 0 and the timer period defaults to the first rate-table entry.
+    fn new() -> Self {
+        Self {
+            irq_enable: false,
+            loop_flag: false,
+            rate_index: 0,
+            timer_period: DMC_RATE_TABLE[0],
+            timer: 0,
+            output_counter: 0,
+            sample_buffer: 0,
+            buffer_bits: 0,
+            sample_addr_base: 0xC000,
+            sample_address: 0xC000,
+            sample_length: 1,
+            bytes_remaining: 0,
+            enabled: false,
+            irq_flag: false,
+        }
+    }
+
+    /// Write to one of the DMC channel registers.
+    ///
+    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
+    /// the channel base `$4010`).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_DMC#Registers
+    pub fn write_register(&mut self, reg: u8, value: u8) {
+        match reg {
+            0 => {
+                // $4010: IL-- RRRR — IRQ enable, loop, rate index.
+                self.irq_enable = (value & 0x80) != 0;
+                self.loop_flag = (value & 0x40) != 0;
+                self.rate_index = value & 0x0F;
+                self.timer_period = DMC_RATE_TABLE[self.rate_index as usize];
+            }
+            1 => {
+                // $4011: -DDD DDDD — direct DAC load. Bits 0-6 set the
+                // output counter directly; bit 7 is ignored.
+                self.output_counter = value & 0x7F;
+            }
+            2 => {
+                // $4012: sample address base = (value << 6) + $C000.
+                self.sample_addr_base = ((value as u16) << 6) | 0xC000;
+            }
+            3 => {
+                // $4013: sample length = (value << 4) + 1.
+                self.sample_length = ((value as u16) << 4) | 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the channel enable flag from `$4015` bit 4. When enabled and
+    /// the sample is not already playing (`bytes_remaining == 0`), the
+    /// sample is restarted from the base address. When disabled, bytes
+    /// remaining is forced to 0 but the output counter keeps its value.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Status
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if enabled {
+            // Only restart if the sample has finished (or was never
+            // started). Per NESdev: "If DMC bytes remaining is 0, restart
+            // DMC sample."
+            if self.bytes_remaining == 0 {
+                self.sample_address = self.sample_addr_base;
+                self.bytes_remaining = self.sample_length;
+                self.buffer_bits = 0; // empty the sample buffer
+            }
+        } else {
+            // Stop playback; the output counter retains its value.
+            self.bytes_remaining = 0;
+        }
+    }
+
+    /// Whether the channel is currently enabled via `$4015`.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether the DMC has bytes remaining to fetch (read at `$4015` bit 4).
+    pub fn bytes_remaining(&self) -> u16 {
+        self.bytes_remaining
+    }
+
+    /// Current output counter value (0..=127) — the DAC output.
+    pub fn output_counter(&self) -> u8 {
+        self.output_counter
+    }
+
+    /// Current timer period (from the rate lookup table).
+    pub fn timer_period(&self) -> u16 {
+        self.timer_period
+    }
+
+    /// Current rate index (0..=15).
+    pub fn rate_index(&self) -> u8 {
+        self.rate_index
+    }
+
+    /// Current sample address (the next byte to fetch).
+    pub fn sample_address(&self) -> u16 {
+        self.sample_address
+    }
+
+    /// Current sample address base (set by `$4012`).
+    pub fn sample_addr_base(&self) -> u16 {
+        self.sample_addr_base
+    }
+
+    /// Current sample length (set by `$4013`).
+    pub fn sample_length(&self) -> u16 {
+        self.sample_length
+    }
+
+    /// Whether the loop flag is set.
+    pub fn loop_flag(&self) -> bool {
+        self.loop_flag
+    }
+
+    /// Whether the IRQ enable flag is set.
+    pub fn irq_enable(&self) -> bool {
+        self.irq_enable
+    }
+
+    /// Whether the DMC IRQ flag is set (read at `$4015` bit 7).
+    pub fn irq_flag(&self) -> bool {
+        self.irq_flag
+    }
+
+    /// Clear the DMC IRQ flag (done by reading `$4015`).
+    pub fn clear_irq(&mut self) {
+        self.irq_flag = false;
+    }
+
+    /// Advance the channel by one APU cycle (half a CPU cycle). The timer
+    /// counts down; on reaching zero it reloads to the period and the
+    /// output unit clocks one bit. `read` is a closure that fetches a
+    /// byte from CPU memory at the given address (used for DMA sample
+    /// fetches).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_DMC#Output_unit
+    pub fn tick(&mut self, read: &mut impl FnMut(u16) -> u8) {
+        if self.timer == 0 {
+            self.timer = self.timer_period;
+            self.clock_output_unit(read);
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    /// Clock the output unit: optionally fetch a byte from memory, then
+    /// shift one bit out and update the output counter.
+    ///
+    /// Per NESdev, each timer tick does the following in order:
+    /// 1. If the sample buffer is empty and bytes remain, fetch a byte.
+    /// 2. If the sample buffer is non-empty, shift one bit out and update
+    ///    the output counter.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_DMC#Output_unit
+    fn clock_output_unit(&mut self, read: &mut impl FnMut(u16) -> u8) {
+        // Step 1: refill the sample buffer if empty and bytes remain.
+        if self.buffer_bits == 0 && self.bytes_remaining > 0 {
+            self.sample_buffer = read(self.sample_address);
+            self.buffer_bits = 8;
+            // Advance the sample address, wrapping $FFFF → $8000.
+            self.sample_address = self.sample_address.wrapping_add(1);
+            if self.sample_address == 0 {
+                self.sample_address = 0x8000;
+            }
+            self.bytes_remaining -= 1;
+            // If the sample is now exhausted, handle loop / IRQ.
+            if self.bytes_remaining == 0 {
+                if self.loop_flag {
+                    self.sample_address = self.sample_addr_base;
+                    self.bytes_remaining = self.sample_length;
+                } else if self.irq_enable {
+                    self.irq_flag = true;
+                }
+            }
+        }
+
+        // Step 2: output one bit from the sample buffer.
+        if self.buffer_bits > 0 {
+            let bit = self.sample_buffer & 1;
+            if bit == 0 {
+                self.output_counter = self.output_counter.saturating_sub(2);
+            } else {
+                self.output_counter = (self.output_counter.saturating_add(2)).min(127);
+            }
+            self.sample_buffer >>= 1;
+            self.buffer_bits -= 1;
+        }
+    }
+
+    /// Current output sample (0..=127). The DMC always outputs its DAC
+    /// counter value regardless of the enabled flag (the counter retains
+    /// its value after the channel is disabled).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_DMC#Output
+    pub fn sample(&self) -> u8 {
+        self.output_counter
+    }
+}
+
+/// The APU — owns the two pulse channels, the triangle channel, the noise
+/// channel, the DMC channel, and the frame counter.
 pub struct Apu {
     pulse1: PulseChannel,
     pulse2: PulseChannel,
     triangle: TriangleChannel,
     noise: NoiseChannel,
+    dmc: DmcChannel,
+
     /// Half-cycle accumulator: the APU runs at CPU clock / 2, so one APU
     /// cycle is two CPU cycles. This accumulates fractional APU cycles
     /// across `step` calls.
     cycle_accumulator: u32,
+
+    // ---- Frame counter ($4017) -----------------------------------------
+    /// `true` for 5-step mode (bit 7 of `$4017`), `false` for 4-step mode.
+    frame_mode_5step: bool,
+    /// IRQ inhibit flag (bit 6 of `$4017`). When set, the frame counter
+    /// does not raise IRQs in 4-step mode.
+    frame_irq_inhibit: bool,
+    /// Frame counter cycle position (in CPU cycles). Resets at the end of
+    /// each frame-counter period (29830 for 4-step, 37282 for 5-step).
+    frame_cycle: u32,
+    /// Frame counter IRQ flag (read at `$4015` bit 6, cleared by reading
+    /// `$4015`). Set at the 4th step of 4-step mode if IRQ is not inhibited.
+    frame_irq: bool,
+    /// Pending reset delay in CPU cycles. On `$4017` write the frame
+    /// counter resets after ~3-4 CPU cycles; this counts down that delay.
+    /// A value of 0 means no pending reset.
+    frame_reset_delay: u32,
 }
 
 impl Apu {
@@ -917,7 +1218,13 @@ impl Apu {
             pulse2: PulseChannel::new(true),
             triangle: TriangleChannel::new(),
             noise: NoiseChannel::new(),
+            dmc: DmcChannel::new(),
             cycle_accumulator: 0,
+            frame_mode_5step: false,
+            frame_irq_inhibit: false,
+            frame_cycle: 0,
+            frame_irq: false,
+            frame_reset_delay: 0,
         }
     }
 
@@ -961,10 +1268,20 @@ impl Apu {
         &mut self.noise
     }
 
+    /// Borrow the DMC channel.
+    pub fn dmc(&self) -> &DmcChannel {
+        &self.dmc
+    }
+
+    /// Mutably borrow the DMC channel.
+    pub fn dmc_mut(&mut self) -> &mut DmcChannel {
+        &mut self.dmc
+    }
+
     /// Write the status register `$4015`. Bits 0-3 enable/disable the
     /// pulse 1, pulse 2, triangle, and noise channels (clearing a bit
-    /// forces that channel's length counter to zero). The DMC bits (4,7)
-    /// land in M16.
+    /// forces that channel's length counter to zero). Bit 4 enables the
+    /// DMC channel (restarting the sample from its base address).
     ///
     /// See: https://www.nesdev.org/wiki/APU_Status
     pub fn write_status(&mut self, value: u8) {
@@ -972,14 +1289,16 @@ impl Apu {
         self.pulse2.set_enabled(value & 0x02 != 0);
         self.triangle.set_enabled(value & 0x04 != 0);
         self.noise.set_enabled(value & 0x08 != 0);
+        self.dmc.set_enabled(value & 0x10 != 0);
     }
 
-    /// Read the status register `$4015`. Bits 0-3 reflect whether each
-    /// channel's length counter is non-zero. The DMC and IRQ flags
-    /// (bits 4,6,7) are 0 until M16.
+    /// Read the status register `$4015`. Bits 0-4 reflect whether each
+    /// channel's length counter / bytes-remaining is non-zero. Bit 6 is
+    /// the frame counter IRQ flag; bit 7 is the DMC IRQ flag. Reading
+    /// `$4015` clears both IRQ flags (matching real hardware).
     ///
     /// See: https://www.nesdev.org/wiki/APU_Status
-    pub fn read_status(&self) -> u8 {
+    pub fn read_status(&mut self) -> u8 {
         let mut v = 0u8;
         if self.pulse1.length_counter > 0 {
             v |= 0x01;
@@ -993,13 +1312,72 @@ impl Apu {
         if self.noise.length_counter > 0 {
             v |= 0x08;
         }
+        if self.dmc.bytes_remaining > 0 {
+            v |= 0x10;
+        }
+        if self.frame_irq {
+            v |= 0x40;
+        }
+        if self.dmc.irq_flag {
+            v |= 0x80;
+        }
+        // Reading $4015 clears both IRQ flags.
+        self.frame_irq = false;
+        self.dmc.irq_flag = false;
         v
     }
 
-    /// Advance the APU by `cpu_cycles` CPU cycles. All channel timers tick
-    /// once per APU cycle (every 2 CPU cycles). Frame-counter clocking
-    /// (quarter/half-frame) is added in M16.
-    pub fn step(&mut self, cpu_cycles: u32) {
+    /// Write the frame counter control register `$4017`.
+    ///
+    /// - Bit 7: mode (`0` = 4-step, `1` = 5-step).
+    /// - Bit 6: IRQ inhibit (`1` = suppress frame counter IRQ).
+    ///
+    /// On write, the frame counter is reset after a short delay (~3-4 CPU
+    /// cycles on real hardware; modeled here as a 4-cycle delay). In 5-step
+    /// mode, an immediate quarter+half-frame clock is also performed.
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Frame_Counter
+    pub fn write_frame_counter(&mut self, value: u8) {
+        let new_mode_5step = (value & 0x80) != 0;
+        self.frame_irq_inhibit = (value & 0x40) != 0;
+
+        // If the IRQ inhibit flag is set, clear any pending frame IRQ.
+        if self.frame_irq_inhibit {
+            self.frame_irq = false;
+        }
+
+        // 5-step mode: immediately clock quarter + half frame.
+        if new_mode_5step {
+            self.clock_quarter_frame();
+            self.clock_half_frame();
+        }
+
+        // Schedule a frame counter reset after ~4 CPU cycles.
+        self.frame_reset_delay = 4;
+        // Update the mode immediately (the reset will zero the cycle counter).
+        self.frame_mode_5step = new_mode_5step;
+    }
+
+    /// Whether the APU has a pending IRQ (frame counter or DMC). The
+    /// emulator main loop polls this after each CPU step and raises
+    /// `Cpu::irq_pending` when it returns `true`.
+    pub fn irq_pending(&self) -> bool {
+        self.frame_irq || self.dmc.irq_flag
+    }
+
+    /// Advance the APU by `cpu_cycles` CPU cycles. All channel timers
+    /// (including the DMC) tick once per APU cycle (every 2 CPU cycles).
+    /// The frame counter advances at the CPU clock rate and triggers
+    /// quarter/half-frame clocks at the appropriate cycle counts. `read`
+    /// is a closure that fetches a byte from CPU memory at the given
+    /// address (used by the DMC for DMA sample fetches).
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Frame_Counter
+    pub fn step(&mut self, cpu_cycles: u32, mut read: impl FnMut(u16) -> u8) {
+        // ---- Frame counter (CPU clock rate) ----
+        self.step_frame_counter(cpu_cycles);
+
+        // ---- Channel timers (APU clock rate = CPU / 2) ----
         self.cycle_accumulator = self.cycle_accumulator.saturating_add(cpu_cycles);
         while self.cycle_accumulator >= 2 {
             self.cycle_accumulator -= 2;
@@ -1007,6 +1385,87 @@ impl Apu {
             self.pulse2.tick();
             self.triangle.tick();
             self.noise.tick();
+            self.dmc.tick(&mut read);
+        }
+    }
+
+    /// Advance the frame counter by `cpu_cycles` CPU cycles, firing
+    /// quarter/half-frame clocks and IRQ at the appropriate thresholds.
+    ///
+    /// 4-step mode thresholds (NTSC, CPU cycles):
+    /// - 7457: quarter-frame
+    /// - 14913: quarter + half-frame
+    /// - 22371: quarter-frame
+    /// - 29828: quarter + half-frame + IRQ (if not inhibited)
+    /// - 29830: counter resets
+    ///
+    /// 5-step mode thresholds:
+    /// - 7457: quarter-frame
+    /// - 14913: quarter + half-frame
+    /// - 22371: quarter-frame
+    /// - 37281: quarter + half-frame (no IRQ)
+    /// - 37282: counter resets
+    ///
+    /// See: https://www.nesdev.org/wiki/APU_Frame_Counter
+    fn step_frame_counter(&mut self, cpu_cycles: u32) {
+        // Handle the pending reset delay from a $4017 write.
+        if self.frame_reset_delay > 0 {
+            let advance = cpu_cycles.min(self.frame_reset_delay);
+            self.frame_reset_delay -= advance;
+            if self.frame_reset_delay == 0 {
+                // The reset takes effect: zero the cycle counter.
+                self.frame_cycle = 0;
+            }
+            // During the reset delay, the frame counter does not advance.
+            // The remaining cycles (if any) are applied after the reset.
+            let remaining = cpu_cycles - advance;
+            if remaining == 0 {
+                return;
+            }
+            self.frame_cycle = self.frame_cycle.saturating_add(remaining);
+        } else {
+            self.frame_cycle = self.frame_cycle.saturating_add(cpu_cycles);
+        }
+
+        // Threshold crossings. We check each threshold against the
+        // pre/post cycle count so that a large batch (e.g. DMA stall)
+        // doesn't skip a threshold.
+        let prev = self.frame_cycle.saturating_sub(cpu_cycles);
+        let thresholds: [(u32, bool, bool); 4] = if self.frame_mode_5step {
+            [
+                (7457, true, false),
+                (14913, true, true),
+                (22371, true, false),
+                (37281, true, true),
+            ]
+        } else {
+            [
+                (7457, true, false),
+                (14913, true, true),
+                (22371, true, false),
+                (29828, true, true),
+            ]
+        };
+
+        for &(threshold, quarter, half) in thresholds.iter() {
+            if prev < threshold && self.frame_cycle >= threshold {
+                if quarter {
+                    self.clock_quarter_frame();
+                }
+                if half {
+                    self.clock_half_frame();
+                }
+                // IRQ only in 4-step mode, at the 4th step, if not inhibited.
+                if !self.frame_mode_5step && threshold == 29828 && !self.frame_irq_inhibit {
+                    self.frame_irq = true;
+                }
+            }
+        }
+
+        // Reset the counter at the end of the period.
+        let reset_at: u32 = if self.frame_mode_5step { 37282 } else { 29830 };
+        if self.frame_cycle >= reset_at {
+            self.frame_cycle -= reset_at;
         }
     }
 
@@ -1035,6 +1494,8 @@ impl Apu {
     /// M15 this is a simple sum (clamped); the non-linear mixer lands in
     /// Tier 3. The triangle channel's full-volume output (0..=15) is
     /// added directly; the noise channel contributes its envelope volume.
+    /// The DMC is not included in this 0..=15 mix; see [`Apu::output`]
+    /// for the full mix including DMC.
     pub fn mix(&self) -> u8 {
         let s = self.pulse1.sample() as u16
             + self.pulse2.sample() as u16
@@ -1045,6 +1506,18 @@ impl Apu {
         } else {
             s as u8
         }
+    }
+
+    /// Full audio output sample as an `f32` in `[-1.0, 1.0]`, including
+    /// the DMC channel. The pulse/triangle/noise mix (0..=15) is centered
+    /// at its midpoint (7.5) and scaled to `[-1.0, 1.0]`; the DMC output
+    /// (0..=127) is centered at its midpoint (63.5) and scaled to
+    /// `[-1.0, 1.0]`. The two are averaged, so silence (all channels off,
+    /// DMC = 0) produces 0.0. The non-linear mixer lands in Tier 3 (M31).
+    pub fn output(&self) -> f32 {
+        let ptn = (self.mix() as f32 - 7.5) / 7.5; // -1..=1
+        let dmc = (self.dmc.sample() as f32 - 63.5) / 63.5; // -1..=1
+        (ptn + dmc) / 2.0 // -1..=1
     }
 }
 
@@ -1489,11 +1962,11 @@ mod tests {
         apu.pulse1_mut().write_register(2, 0x00);
         apu.pulse1_mut().write_register(3, 0x00);
         let s0 = apu.pulse1().sequence();
-        apu.step(2); // one APU cycle
+        apu.step(2, |_| 0); // one APU cycle
         assert_eq!(apu.pulse1().sequence(), (s0 + 1) & 7);
-        apu.step(1); // not enough for a full APU cycle
+        apu.step(1, |_| 0); // not enough for a full APU cycle
         assert_eq!(apu.pulse1().sequence(), (s0 + 1) & 7);
-        apu.step(1); // now completes the second APU cycle
+        apu.step(1, |_| 0); // now completes the second APU cycle
         assert_eq!(apu.pulse1().sequence(), (s0 + 2) & 7);
     }
 
@@ -2017,7 +2490,7 @@ mod tests {
         apu.triangle_mut().write_register(2, 0x00);
         apu.triangle_mut().write_register(3, 0x00); // period 0
         let s0 = apu.triangle().sequence();
-        apu.step(2); // one APU cycle
+        apu.step(2, |_| 0); // one APU cycle
         assert_eq!(apu.triangle().sequence(), (s0 + 1) & 0x1F);
     }
 
@@ -2042,5 +2515,387 @@ mod tests {
         assert_eq!(apu.noise().sample(), 5);
         // Mix = 15 (triangle) + 5 (noise) = 20 → clamped to 15.
         assert_eq!(apu.mix(), 15);
+    }
+
+    // ---- DMC channel (M16) ----------------------------------------------
+
+    #[test]
+    fn dmc_rate_table_all_entries() {
+        // NTSC rate table (APU cycles = CPU/2). Derived from the NESdev
+        // CPU-cycle values: [428, 380, 340, 320, 298, 276, 254, 226, 214,
+        // 190, 170, 160, 142, 126, 108, 84].
+        assert_eq!(
+            DMC_RATE_TABLE,
+            [214, 190, 170, 160, 149, 138, 127, 113, 107, 95, 85, 80, 71, 63, 54, 42]
+        );
+    }
+
+    #[test]
+    fn dmc_write_4010_sets_irq_loop_and_rate_index() {
+        let mut d = DmcChannel::new();
+        // 0xFF = IRQ enable + loop + rate index 15.
+        d.write_register(0, 0xFF);
+        assert!(d.irq_enable());
+        assert!(d.loop_flag());
+        assert_eq!(d.rate_index(), 0x0F);
+        assert_eq!(d.timer_period(), DMC_RATE_TABLE[15]);
+    }
+
+    #[test]
+    fn dmc_write_4011_loads_output_counter_7_bits() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x7F);
+        assert_eq!(d.output_counter(), 127);
+        // Bit 7 is ignored.
+        d.write_register(1, 0x80);
+        assert_eq!(d.output_counter(), 0);
+    }
+
+    #[test]
+    fn dmc_write_4012_sets_sample_address_base() {
+        let mut d = DmcChannel::new();
+        d.write_register(2, 0x00);
+        assert_eq!(d.sample_addr_base(), 0xC000);
+        d.write_register(2, 0x40);
+        assert_eq!(d.sample_addr_base(), 0xD000);
+        d.write_register(2, 0xFF);
+        assert_eq!(d.sample_addr_base(), 0xFFC0);
+    }
+
+    #[test]
+    fn dmc_write_4013_sets_sample_length() {
+        let mut d = DmcChannel::new();
+        d.write_register(3, 0x00);
+        assert_eq!(d.sample_length(), 1);
+        d.write_register(3, 0x01);
+        assert_eq!(d.sample_length(), 17);
+        d.write_register(3, 0xFF);
+        assert_eq!(d.sample_length(), 0xFF1);
+    }
+
+    #[test]
+    fn dmc_enable_restarts_sample_from_base() {
+        let mut d = DmcChannel::new();
+        d.write_register(2, 0x10); // base = $C400
+        d.write_register(3, 0x01); // length = 17
+        d.set_enabled(true);
+        assert!(d.enabled());
+        assert_eq!(d.sample_address(), 0xC400);
+        assert_eq!(d.bytes_remaining(), 17);
+    }
+
+    #[test]
+    fn dmc_disable_stops_fetch_but_keeps_output() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x40); // output = 64
+        d.set_enabled(true);
+        d.set_enabled(false);
+        assert_eq!(d.bytes_remaining(), 0);
+        assert_eq!(d.output_counter(), 64);
+    }
+
+    #[test]
+    fn dmc_tick_increments_output_on_one_bit() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x00); // output = 0
+                                   // Set rate index 0 (period 214 APU cycles) and prime the buffer
+                                   // with 0xFF (all 1 bits → 8 increments of 2 = +16, saturating at 127).
+        d.write_register(0, 0x0F); // rate index 15, period 42
+        d.set_enabled(true);
+        // Manually fill the buffer to avoid needing a memory read.
+        // We tick the timer; on each reload the output unit clocks a bit.
+        // With period 42, we need 27+1 ticks to shift one bit (timer starts
+        // at 0 → first tick reloads + clocks).
+        // Instead, directly test the output unit by ticking enough times
+        // to shift all 8 bits of a fetched byte.
+        // Use a read closure that returns 0xFF.
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0xFF);
+        }
+        // 8 bits of 1 → +16, but saturating at 127.
+        assert_eq!(d.output_counter(), 16);
+    }
+
+    #[test]
+    fn dmc_tick_decrements_output_on_zero_bit() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x7F); // output = 127
+        d.write_register(0, 0x0F); // rate index 15, period 42
+        d.set_enabled(true);
+        // Fetch 0x00 (all 0 bits → 8 decrements of 2 = -16).
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0x00);
+        }
+        assert_eq!(d.output_counter(), 127 - 16);
+    }
+
+    #[test]
+    fn dmc_output_saturates_at_127() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x7E); // output = 126
+        d.write_register(0, 0x0F); // period 42
+        d.set_enabled(true);
+        // Fetch 0xFF → 8 bits of 1 → +16 → saturate at 127.
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0xFF);
+        }
+        assert_eq!(d.output_counter(), 127);
+    }
+
+    #[test]
+    fn dmc_output_saturates_at_0() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x02); // output = 2
+        d.write_register(0, 0x0F); // period 42
+        d.set_enabled(true);
+        // Fetch 0x00 → 8 bits of 0 → -16 → saturate at 0.
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0x00);
+        }
+        assert_eq!(d.output_counter(), 0);
+    }
+
+    #[test]
+    fn dmc_dma_fetch_advances_address_and_decrements_bytes() {
+        let mut d = DmcChannel::new();
+        d.write_register(2, 0x00); // base = $C000
+        d.write_register(3, 0x01); // length = 17
+        d.write_register(0, 0x0F); // period 42
+        d.set_enabled(true);
+        // Tick enough to fetch one byte (8 bits): the first timer reload
+        // triggers a fetch + shifts 8 bits.
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0xAA);
+        }
+        // One byte fetched: address advanced, bytes remaining decremented.
+        assert_eq!(d.sample_address(), 0xC001);
+        assert_eq!(d.bytes_remaining(), 16);
+    }
+
+    #[test]
+    fn dmc_address_wraps_ffff_to_8000() {
+        let mut d = DmcChannel::new();
+        d.write_register(2, 0xFF); // base = $FFC0
+                                   // length = (0x04 << 4) + 1 = 65 bytes → enough to wrap past $FFFF.
+        d.write_register(3, 0x04); // length = 65
+        d.write_register(0, 0x0F); // period 42 (rate index 15)
+        d.set_enabled(true);
+        // The timer counts from period to 0 (period+1 ticks per clock).
+        // Period 42 → 43 ticks per bit. 8 bits per byte → 344 ticks/byte.
+        // 65 fetches → 65 * 344 = 22360 ticks + headroom.
+        for _ in 0..23000 {
+            d.tick(&mut |_| 0x00);
+        }
+        // After 65 fetches from $FFC0, address should have wrapped to $8001.
+        assert!(d.sample_address() >= 0x8000 && d.sample_address() < 0xC000);
+    }
+
+    #[test]
+    fn dmc_loop_restart_resets_address_and_bytes() {
+        let mut d = DmcChannel::new();
+        d.write_register(0, 0x4F); // loop + rate index 15
+        d.write_register(2, 0x10); // base = $C400
+        d.write_register(3, 0x00); // length = 1
+        d.set_enabled(true);
+        // Fetch the single byte (8 bits), then the loop should restart.
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0x00);
+        }
+        // After loop restart, bytes_remaining should be back to 1.
+        assert_eq!(d.bytes_remaining(), 1);
+        assert_eq!(d.sample_address(), 0xC400);
+    }
+
+    #[test]
+    fn dmc_irq_raised_on_completion_without_loop() {
+        let mut d = DmcChannel::new();
+        d.write_register(0, 0x8F); // IRQ enable + rate index 15 (no loop)
+        d.write_register(3, 0x00); // length = 1
+        d.set_enabled(true);
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0x00);
+        }
+        assert!(d.irq_flag());
+    }
+
+    #[test]
+    fn dmc_no_irq_when_loop_set() {
+        let mut d = DmcChannel::new();
+        d.write_register(0, 0xCF); // IRQ enable + loop + rate index 15
+        d.write_register(3, 0x00); // length = 1
+        d.set_enabled(true);
+        for _ in 0..(42 * 8 + 1) {
+            d.tick(&mut |_| 0x00);
+        }
+        assert!(!d.irq_flag());
+    }
+
+    #[test]
+    fn dmc_clear_irq() {
+        let mut d = DmcChannel::new();
+        d.irq_flag = true;
+        d.clear_irq();
+        assert!(!d.irq_flag());
+    }
+
+    #[test]
+    fn dmc_sample_returns_output_counter() {
+        let mut d = DmcChannel::new();
+        d.write_register(1, 0x5A);
+        assert_eq!(d.sample(), 0x5A & 0x7F);
+    }
+
+    // ---- Frame counter (M16) --------------------------------------------
+
+    #[test]
+    fn apu_write_frame_counter_4_step_mode() {
+        let mut apu = Apu::new();
+        apu.write_frame_counter(0x00); // 4-step, IRQ not inhibited
+        assert!(!apu.frame_mode_5step);
+        assert!(!apu.frame_irq_inhibit);
+    }
+
+    #[test]
+    fn apu_write_frame_counter_5_step_mode_clocks_immediately() {
+        let mut apu = Apu::new();
+        apu.write_status(0x01);
+        apu.pulse1_mut().write_register(3, 0x00); // length 10
+        let len0 = apu.pulse1().length_counter();
+        apu.write_frame_counter(0x80); // 5-step → immediate Q+H clock
+                                       // Half-frame clocks the length counter → 10 → 9.
+        assert_eq!(apu.pulse1().length_counter(), len0 - 1);
+    }
+
+    #[test]
+    fn apu_write_frame_counter_irq_inhibit_clears_pending_irq() {
+        let mut apu = Apu::new();
+        apu.frame_irq = true;
+        apu.write_frame_counter(0x40); // IRQ inhibit
+        assert!(!apu.frame_irq);
+        assert!(apu.frame_irq_inhibit);
+    }
+
+    #[test]
+    fn apu_frame_counter_4_step_raises_irq_at_29828() {
+        let mut apu = Apu::new();
+        apu.write_frame_counter(0x00); // 4-step, IRQ enabled
+                                       // The $4017 write imposes a 4-cycle reset delay, so we need
+                                       // 29828 + 4 + a few extra cycles to reach the IRQ threshold.
+        apu.step(29833, |_| 0);
+        assert!(apu.irq_pending());
+    }
+
+    #[test]
+    fn apu_frame_counter_4_step_irq_inhibited() {
+        let mut apu = Apu::new();
+        apu.write_frame_counter(0x40); // 4-step, IRQ inhibited
+        apu.step(29833, |_| 0);
+        assert!(!apu.irq_pending());
+    }
+
+    #[test]
+    fn apu_frame_counter_5_step_no_irq() {
+        let mut apu = Apu::new();
+        apu.write_frame_counter(0x80); // 5-step
+        apu.step(37288, |_| 0);
+        assert!(!apu.irq_pending());
+    }
+
+    #[test]
+    fn apu_frame_counter_4_step_quarter_frame_clocks_envelope() {
+        let mut apu = Apu::new();
+        apu.write_status(0x01);
+        // Envelope mode (bit 4 = 0), volume 0 → divider starts at 0, so
+        // the second quarter-frame immediately decrements decay.
+        apu.pulse1_mut().write_register(0, 0x00); // envelope mode, volume 0
+        apu.pulse1_mut().write_register(3, 0x00); // length 10, sets envelope_start
+                                                  // The first quarter-frame (at 7457) loads decay=15, divider=0, and
+                                                  // clears envelope_start. The second quarter-frame (at 14913) sees
+                                                  // divider==0 → reloads divider, decrements decay to 14.
+                                                  // Account for the 4-cycle reset delay from $4017 write.
+        apu.write_frame_counter(0x00);
+        apu.step(14918, |_| 0); // past the second quarter-frame
+        assert_eq!(apu.pulse1().envelope_decay(), 14);
+    }
+
+    #[test]
+    fn apu_frame_counter_4_step_half_frame_clocks_length() {
+        let mut apu = Apu::new();
+        apu.write_status(0x01);
+        apu.pulse1_mut().write_register(3, 0x00); // length 10
+        apu.write_frame_counter(0x00);
+        apu.step(14918, |_| 0); // past first half-frame at 14913 (+4 reset delay)
+        assert_eq!(apu.pulse1().length_counter(), 9);
+    }
+
+    #[test]
+    fn apu_read_status_clears_frame_and_dmc_irq() {
+        let mut apu = Apu::new();
+        apu.frame_irq = true;
+        apu.dmc.irq_flag = true;
+        let s = apu.read_status();
+        assert_eq!(s & 0x40, 0x40); // frame IRQ
+        assert_eq!(s & 0x80, 0x80); // DMC IRQ
+                                    // Reading clears both.
+        let s2 = apu.read_status();
+        assert_eq!(s2 & 0xC0, 0x00);
+    }
+
+    #[test]
+    fn apu_read_status_reflects_dmc_bytes_remaining() {
+        let mut apu = Apu::new();
+        apu.dmc_mut().write_register(3, 0x01); // length 17
+        apu.dmc_mut().set_enabled(true);
+        let s = apu.read_status();
+        assert_eq!(s & 0x10, 0x10);
+    }
+
+    #[test]
+    fn apu_output_includes_dmc() {
+        let mut apu = Apu::new();
+        // DMC output = 127, all other channels silent (mix = 0).
+        apu.dmc_mut().write_register(1, 0x7F);
+        let out = apu.output();
+        // ptn = (0 - 7.5) / 7.5 = -1.0, dmc = (127 - 63.5) / 63.5 ≈ 1.0.
+        // combined = (-1.0 + 1.0) / 2 = 0.0.
+        assert!((out - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn apu_output_with_both_ptn_and_dmc() {
+        let mut apu = Apu::new();
+        apu.write_status(0x01);
+        // Duty 3 (bits 6-7 = 11) → sequence [1,0,0,0,1,1,1,1], seq[0] = 1.
+        // Const vol 15 (bit 4 + bits 0-3 = 0x1F). So $4000 = 0xDF.
+        apu.pulse1_mut().write_register(0, 0b1101_1111); // duty 3, const vol 15
+                                                         // Period must be >= MIN_AUDIBLE_PERIOD (8) to avoid muting.
+        apu.pulse1_mut().write_register(2, 0x08); // timer low = 8
+        apu.pulse1_mut().write_register(3, 0x00); // length 10, timer high = 0
+        apu.dmc_mut().write_register(1, 0x7F); // DMC = 127
+        let out = apu.output();
+        // ptn = (15 - 7.5) / 7.5 = 1.0, dmc = (127 - 63.5) / 63.5 ≈ 1.0.
+        // combined = (1.0 + 1.0) / 2 = 1.0.
+        assert!((out - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn apu_output_silence_is_negative_one() {
+        let apu = Apu::new();
+        // All channels off, DMC = 0. Centered mapping: both components at
+        // minimum → output = -1.0. A DC blocking filter would center this
+        // at 0.0; for M16 we accept the DC offset.
+        let out = apu.output();
+        assert!((out - (-1.0_f32)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apu_irq_pending_reflects_both_sources() {
+        let mut apu = Apu::new();
+        assert!(!apu.irq_pending());
+        apu.frame_irq = true;
+        assert!(apu.irq_pending());
+        apu.frame_irq = false;
+        apu.dmc.irq_flag = true;
+        assert!(apu.irq_pending());
     }
 }

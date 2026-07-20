@@ -22,21 +22,28 @@
 
 #![allow(dead_code)]
 
+use crate::audio::CPU_CYCLES_PER_SAMPLE;
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::cpu::Cpu;
 use crate::ppu::{CYCLES_PER_SCANLINE, SCANLINES_PER_FRAME, SCANLINE_PRERENDER};
 
-/// The complete NES emulator state — CPU + bus (which owns the PPU and
-/// cartridge).
+/// The complete NES emulator state — CPU + bus (which owns the PPU, APU,
+/// and cartridge) + audio sample accumulation.
 ///
 /// Created once at startup and driven by the main loop's
 /// [`EmulatorState::step_frame`]. No allocation happens inside
-/// `step_frame` after construction (the PPU framebuffer and bg-pattern
-/// buffer are pre-allocated in `Ppu::new`).
+/// `step_frame` after construction (the PPU framebuffer, bg-pattern
+/// buffer, and audio buffer are pre-allocated).
 pub struct EmulatorState {
     cpu: Cpu,
     bus: Bus,
+    /// Audio sample accumulator — tracks fractional CPU cycles toward
+    /// the next audio sample.
+    sample_accumulator: f32,
+    /// Pre-allocated buffer of audio samples produced during the current
+    /// frame. Drained by the main loop via [`take_audio_samples`].
+    audio_buffer: Vec<f32>,
 }
 
 impl EmulatorState {
@@ -47,6 +54,9 @@ impl EmulatorState {
         Self {
             cpu: Cpu::new(),
             bus: Bus::with_cartridge(cartridge),
+            sample_accumulator: 0.0,
+            // Pre-allocate for ~735 samples/frame (44100/60) + headroom.
+            audio_buffer: Vec::with_capacity(800),
         }
     }
 
@@ -134,16 +144,34 @@ impl EmulatorState {
             cpu_cycles = cpu_cycles.saturating_add(dma_cycles);
 
             // Advance the APU by the total CPU cycles this iteration
-            // (instruction + DMA stall). The APU runs at CPU clock / 2.
-            // Frame-counter clocking (quarter/half-frame) lands in M16.
-            self.bus.step_apu(step_cycles + dma_cycles);
+            // (instruction + DMA stall). The APU runs at CPU clock / 2;
+            // the frame counter advances at the CPU clock rate and clocks
+            // quarter/half-frame signals (M16).
+            let apu_cycles = step_cycles + dma_cycles;
+            self.bus.step_apu(apu_cycles);
+
+            // Poll the APU IRQ line (frame counter or DMC). The 6502 IRQ
+            // is level-triggered, so we set `irq_pending` whenever the APU
+            // flag is set; the CPU services it at the next instruction
+            // boundary if the I flag is clear.
+            if self.bus.apu_irq_pending() {
+                self.cpu.irq_pending = true;
+            }
+
+            // Generate audio samples at 44.1 kHz from the APU output.
+            // One sample every ~40.585 CPU cycles.
+            self.sample_accumulator += apu_cycles as f32;
+            while self.sample_accumulator >= CPU_CYCLES_PER_SAMPLE {
+                self.sample_accumulator -= CPU_CYCLES_PER_SAMPLE;
+                self.audio_buffer.push(self.bus.apu().output());
+            }
 
             // Advance the PPU by 3× the total CPU cycles this iteration
             // (instruction + DMA stall), maintaining the 1:3 CPU:PPU clock
             // ratio. Step in chunks of at most one scanline (341 cycles)
             // so the 261→0 wrap can be detected even when a DMA stall
             // pushes the batch past multiple scanlines.
-            let ppu_cycles = 3 * (step_cycles + dma_cycles);
+            let ppu_cycles = 3 * apu_cycles;
             let mut remaining = ppu_cycles;
             while remaining > 0 {
                 let chunk = remaining.min(CYCLES_PER_SCANLINE as u32);
@@ -178,6 +206,17 @@ impl EmulatorState {
         self.bus.render_frame();
 
         cpu_cycles
+    }
+
+    /// Drain and return the audio samples produced during the current
+    /// frame. The main loop calls this after `step_frame` and pushes the
+    /// samples to the SDL2 audio device. The internal buffer is cleared
+    /// (capacity preserved) so no allocation happens on the next frame.
+    pub fn take_audio_samples(&mut self) -> Vec<f32> {
+        let buf = std::mem::take(&mut self.audio_buffer);
+        // Re-allocate the buffer with the same capacity for the next frame.
+        self.audio_buffer = Vec::with_capacity(buf.capacity().max(800));
+        buf
     }
 
     /// Run `step_frame` and assert the PPU is at a valid frame boundary.

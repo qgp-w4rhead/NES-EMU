@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
+use nes_emu::audio::AudioOutput;
 use nes_emu::cartridge::Cartridge;
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::handle_key;
@@ -72,8 +73,10 @@ fn run() -> Result<(), String> {
 
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
+    let audio_subsystem = sdl_context.audio()?;
 
     let mut video = Video::new(&video_subsystem, DEFAULT_SCALE)?;
+    let audio = AudioOutput::new(&audio_subsystem)?;
     let mut event_pump = sdl_context.event_pump()?;
 
     'running: loop {
@@ -101,11 +104,19 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Step one full NTSC frame (CPU + PPU in lockstep), then present
-        // the rendered framebuffer. SDL2's vsynced renderer paces the
-        // loop to the monitor refresh rate (~60 Hz).
+        // Step one full NTSC frame (CPU + PPU + APU in lockstep), then
+        // present the rendered framebuffer and queue the audio samples.
+        // SDL2's vsynced renderer paces the loop to the monitor refresh
+        // rate (~60 Hz).
         emulator.step_frame();
         video.present(emulator.framebuffer())?;
+        let samples = emulator.take_audio_samples();
+        if !samples.is_empty() {
+            // Audio output is best-effort: if the queue is full (e.g. the
+            // audio device is slow), drop the samples rather than blocking
+            // the emulation loop.
+            let _ = audio.push_samples(&samples);
+        }
     }
 
     Ok(())

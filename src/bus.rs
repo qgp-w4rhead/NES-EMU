@@ -178,10 +178,29 @@ impl Bus {
     }
 
     /// Advance the APU by `cpu_cycles` CPU cycles. The APU runs at half the
-    /// CPU clock, so the pulse channel timers tick once every 2 CPU cycles.
-    /// Frame-counter clocking (quarter/half-frame) is added in M16.
+    /// CPU clock, so the channel timers tick once every 2 CPU cycles. The
+    /// frame counter advances at the CPU clock rate. The DMC channel's DMA
+    /// fetches read from CPU memory (RAM + cartridge PRG space) via a
+    /// split-borrow closure.
     pub fn step_apu(&mut self, cpu_cycles: u32) {
-        self.apu.step(cpu_cycles);
+        let apu = &mut self.apu;
+        let ram = &self.ram;
+        let cart = self.cartridge.as_ref();
+        apu.step(cpu_cycles, |addr| match addr {
+            0x0000..=0x1FFF => ram[(addr & RAM_MASK) as usize],
+            0x8000..=0xFFFF => match cart {
+                Some(c) => c.read_prg(addr),
+                None => 0,
+            },
+            _ => 0,
+        });
+    }
+
+    /// Whether the APU has a pending IRQ (frame counter or DMC). The
+    /// emulator main loop polls this after each CPU step and raises
+    /// `Cpu::irq_pending` when it returns `true`.
+    pub fn apu_irq_pending(&self) -> bool {
+        self.apu.irq_pending()
     }
 
     /// Render the background layer into the PPU framebuffer.
@@ -286,15 +305,16 @@ impl Bus {
             // reads return the open-bus latch.
             0x400C..=0x400F => self.apu_read(addr - APU_IO_BASE),
 
-            // $4010-$4013: DMC channel registers (open-bus latch until M16).
+            // $4010-$4013: DMC channel registers (M16). Write-only on real
+            // hardware; reads return the open-bus latch (last written value).
             0x4010..=0x4013 => self.apu_read(addr - APU_IO_BASE),
 
             // $4014: OAMDMA — write-only; reads return open bus.
             0x4014 => self.apu_read(0x14),
 
-            // $4015: APU status — bits 0-3 reflect pulse/triangle/noise
-            // length counters; bits 5-7 come from the open-bus latch
-            // (unused / IRQ flags land in M16). Bit 4 (DMC) is 0 until M16.
+            // $4015: APU status — bits 0-4 reflect channel length/bytes
+            // remaining; bit 5 is open bus; bits 6,7 are the frame counter
+            // and DMC IRQ flags. Reading $4015 clears both IRQ flags.
             0x4015 => self.apu_status_read(),
 
             // $4016: controller 1 + open-bus bits 1-7.
@@ -344,14 +364,19 @@ impl Bus {
                 self.apu_open_bus[offset as usize] = value;
             }
 
-            // $4010-$4013: DMC channel registers (open-bus latch until M16).
-            0x4010..=0x4013 => self.apu_write(addr - APU_IO_BASE, value),
+            // $4010-$4013: DMC channel registers (M16). Routed to the APU
+            // DMC channel; also latched on the open bus.
+            0x4010..=0x4013 => {
+                let offset = addr - APU_IO_BASE;
+                self.apu_dmc_write(offset, value);
+                self.apu_open_bus[offset as usize] = value;
+            }
 
             // $4014: OAMDMA — triggers 256-byte DMA from CPU page to OAM.
             0x4014 => self.oam_dma(value),
 
-            // $4015: APU status — enables/disables the pulse, triangle, and
-            // noise channels (bits 0-3). The DMC bits (4,7) land in M16.
+            // $4015: APU status — enables/disables all 5 channels (bits
+            // 0-4). Also latched on the open bus for bit 5 preservation.
             0x4015 => {
                 self.apu_open_bus[0x15] = value;
                 self.apu.write_status(value);
@@ -365,8 +390,12 @@ impl Bus {
                 self.joypad.write_strobe(value);
             }
 
-            // $4017: APU frame counter (open-bus latch until M14/M16).
-            0x4017 => self.apu_write(0x17, value),
+            // $4017: APU frame counter control (M16). Routed to the APU
+            // frame counter; also latched on the open bus.
+            0x4017 => {
+                self.apu_open_bus[0x17] = value;
+                self.apu.write_frame_counter(value);
+            }
 
             // $4018-$401F: disabled test region — ignore writes.
             0x4018..=0x401F => {}
@@ -531,12 +560,22 @@ impl Bus {
             .write_register((offset - 0x0C) as u8, value);
     }
 
-    /// Read the `$4015` APU status register. Bits 0-3 come from the APU
-    /// (pulse/triangle/noise length-counter status); bits 5-7 come from
-    /// the open-bus latch (bit 5 unused, bits 6,7 are IRQ flags handled
-    /// in M16). Bit 4 (DMC) is 0 until M16.
-    fn apu_status_read(&self) -> u8 {
-        (self.apu.read_status() & 0x1F) | (self.apu_open_bus[0x15] & 0xE0)
+    /// Write to a DMC channel register. `offset` is `addr - 0x4000` in
+    /// `0x10..=0x13`: reg = offset - 0x10 (0..=3).
+    fn apu_dmc_write(&mut self, offset: u16, value: u8) {
+        self.apu
+            .dmc_mut()
+            .write_register((offset - 0x10) as u8, value);
+    }
+
+    /// Read the `$4015` APU status register. Bits 0-4 come from the APU
+    /// (channel length/bytes-remaining status); bit 5 comes from the
+    /// open-bus latch (unused); bits 6,7 are the frame counter and DMC
+    /// IRQ flags from the APU. Reading `$4015` clears both IRQ flags
+    /// (side effect of `Apu::read_status`).
+    fn apu_status_read(&mut self) -> u8 {
+        let status = self.apu.read_status();
+        (status & 0xDF) | (self.apu_open_bus[0x15] & 0x20)
     }
 
     /// Read a controller register (`$4016` for controller 1, `$4017` for
@@ -707,16 +746,18 @@ mod tests {
         // reads return that latch (the register itself is write-only).
         bus.write(0x4000, 0x12);
         assert_eq!(bus.read(0x4000), 0x12);
-        // $4015 is the APU status register (M14): bits 0,1 reflect pulse
-        // length-counter status; bits 5-7 come from the open-bus latch.
-        // With no length loaded, bits 0,1 read 0; the upper bits preserve
-        // the last write.
+        // $4015 is the APU status register (M16): bits 0-4 reflect channel
+        // length/bytes-remaining; bit 5 comes from the open-bus latch;
+        // bits 6,7 are IRQ flags. With no length loaded and no IRQs, the
+        // read returns just the open-bus bit 5 (0x0F & 0x20 = 0).
         bus.write(0x4015, 0x0F); // enable pulse 1+2 (bits 0,1); latch 0x0F.
-        assert_eq!(bus.read(0x4015), 0x00); // no length loaded → bits 0,1 = 0
+        assert_eq!(bus.read(0x4015), 0x00); // no length loaded → bits 0-4 = 0
                                             // Loading a length into pulse 1 sets bit 0.
         bus.write(0x4003, 0x00); // length index 0 → length = 10
         assert_eq!(bus.read(0x4015) & 0x01, 0x01);
-        // $4017 stays open-bus until the frame counter lands in M16.
+        // $4017 is the frame counter control (M16): writes latch the open
+        // bus and configure the frame counter. Reads return the open-bus
+        // latch (via the joypad read path, bit 0 from controller 2).
         bus.write(0x4017, 0xC0);
         assert_eq!(bus.read(0x4017), 0xC0);
     }

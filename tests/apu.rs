@@ -69,14 +69,16 @@ fn bus_4015_read_reflects_length_counter_status() {
 }
 
 #[test]
-fn bus_4015_read_preserves_open_bus_upper_bits() {
+fn bus_4015_read_preserves_open_bus_bit5_and_reflects_irq_flags() {
     let mut bus = Bus::new();
-    // Write 0xE0 to $4015 — bits 5-7 latched on open bus; bits 0,1 enable
-    // the pulse channels (no length loaded → status 0).
+    // Write 0xE3 to $4015 — bit 5 latched on open bus; bits 0,1 enable
+    // the pulse channels (no length loaded → status 0). Bits 6,7 are the
+    // frame counter and DMC IRQ flags (both 0 since nothing triggered).
     bus.write(0x4015, 0xE3);
     let r = bus.read(0x4015);
-    assert_eq!(r & 0xE0, 0xE0);
-    assert_eq!(r & 0x1F, 0x00);
+    assert_eq!(r & 0x20, 0x20); // bit 5 from open bus
+    assert_eq!(r & 0xC0, 0x00); // bits 6,7 = IRQ flags (0)
+    assert_eq!(r & 0x1F, 0x00); // no length loaded
 }
 
 #[test]
@@ -129,10 +131,10 @@ fn apu_step_ticks_each_pulse_timer_at_half_cpu_rate() {
     apu.pulse1_mut().write_register(3, 0x00); // period 0
     let s0 = apu.pulse1().sequence();
     // 5 CPU cycles = 2 APU cycles (with 1 CPU cycle left in the accumulator).
-    apu.step(5);
+    apu.step(5, |_| 0);
     assert_eq!(apu.pulse1().sequence(), (s0 + 2) & 7);
     // The remaining 1 CPU cycle completes on the next step's first APU cycle.
-    apu.step(1);
+    apu.step(1, |_| 0);
     assert_eq!(apu.pulse1().sequence(), (s0 + 3) & 7);
 }
 
@@ -328,14 +330,17 @@ fn emulator_apu_state_survives_multiple_frames() {
     let mut emu = EmulatorState::new(cart);
     emu.reset();
     emu.bus_mut().write(0x4015, 0x01);
+    // Set halt flag (bit 5 of $4000) so the length counter doesn't
+    // decrement — the frame counter (M16) now clocks it at half-frame rate.
+    emu.bus_mut().write(0x4000, 0x20);
     emu.bus_mut().write(0x4003, 0x00); // load length 10
     let len0 = emu.bus().apu().pulse1().length_counter();
     assert_eq!(len0, 10);
     for _ in 0..3 {
         emu.step_frame();
     }
-    // Length counter is not clocked (frame counter lands in M16), so it
-    // should still be loaded. The channel remains enabled.
+    // With halt set, the length counter is not clocked. The channel
+    // remains enabled across frames.
     assert_eq!(emu.bus().apu().pulse1().length_counter(), 10);
     assert!(emu.bus().apu().pulse1().enabled());
 }
@@ -446,23 +451,31 @@ fn bus_4015_read_reflects_triangle_and_noise_length_status() {
 }
 
 #[test]
-fn bus_4015_read_preserves_open_bus_upper_bits_with_all_channels() {
+fn bus_4015_read_preserves_open_bus_bit5_with_all_channels() {
     let mut bus = Bus::new();
-    bus.write(0x4015, 0xEF); // bits 5-7 latched; bits 0-3 enable channels
+    bus.write(0x4015, 0xEF); // bit 5 latched; bits 0-3 enable channels
     let r = bus.read(0x4015);
-    assert_eq!(r & 0xE0, 0xE0);
+    assert_eq!(r & 0x20, 0x20); // bit 5 from open bus
+    assert_eq!(r & 0xC0, 0x00); // bits 6,7 = IRQ flags (0)
     assert_eq!(r & 0x1F, 0x00); // no length loaded
 }
 
-// ---- $4010-$4013 remain open bus (DMC, M16) -----------------------------
+// ---- $4010-$4013 DMC register routing (M16) -----------------------------
 
 #[test]
-fn bus_4010_through_4013_remain_open_bus() {
+fn bus_4010_through_4013_route_to_dmc_and_latch_open_bus() {
     let mut bus = Bus::new();
+    // $4010-$4013 route to the DMC channel (M16) AND latch the open bus
+    // (so reads return the last written value, matching real open-bus
+    // behavior for write-only registers).
     bus.write(0x4010, 0x12);
     assert_eq!(bus.read(0x4010), 0x12);
+    // $4010: IL-- RRRR — rate index = 0x02.
+    assert_eq!(bus.apu().dmc().rate_index(), 0x02);
     bus.write(0x4013, 0x34);
     assert_eq!(bus.read(0x4013), 0x34);
+    // $4013: sample length = (0x34 << 4) + 1 = 0x341.
+    assert_eq!(bus.apu().dmc().sample_length(), 0x341);
 }
 
 // ---- Triangle waveform frequency via tick --------------------------------
@@ -670,11 +683,11 @@ fn apu_step_ticks_triangle_and_noise_at_half_cpu_rate() {
     apu.triangle_mut().write_register(2, 0x00);
     apu.triangle_mut().write_register(3, 0x00); // period 0
     let s0 = apu.triangle().sequence();
-    apu.step(2); // one APU cycle → one triangle tick
+    apu.step(2, |_| 0); // one APU cycle → one triangle tick
     assert_eq!(apu.triangle().sequence(), (s0 + 1) & 0x1F);
-    apu.step(1); // not enough for a full APU cycle
+    apu.step(1, |_| 0); // not enough for a full APU cycle
     assert_eq!(apu.triangle().sequence(), (s0 + 1) & 0x1F);
-    apu.step(1); // completes the second APU cycle
+    apu.step(1, |_| 0); // completes the second APU cycle
     assert_eq!(apu.triangle().sequence(), (s0 + 2) & 0x1F);
 }
 
@@ -739,6 +752,11 @@ fn emulator_triangle_and_noise_state_survives_multiple_frames() {
     let mut emu = EmulatorState::new(cart);
     emu.reset();
     emu.bus_mut().write(0x4015, 0x0C);
+    // Set halt flags so length counters don't decrement — the frame
+    // counter (M16) now clocks them at half-frame rate. Triangle halt =
+    // $4008 bit 7; noise halt = $400C bit 5.
+    emu.bus_mut().write(0x4008, 0x80); // triangle halt
+    emu.bus_mut().write(0x400C, 0x20); // noise halt
     emu.bus_mut().write(0x400B, 0x00); // triangle length 10
     emu.bus_mut().write(0x400F, 0x00); // noise length 10
     assert_eq!(emu.bus().apu().triangle().length_counter(), 10);
@@ -746,10 +764,200 @@ fn emulator_triangle_and_noise_state_survives_multiple_frames() {
     for _ in 0..3 {
         emu.step_frame();
     }
-    // Length counters are not clocked (frame counter lands in M16), so
-    // they should still be loaded. The channels remain enabled.
+    // With halt set, the length counters are not clocked. The channels
+    // remain enabled across frames.
     assert_eq!(emu.bus().apu().triangle().length_counter(), 10);
     assert_eq!(emu.bus().apu().noise().length_counter(), 10);
     assert!(emu.bus().apu().triangle().enabled());
     assert!(emu.bus().apu().noise().enabled());
+}
+
+// ===========================================================================
+// DMC channel + frame counter + audio output (M16)
+// ===========================================================================
+
+// ---- $4017 frame counter routing -----------------------------------------
+
+#[test]
+fn bus_4017_write_routes_to_frame_counter() {
+    let mut bus = Bus::new();
+    // $4017 write should latch open bus AND configure the frame counter.
+    bus.write(0x4017, 0xC0); // 5-step mode + IRQ inhibit
+    assert_eq!(bus.read(0x4017), 0xC0); // open-bus latch
+}
+
+#[test]
+fn bus_4015_read_reflects_dmc_bytes_remaining_bit4() {
+    let mut bus = Bus::new();
+    // Configure DMC sample: $4012 = 0x00 (base $C000), $4013 = 0x01 (len 17).
+    bus.write(0x4010, 0x0F); // rate index 15, no IRQ, no loop
+    bus.write(0x4012, 0x00);
+    bus.write(0x4013, 0x01);
+    // Enable DMC via $4015 bit 4.
+    bus.write(0x4015, 0x10);
+    let s = bus.read(0x4015);
+    assert_eq!(s & 0x10, 0x10); // DMC bytes remaining > 0
+}
+
+#[test]
+fn bus_4015_read_clears_irq_flags() {
+    let mut bus = Bus::new();
+    // Enable frame counter IRQ (4-step, no inhibit).
+    bus.write(0x4017, 0x00);
+    // Step the APU past the IRQ threshold (~29830 CPU cycles).
+    bus.step_apu(29833);
+    // The APU should have a pending frame IRQ.
+    assert!(bus.apu_irq_pending());
+    // Reading $4015 should clear the IRQ flags.
+    let s = bus.read(0x4015);
+    assert_eq!(s & 0x40, 0x40); // frame IRQ flag was set
+                                // After read, IRQ should be cleared.
+    assert!(!bus.apu_irq_pending());
+}
+
+// ---- DMC via bus ---------------------------------------------------------
+
+#[test]
+fn bus_dmc_register_writes_route_to_apu() {
+    let mut bus = Bus::new();
+    bus.write(0x4010, 0x8F); // IRQ enable + rate index 15
+    bus.write(0x4011, 0x5A); // direct load
+    bus.write(0x4012, 0x10); // base = $C400
+    bus.write(0x4013, 0x04); // length = 65
+    assert!(bus.apu().dmc().irq_enable());
+    assert_eq!(bus.apu().dmc().rate_index(), 0x0F);
+    assert_eq!(bus.apu().dmc().output_counter(), 0x5A & 0x7F);
+    assert_eq!(bus.apu().dmc().sample_addr_base(), 0xC400);
+    assert_eq!(bus.apu().dmc().sample_length(), 65);
+}
+
+#[test]
+fn bus_dmc_enable_via_4015_restarts_sample() {
+    let mut bus = Bus::new();
+    bus.write(0x4012, 0x00); // base = $C000
+    bus.write(0x4013, 0x01); // length = 17
+    bus.write(0x4015, 0x10); // enable DMC
+    assert_eq!(bus.apu().dmc().sample_address(), 0xC000);
+    assert_eq!(bus.apu().dmc().bytes_remaining(), 17);
+}
+
+#[test]
+fn bus_dmc_disable_via_4015_stops_fetch() {
+    let mut bus = Bus::new();
+    bus.write(0x4013, 0x01);
+    bus.write(0x4015, 0x10); // enable
+    bus.write(0x4015, 0x00); // disable
+    assert_eq!(bus.apu().dmc().bytes_remaining(), 0);
+}
+
+// ---- Frame counter via emulator step_frame --------------------------------
+
+#[test]
+fn emulator_frame_counter_clocks_length_counter() {
+    use nes_emu::cartridge::Cartridge;
+    use nes_emu::emulator::EmulatorState;
+
+    let mut bytes = vec![b'N', b'E', b'S', 0x1A, 1, 0, 0, 0];
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes.resize(16 + 16 * 1024, 0xEA);
+    let reset_off = 16 + 0x3FFC;
+    bytes[reset_off] = 0x00;
+    bytes[reset_off + 1] = 0xC0;
+    let cart = Cartridge::from_bytes(&bytes).expect("build cart");
+
+    let mut emu = EmulatorState::new(cart);
+    emu.reset();
+    // Enable pulse 1 and load length 10 (no halt → will decrement).
+    emu.bus_mut().write(0x4015, 0x01);
+    emu.bus_mut().write(0x4003, 0x00); // length 10
+    let len0 = emu.bus().apu().pulse1().length_counter();
+    assert_eq!(len0, 10);
+    // Step one frame — the frame counter should clock the length counter
+    // at the half-frame rate, decrementing it at least once.
+    emu.step_frame();
+    assert!(
+        emu.bus().apu().pulse1().length_counter() < 10,
+        "length counter should have been clocked by the frame counter"
+    );
+}
+
+// ---- Audio sample generation ----------------------------------------------
+
+#[test]
+fn emulator_produces_audio_samples() {
+    use nes_emu::cartridge::Cartridge;
+    use nes_emu::emulator::EmulatorState;
+
+    let mut bytes = vec![b'N', b'E', b'S', 0x1A, 1, 0, 0, 0];
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes.resize(16 + 16 * 1024, 0xEA);
+    let reset_off = 16 + 0x3FFC;
+    bytes[reset_off] = 0x00;
+    bytes[reset_off + 1] = 0xC0;
+    let cart = Cartridge::from_bytes(&bytes).expect("build cart");
+
+    let mut emu = EmulatorState::new(cart);
+    emu.reset();
+    emu.step_frame();
+    let samples = emu.take_audio_samples();
+    // One NTSC frame ≈ 29830 CPU cycles / 40.585 cycles/sample ≈ 735 samples.
+    assert!(
+        samples.len() > 700 && samples.len() < 800,
+        "expected ~735 audio samples, got {}",
+        samples.len()
+    );
+    // All samples should be in [-1.0, 1.0].
+    for &s in &samples {
+        assert!((-1.0..=1.0).contains(&s), "sample out of range: {s}");
+    }
+}
+
+#[test]
+fn emulator_audio_samples_are_silent_when_all_channels_off() {
+    use nes_emu::cartridge::Cartridge;
+    use nes_emu::emulator::EmulatorState;
+
+    let mut bytes = vec![b'N', b'E', b'S', 0x1A, 1, 0, 0, 0];
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes.resize(16 + 16 * 1024, 0xEA);
+    let reset_off = 16 + 0x3FFC;
+    bytes[reset_off] = 0x00;
+    bytes[reset_off + 1] = 0xC0;
+    let cart = Cartridge::from_bytes(&bytes).expect("build cart");
+
+    let mut emu = EmulatorState::new(cart);
+    emu.reset();
+    // No channels enabled, DMC output = 0. The centered mapping produces
+    // -1.0 for silence (both components at minimum). A DC blocking filter
+    // would remove this offset, but for M16 we accept it — the audio is
+    // continuous so no clicks occur.
+    emu.step_frame();
+    let samples = emu.take_audio_samples();
+    assert!(!samples.is_empty());
+    // All samples should be in [-1.0, 1.0].
+    for &s in &samples {
+        assert!((-1.0..=1.0).contains(&s), "sample out of range: {s}");
+    }
+}
+
+#[test]
+fn emulator_take_audio_samples_drains_buffer() {
+    use nes_emu::cartridge::Cartridge;
+    use nes_emu::emulator::EmulatorState;
+
+    let mut bytes = vec![b'N', b'E', b'S', 0x1A, 1, 0, 0, 0];
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes.resize(16 + 16 * 1024, 0xEA);
+    let reset_off = 16 + 0x3FFC;
+    bytes[reset_off] = 0x00;
+    bytes[reset_off + 1] = 0xC0;
+    let cart = Cartridge::from_bytes(&bytes).expect("build cart");
+
+    let mut emu = EmulatorState::new(cart);
+    emu.reset();
+    emu.step_frame();
+    let first = emu.take_audio_samples();
+    let second = emu.take_audio_samples();
+    assert!(!first.is_empty());
+    assert!(second.is_empty(), "second call should return empty buffer");
 }
