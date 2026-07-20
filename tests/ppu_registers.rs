@@ -569,3 +569,46 @@ fn ppu_new_defaults() {
     assert!(!ppu.in_vblank());
     assert_eq!(ppu.mirroring(), Mirroring::Horizontal);
 }
+
+// =====================================================================
+//  PPUDATA palette reads — open-bus upper 2 bits (M23)
+//
+//  Palette RAM only stores 6 meaningful bits. When reading via PPUDATA
+//  ($2007), the upper 2 bits (6-7) of the value placed on the CPU bus
+//  come from the PPU open-bus latch (the last byte written to any PPU
+//  register). The lower 6 bits are the palette entry.
+//  See: https://www.nesdev.org/wiki/PPU_registers#PPUDATA
+// =====================================================================
+
+#[test]
+fn ppudata_palette_read_upper_bits_from_open_bus() {
+    let mut bus = bus_with_cart();
+    // Write a palette color ($0F) at $3F00.
+    set_vram_addr(&mut bus, 0x3F00);
+    bus.write(0x2007, 0x0F);
+    // Set the VRAM address to $3F00 (PPUADDR writes update the open-bus
+    // latch to the address byte), then overwrite the open-bus latch with
+    // 0xC0 via a PPUMASK write (a non-PPUADDR register so `v` is
+    // untouched). Bits 6-7 of the open bus will appear in the palette read.
+    set_vram_addr(&mut bus, 0x3F00);
+    bus.write(0x2001, 0xC0);
+    let val = bus.read(0x2007);
+    // Palette $3F00 = 0x0F; upper 2 bits from open bus 0xC0 → 0xCF.
+    assert_eq!(
+        val, 0xCF,
+        "palette read ORs open-bus bits 6-7 into upper bits"
+    );
+}
+
+#[test]
+fn ppudata_palette_read_upper_bits_zero_when_open_bus_zero() {
+    let mut bus = bus_with_cart();
+    set_vram_addr(&mut bus, 0x3F00);
+    bus.write(0x2007, 0x21);
+    // Set open bus to a value with bits 6-7 clear (e.g. 0x03 via PPUMASK).
+    set_vram_addr(&mut bus, 0x3F00);
+    bus.write(0x2001, 0x03);
+    let val = bus.read(0x2007);
+    // Palette = 0x21, open bus bits 6-7 = 0 → 0x21.
+    assert_eq!(val, 0x21, "open-bus bits 6-7 clear → raw palette value");
+}

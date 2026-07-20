@@ -50,8 +50,9 @@
 #![allow(dead_code)]
 
 use crate::ppu::{
-    Ppu, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, CTRL_SPRITE_PATTERN_1000, MASK_SHOW_BG,
-    MASK_SHOW_BG_LEFT, MASK_SHOW_SPRITES, MASK_SHOW_SPRITES_LEFT, SCREEN_HEIGHT, SCREEN_WIDTH,
+    Ppu, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, CTRL_SPRITE_PATTERN_1000, CTRL_SPRITE_SIZE_16,
+    MASK_SHOW_BG, MASK_SHOW_BG_LEFT, MASK_SHOW_SPRITES, MASK_SHOW_SPRITES_LEFT, SCREEN_HEIGHT,
+    SCREEN_WIDTH,
 };
 
 /// Nametable tile grid is 32×30 tiles (256×240 pixels).
@@ -81,8 +82,10 @@ const ATTR_VFLIP: u8 = 0b1000_0000;
 const MAX_SPRITES_PER_SCANLINE: usize = 8;
 /// Number of sprites in OAM (64).
 const SPRITE_COUNT: usize = 64;
-/// Sprite height in pixels (8x8 mode; 8x16 lands in M23).
-const SPRITE_HEIGHT: u16 = 8;
+/// Sprite height in 8×8 mode (pixels).
+const SPRITE_HEIGHT_8X8: u16 = 8;
+/// Sprite height in 8×16 mode (pixels).
+const SPRITE_HEIGHT_8X16: u16 = 16;
 /// Sprite width in pixels.
 const SPRITE_WIDTH: u16 = 8;
 /// OAM Y value at or above which a sprite is hidden ($EF-$FE = 239-254).
@@ -345,11 +348,17 @@ impl Ppu {
     /// - Honours PPUMASK bit 4 (show sprites) and bit 2 (show left 8
     ///   pixels of sprites).
     /// - Uses PPUCTRL bit 3 to select the sprite pattern table
-    ///   (`$0000` or `$1000`).
+    ///   (`$0000` or `$1000`) in 8×8 mode. In 8×16 mode (PPUCTRL bit 5
+    ///   set) bit 3 is ignored — the pattern table is selected per
+    ///   sprite by bit 0 of its tile index (even → `$0000`, odd →
+    ///   `$1000`), the top 8 rows fetch tile `index & 0xFE`, and the
+    ///   bottom 8 rows fetch `tile + 1` (`index | 1`). Vertical flip
+    ///   mirrors the entire 16-pixel range.
     /// - A sprite is visible on scanline `s` when its OAM Y byte `y`
-    ///   satisfies `y + 1 <= s <= y + 8` and `y < $EF` (matching the
-    ///   one-scanline delay documented on the NESdev wiki — "subtract 1
-    ///   from the sprite's Y coordinate before writing it here").
+    ///   satisfies `y + 1 <= s <= y + height` (height = 8 or 16) and
+    ///   `y < $EF` (matching the one-scanline delay documented on the
+    ///   NESdev wiki — "subtract 1 from the sprite's Y coordinate
+    ///   before writing it here").
     /// - At most 8 sprites are rendered per scanline (the first 8 in OAM
     ///   order); if a 9th would be in range, the sprite-overflow flag
     ///   (PPUSTATUS bit 5) is set. Sprite evaluation halts when a sprite
@@ -396,8 +405,19 @@ impl Ppu {
         }
         let sprites_left_enabled = (self.ppumask & MASK_SHOW_SPRITES_LEFT) != 0;
 
+        // Sprite size: 8×8 (default) or 8×16 (PPUCTRL bit 5).
+        // See: https://www.nesdev.org/wiki/PPU_OAM#8x16_sprites
+        let sprite_size_16 = (self.ppuctrl & CTRL_SPRITE_SIZE_16) != 0;
+        let sprite_height: u16 = if sprite_size_16 {
+            SPRITE_HEIGHT_8X16
+        } else {
+            SPRITE_HEIGHT_8X8
+        };
+
         // Sprite pattern table base: $0000 or $1000 (PPUCTRL bit 3).
-        let sprite_table: u16 = if (self.ppuctrl & CTRL_SPRITE_PATTERN_1000) != 0 {
+        // In 8×16 mode this bit is ignored — the table is selected per
+        // sprite by bit 0 of the tile index (handled in the pixel loop).
+        let sprite_table_8x8: u16 = if (self.ppuctrl & CTRL_SPRITE_PATTERN_1000) != 0 {
             0x1000
         } else {
             0x0000
@@ -432,10 +452,10 @@ impl Ppu {
                     // $EF-$FE: out of range, but evaluation continues.
                     continue;
                 }
-                // Visible on scanlines (y+1)..=(y+8). With y < 0xEF there
-                // is no u8 wraparound to worry about.
+                // Visible on scanlines (y+1)..=(y+height). With y < 0xEF
+                // there is no u8 wraparound to worry about.
                 let top = y as u16 + 1;
-                if scanline < top || scanline >= top + SPRITE_HEIGHT {
+                if scanline < top || scanline >= top + sprite_height {
                     continue;
                 }
                 if count < MAX_SPRITES_PER_SCANLINE {
@@ -470,10 +490,12 @@ impl Ppu {
                         continue;
                     }
                     let tile_col = (px - sx) as u8;
-                    // Row within the sprite (0..7). scanline - (y+1).
+                    // Row within the sprite (0..height-1). scanline - (y+1).
                     let tile_row = (scanline - (y as u16 + 1)) as u8;
+                    // Vertical flip mirrors the entire sprite height (8 or
+                    // 16), not just the 8-pixel tile half.
                     let row = if (attr & ATTR_VFLIP) != 0 {
-                        7 - tile_row
+                        ((sprite_height - 1) as u8) - tile_row
                     } else {
                         tile_row
                     };
@@ -483,7 +505,31 @@ impl Ppu {
                         tile_col
                     };
 
-                    let pattern_addr = sprite_table | ((tile as u16) << 4) | (row as u16);
+                    // Pattern address computation differs between 8×8 and
+                    // 8×16 modes.
+                    //
+                    // 8×8: table from PPUCTRL bit 3; tile index unchanged.
+                    //
+                    // 8×16: PPUCTRL bit 3 ignored; table from tile bit 0
+                    // (even → $0000, odd → $1000); tile base = tile & 0xFE;
+                    // rows 0-7 fetch tile_base, rows 8-15 fetch tile_base+1.
+                    // See: https://www.nesdev.org/wiki/PPU_OAM#8x16_sprites
+                    let (table, tile_base): (u16, u16) = if sprite_size_16 {
+                        let t = if (tile & 1) != 0 { 0x1000 } else { 0x0000 };
+                        (t, (tile & 0xFE) as u16)
+                    } else {
+                        (sprite_table_8x8, tile as u16)
+                    };
+                    // For 8×16, rows 8-15 come from the next tile
+                    // (tile_base + 1) at row offset (row - 8).
+                    let row_in_tile = if sprite_size_16 { row & 0x07 } else { row };
+                    let tile_for_row = if sprite_size_16 && row >= 8 {
+                        tile_base + 1
+                    } else {
+                        tile_base
+                    };
+
+                    let pattern_addr = table | (tile_for_row << 4) | (row_in_tile as u16);
                     let plane0 = chr_read(pattern_addr);
                     let plane1 = chr_read(pattern_addr | 0x08);
                     let bit = 7 - col;

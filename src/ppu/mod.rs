@@ -62,7 +62,15 @@ const CTRL_INCREMENT_32: u8 = 0b0000_0100;
 /// PPUCTRL bit: background pattern table select (0 = `$0000`, 1 = `$1000`).
 const CTRL_BG_PATTERN_1000: u8 = 0b0001_0000;
 /// PPUCTRL bit: sprite pattern table select (0 = `$0000`, 1 = `$1000`).
+/// Ignored in 8×16 sprite mode (see [`CTRL_SPRITE_SIZE_16`]).
 const CTRL_SPRITE_PATTERN_1000: u8 = 0b0000_1000;
+/// PPUCTRL bit 5: sprite size (0 = 8×8, 1 = 8×16). In 8×16 mode the
+/// pattern table for each sprite is selected by bit 0 of its tile index
+/// (even → `$0000`, odd → `$1000`), and PPUCTRL bit 3 is ignored. The
+/// top 8 rows fetch tile `index & 0xFE`; the bottom 8 rows fetch
+/// `tile + 1` (`index | 1`).
+/// See: https://www.nesdev.org/wiki/PPU_OAM#8x16_sprites
+const CTRL_SPRITE_SIZE_16: u8 = 0b0010_0000;
 /// PPUCTRL bits 0-1: base nametable address (`$2000`/`$2400`/`$2800`/`$2C00`).
 const CTRL_BASE_NT_MASK: u8 = 0b0000_0011;
 /// PPUMASK bit: show background (enable background rendering).
@@ -457,6 +465,14 @@ impl Ppu {
     /// value from CHR or nametable memory).
     pub fn set_ppudata_buffer(&mut self, value: u8) {
         self.ppudata_buffer = value;
+    }
+
+    /// The PPU open-bus latch (the last byte written to any PPU register).
+    /// Palette reads via PPUDATA (`$2007`) return the 6-bit palette value
+    /// in bits 0-5 and the open-bus latch bits 6-7 in the upper two bits.
+    /// See: https://www.nesdev.org/wiki/PPU_registers#PPUDATA
+    pub fn open_bus(&self) -> u8 {
+        self.open_bus
     }
 
     /// Read a nametable byte at `addr` (in `$2000-$3EFF`). Handles the

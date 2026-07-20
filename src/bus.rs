@@ -473,9 +473,13 @@ impl Bus {
             // Palette: the returned value comes from palette RAM directly
             // (bypassing the stale buffer), but the buffer is still loaded
             // with the nametable byte at `v & 0x2FFF` per NESdev. This
-            // matters for a subsequent non-palette read.
+            // matters for a subsequent non-palette read. The upper two bits
+            // of the value placed on the CPU bus come from the PPU open-bus
+            // latch (the last byte written to any PPU register) — palette
+            // RAM only stores 6 meaningful bits.
             // See: https://www.nesdev.org/wiki/PPU_registers#PPUDATA
-            let val = self.ppu.read_palette(addr);
+            let pal = self.ppu.read_palette(addr);
+            let val = (pal & 0x3F) | (self.ppu.open_bus() & 0xC0);
             let nt_addr = addr & 0x2FFF;
             let buffered_fill = if nt_addr < 0x2000 {
                 match &self.cartridge {

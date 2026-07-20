@@ -951,3 +951,273 @@ fn multiple_sprites_on_different_scanlines() {
         "gap between sprites"
     );
 }
+
+// =====================================================================
+//  8×16 sprite mode (M23)
+//
+//  PPUCTRL bit 5 selects 8×16 sprite mode. In this mode:
+//   - PPUCTRL bit 3 (sprite pattern table) is IGNORED.
+//   - The pattern table is selected per sprite by bit 0 of the tile
+//     index: even → $0000, odd → $1000.
+//   - The tile base is `tile & 0xFE`; the top 8 rows fetch tile_base,
+//     the bottom 8 rows fetch tile_base + 1.
+//   - Vertical flip mirrors the entire 16-pixel range.
+//   - A sprite is visible on scanlines (y+1)..=(y+16).
+//
+//  See: https://www.nesdev.org/wiki/PPU_OAM#8x16_sprites
+// =====================================================================
+
+/// Enable 8×16 sprite mode (PPUCTRL bit 5) + sprites + left column.
+fn enable_8x16_sprites(bus: &mut Bus) {
+    // PPUCTRL = bit5 (8x16) ; PPUMASK = show sprites + left.
+    bus.write(0x2000, 0b0010_0000);
+    bus.write(0x2001, 0b0001_0100);
+}
+
+/// A tile whose top half (rows 0-3) is solid and bottom half (rows 4-7)
+/// is transparent. Used to distinguish top-tile from bottom-tile fetch.
+const TOP_HALF_SOLID_P0: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+const TOP_HALF_SOLID_P1: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+
+#[test]
+fn sprite_8x16_height_is_16_scanlines() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // Tile 0 (even → $0000): solid everywhere (top + bottom halves).
+    write_tile(&mut bus, 0x0000, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_sprite(&mut bus, 0, 0, 0x00, 0x00, 0);
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    let black = nes_color_to_argb(0x0E);
+    // OAM Y=0 → visible on scanlines 1..=16.
+    for y in 1..=16 {
+        assert_eq!(px(&bus, 0, y), white, "8x16 sprite visible at y={}", y);
+    }
+    assert_eq!(px(&bus, 0, 17), black, "scanline 17 outside 8x16 sprite");
+    assert_eq!(px(&bus, 0, 0), black, "scanline 0 (Y delay)");
+}
+
+#[test]
+fn sprite_8x16_even_tile_uses_0000_table() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // Tile 0 at $0000: solid. Tile 0 at $1000: blank.
+    write_tile(&mut bus, 0x0000, SOLID_TILE_P0, SOLID_TILE_P1);
+    // (Tile 1 at $0010 is the bottom half of an 8x16 sprite with tile 0.)
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_sprite(&mut bus, 0, 0, 0x00, 0x00, 0); // tile 0 = even → $0000
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    assert_eq!(px(&bus, 0, 1), white, "even tile fetches $0000");
+}
+
+#[test]
+fn sprite_8x16_odd_tile_uses_1000_table() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // Tile 1 at $0000: blank. Tile 1 at $1000: solid.
+    // For an 8x16 sprite with tile=1 (odd): table=$1000, tile_base=0.
+    // Top 8 rows → $1000 | (0<<4) = $1000 (tile 0 at $1000).
+    // Bottom 8 rows → $1000 | (1<<4) = $1010 (tile 1 at $1000).
+    write_tile(&mut bus, 0x1000, SOLID_TILE_P0, SOLID_TILE_P1); // top half
+    write_tile(&mut bus, 0x1010, SOLID_TILE_P0, SOLID_TILE_P1); // bottom half
+                                                                // Leave $0000/$0010 blank so we can confirm the sprite did NOT read there.
+    write_sprite(&mut bus, 0, 0, 0x01, 0x00, 0); // tile 1 = odd → $1000
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    let black = nes_color_to_argb(0x0E);
+    // Top half (scanlines 1-8) and bottom half (9-16) both solid → $1000.
+    assert_eq!(px(&bus, 0, 1), white, "odd tile top half from $1000");
+    assert_eq!(px(&bus, 0, 9), white, "odd tile bottom half from $1000+1");
+    assert_eq!(px(&bus, 0, 0), black, "Y delay");
+}
+
+#[test]
+fn sprite_8x16_ppuctrl_bit3_ignored() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    // PPUCTRL = bit5 (8x16) | bit3 (sprite table $1000). Bit 3 must be
+    // ignored in 8x16 mode; an even tile still reads $0000.
+    bus.write(0x2000, 0b0010_1000);
+    bus.write(0x2001, 0b0001_0100);
+    clear_oam(&mut bus);
+    // Tile 0 at $0000: solid. Tile 0 at $1000: blank.
+    write_tile(&mut bus, 0x0000, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_sprite(&mut bus, 0, 0, 0x00, 0x00, 0); // even → $0000 despite bit3
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    assert_eq!(px(&bus, 0, 1), white, "bit3 ignored; even tile uses $0000");
+}
+
+#[test]
+fn sprite_8x16_top_and_bottom_halves_fetch_different_tiles() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // Tile 0 at $0000 (top half): top 4 rows solid, bottom 4 transparent.
+    write_tile(&mut bus, 0x0000, TOP_HALF_SOLID_P0, TOP_HALF_SOLID_P1);
+    // Tile 1 at $0010 (bottom half): solid everywhere.
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_sprite(&mut bus, 0, 0, 0x00, 0x00, 0); // tile_base=0
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    let black = nes_color_to_argb(0x0E);
+    // Top tile (rows 0-7 → scanlines 1-8): rows 0-3 solid, 4-7 transparent.
+    assert_eq!(px(&bus, 0, 1), white, "top tile row 0 solid");
+    assert_eq!(px(&bus, 0, 4), white, "top tile row 3 solid");
+    assert_eq!(px(&bus, 0, 5), black, "top tile row 4 transparent");
+    assert_eq!(px(&bus, 0, 8), black, "top tile row 7 transparent");
+    // Bottom tile (rows 8-15 → scanlines 9-16): solid everywhere.
+    assert_eq!(px(&bus, 0, 9), white, "bottom tile row 0 solid");
+    assert_eq!(px(&bus, 0, 16), white, "bottom tile row 7 solid");
+}
+
+#[test]
+fn sprite_8x16_vflip_mirrors_full_16px_range() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // Tile 0 at $0000 (top half of sprite): top 4 rows solid, bottom 4 transparent.
+    write_tile(&mut bus, 0x0000, TOP_HALF_SOLID_P0, TOP_HALF_SOLID_P1);
+    // Tile 1 at $0010 (bottom half of sprite): solid everywhere.
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    // vflip → the bottom of the bottom-tile appears at the top of the sprite.
+    write_sprite(&mut bus, 0, 0, 0x00, 0b1000_0000, 0);
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    let black = nes_color_to_argb(0x0E);
+    // Without flip: scanlines 1-4 solid (top tile rows 0-3), 5-8 transparent,
+    // 9-16 solid (bottom tile). With vflip the order reverses over 16px:
+    //   scanline 1 ← original row 15 (bottom tile row 7) → solid
+    //   scanline 8 ← original row 8  (bottom tile row 0) → solid
+    //   scanline 9 ← original row 7  (top tile row 7)    → transparent
+    //   scanline 12 ← original row 4 (top tile row 4)    → transparent
+    //   scanline 13 ← original row 3 (top tile row 3)    → solid
+    //   scanline 16 ← original row 0 (top tile row 0)    → solid
+    assert_eq!(px(&bus, 0, 1), white, "vflip: bottom-tile row 7 at top");
+    assert_eq!(px(&bus, 0, 8), white, "vflip: bottom-tile row 0");
+    assert_eq!(px(&bus, 0, 9), black, "vflip: top-tile row 7 transparent");
+    assert_eq!(px(&bus, 0, 12), black, "vflip: top-tile row 4 transparent");
+    assert_eq!(px(&bus, 0, 13), white, "vflip: top-tile row 3 solid");
+    assert_eq!(px(&bus, 0, 16), white, "vflip: top-tile row 0 at bottom");
+}
+
+#[test]
+fn sprite_8x16_hflip_mirrors_columns() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // Tile 0 at $0000: left half solid, right half transparent.
+    write_tile(&mut bus, 0x0000, HALF_TILE_P0, HALF_TILE_P1);
+    write_tile(&mut bus, 0x0010, HALF_TILE_P0, HALF_TILE_P1);
+    write_sprite(&mut bus, 0, 0, 0x00, 0b0100_0000, 0); // hflip
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    let black = nes_color_to_argb(0x0E);
+    // hflip: cols 0-3 transparent, 4-7 solid (mirrored within the 8px width).
+    for x in 0..4 {
+        assert_eq!(px(&bus, x, 1), black, "hflipped col {} transparent", x);
+    }
+    for x in 4..8 {
+        assert_eq!(px(&bus, x, 1), white, "hflipped col {} solid", x);
+    }
+}
+
+#[test]
+fn sprite_8x16_sprite_zero_hit_triggers() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    // Enable bg + sprites + left columns, 8x16 mode.
+    bus.write(0x2000, 0b0010_0000);
+    bus.write(0x2001, 0b0001_1110);
+    clear_oam(&mut bus);
+    // Background: solid white (nametable tile 1, tile 1 solid).
+    for i in 0..960 {
+        set_vram_addr(&mut bus, 0x2000 + i as u16);
+        bus.write(0x2007, 0x01);
+    }
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    // Sprite 0: solid, at (0,0), 8x16 (tile 0 even → $0000).
+    write_tile(&mut bus, 0x0000, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_sprite(&mut bus, 0, 0, 0x00, 0x00, 0);
+    // Palette: bg $3F03 = white, sprite $3F13 = blue.
+    write_vram(&mut bus, 0x3F00, &[0x0E, 0x00, 0x00, 0x20]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x21]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    assert!(bus.ppu().sprite_zero_hit(), "8x16 sprite 0 hit triggers");
+}
+
+#[test]
+fn sprite_8x16_overflow_still_8_per_scanline() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // 9 sprites all in range on scanline 1 (OAM Y=0, 8x16 → scanlines 1-16).
+    write_tile(&mut bus, 0x0000, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    for i in 0..9 {
+        write_sprite(&mut bus, i, 0, 0x00, 0x00, (i * 8) as u8);
+    }
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    assert!(bus.ppu().sprite_overflow(), "9th 8x16 sprite sets overflow");
+}
+
+#[test]
+fn sprite_8x16_partial_bottom_off_screen() {
+    let mut bus = Bus::with_cartridge(make_cart());
+    enable_8x16_sprites(&mut bus);
+    clear_oam(&mut bus);
+    // OAM Y = 230 → visible on scanlines 231..=246. Only scanlines 231-239
+    // are on-screen (SCREEN_HEIGHT=240); the rest are off-screen.
+    write_tile(&mut bus, 0x0000, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_tile(&mut bus, 0x0010, SOLID_TILE_P0, SOLID_TILE_P1);
+    write_sprite(&mut bus, 0, 230, 0x00, 0x00, 0);
+    write_vram(&mut bus, 0x3F00, &[0x0E]);
+    write_vram(&mut bus, 0x3F11, &[0x00, 0x00, 0x20]);
+    set_scroll(&mut bus, 0, 0);
+    bus.render_frame();
+
+    let white = nes_color_to_argb(0x20);
+    // Scanlines 231-239 should be solid (top 9 rows of the 8x16 sprite).
+    for y in 231..=239 {
+        assert_eq!(px(&bus, 0, y), white, "8x16 visible at y={}", y);
+    }
+}
