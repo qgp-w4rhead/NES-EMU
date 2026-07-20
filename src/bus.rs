@@ -136,6 +136,25 @@ impl Bus {
         &mut self.ppu
     }
 
+    /// Render the background layer into the PPU framebuffer.
+    ///
+    /// Delegates to [`Ppu::render_background`], supplying a CHR-read
+    /// closure that routes pattern-table fetches through the loaded
+    /// cartridge (CHR-ROM or CHR-RAM). With no cartridge loaded, CHR
+    /// reads return 0 (blank pattern table).
+    ///
+    /// This is the M8 entry point for producing a visible frame; the
+    /// video layer (M12) uploads the resulting framebuffer to an SDL2
+    /// texture.
+    pub fn render_background(&mut self) {
+        let ppu = &mut self.ppu;
+        let cart = self.cartridge.as_ref();
+        ppu.render_background(move |addr| match cart {
+            Some(c) => c.read_chr(addr),
+            None => 0,
+        });
+    }
+
     /// Read a byte from the CPU address space.
     ///
     /// Takes `&mut self` because some reads have side effects: PPU

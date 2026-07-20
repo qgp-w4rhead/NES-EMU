@@ -35,7 +35,16 @@
 
 #![allow(dead_code)]
 
+pub mod render;
+
 use crate::mappers::Mirroring;
+
+/// Visible screen width in pixels.
+pub const SCREEN_WIDTH: usize = 256;
+/// Visible screen height in pixels (240 scanlines).
+pub const SCREEN_HEIGHT: usize = 240;
+/// Total framebuffer pixel count.
+pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 /// Size of nametable VRAM (4 KB — enough for 4-screen mirroring; H/V use 2 KB).
 const VRAM_SIZE: usize = 0x1000;
@@ -50,6 +59,14 @@ const PALETTE_SIZE: usize = 32;
 const CTRL_NMI: u8 = 0b1000_0000;
 /// PPUCTRL bit: VRAM address increment by 32 instead of 1.
 const CTRL_INCREMENT_32: u8 = 0b0000_0100;
+/// PPUCTRL bit: background pattern table select (0 = `$0000`, 1 = `$1000`).
+const CTRL_BG_PATTERN_1000: u8 = 0b0001_0000;
+/// PPUCTRL bits 0-1: base nametable address (`$2000`/`$2400`/`$2800`/`$2C00`).
+const CTRL_BASE_NT_MASK: u8 = 0b0000_0011;
+/// PPUMASK bit: show background (enable background rendering).
+const MASK_SHOW_BG: u8 = 0b0000_1000;
+/// PPUMASK bit: show leftmost 8 pixels of background.
+const MASK_SHOW_BG_LEFT: u8 = 0b0000_0010;
 
 /// PPUSTATUS bit: VBlank (bit 7).
 const STATUS_VBLANK: u8 = 0b1000_0000;
@@ -110,6 +127,15 @@ pub struct Ppu {
     /// Palette RAM (32 bytes). `$3F00-$3F1F` with internal mirroring.
     palette: [u8; PALETTE_SIZE],
 
+    // ---- framebuffer (M8: background rendering) ----
+    /// Output framebuffer: 256×240 ARGB pixels (0xAARRGGBB). Heap-allocated
+    /// (240 KB) so the `Ppu` struct stays small enough to construct on the
+    /// stack in tests. Written by the background (and, later, sprite)
+    /// rendering pipeline; the video layer (M12) uploads it to an SDL2
+    /// texture each frame. Allocated once at construction — no allocation
+    /// in the render path.
+    framebuffer: Vec<u32>,
+
     // ---- configuration ----
     /// Nametable mirroring mode, set from the cartridge by the bus.
     mirroring: Mirroring,
@@ -137,6 +163,7 @@ impl Ppu {
             vram: [0u8; VRAM_SIZE],
             oam: [0u8; OAM_SIZE],
             palette: [0u8; PALETTE_SIZE],
+            framebuffer: vec![0u32; FRAMEBUFFER_SIZE],
             mirroring: Mirroring::Horizontal,
         }
     }
@@ -496,6 +523,18 @@ impl Ppu {
     /// Current mirroring mode.
     pub fn mirroring(&self) -> Mirroring {
         self.mirroring
+    }
+    /// Borrow the output framebuffer (256×240 ARGB).
+    pub fn framebuffer(&self) -> &[u32] {
+        &self.framebuffer
+    }
+    /// Mutably borrow the output framebuffer.
+    pub fn framebuffer_mut(&mut self) -> &mut [u32] {
+        &mut self.framebuffer
+    }
+    /// Screen dimensions (width, height) in pixels.
+    pub fn screen_size() -> (usize, usize) {
+        (SCREEN_WIDTH, SCREEN_HEIGHT)
     }
 }
 
