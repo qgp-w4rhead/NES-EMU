@@ -14,6 +14,7 @@
 use super::{Mapper, Mirroring};
 
 /// NROM cartridge state.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Nrom {
     prg_rom: Vec<u8>,
     /// CHR data — ROM when `chr_is_ram` is false, RAM when true.
@@ -103,6 +104,17 @@ impl Mapper for Nrom {
 
     fn has_battery(&self) -> bool {
         self.has_battery
+    }
+
+    fn save_state(&self) -> super::MapperState {
+        super::MapperState::Nrom(self.clone())
+    }
+
+    fn restore_state(&mut self, state: super::MapperState) {
+        match state {
+            super::MapperState::Nrom(n) => *self = n,
+            _ => panic!("Nrom::restore_state: expected Nrom variant, got a different mapper type"),
+        }
     }
 }
 

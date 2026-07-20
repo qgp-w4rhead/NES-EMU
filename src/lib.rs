@@ -15,4 +15,5 @@ pub mod input;
 pub mod joypad;
 pub mod mappers;
 pub mod ppu;
+pub mod save_state;
 pub mod video;

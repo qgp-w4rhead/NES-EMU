@@ -88,6 +88,7 @@ const NOISE_PERIOD_TABLE: [u16; 16] = [
 ///
 /// `pulse2` selects the pulse-2 sweep negate variant, which subtracts one
 /// extra from the target period (a hardware quirk; see APU_Sweep).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct PulseChannel {
     /// `true` for pulse channel 2 (affects sweep negate target).
     pulse2: bool,
@@ -433,6 +434,7 @@ impl PulseChannel {
 ///
 /// See: https://www.nesdev.org/wiki/APU_Triangle
 /// See: https://www.nesdev.org/wiki/APU_Length_Counter
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct TriangleChannel {
     // ---- $4008: linear counter control ---------------------------------
     /// Halt flag — halts both the linear counter and the length counter
@@ -656,6 +658,7 @@ impl TriangleChannel {
 /// See: https://www.nesdev.org/wiki/APU_Noise
 /// See: https://www.nesdev.org/wiki/APU_Envelope
 /// See: https://www.nesdev.org/wiki/APU_Length_Counter
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct NoiseChannel {
     // ---- $400C: envelope / length control ------------------------------
     /// Length-counter halt / envelope loop flag (bit 5 of `$400C`).
@@ -927,6 +930,7 @@ const DMC_RATE_TABLE: [u16; 16] = [
 /// | `$4013`   | `LLLL LLLL`   | Sample length (value << 4 + 1 bytes)         |
 ///
 /// See: https://www.nesdev.org/wiki/APU_DMC
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct DmcChannel {
     // ---- $4010: rate + control ------------------------------------------
     /// IRQ enable (bit 7 of `$4010`). When set, the DMC raises an IRQ when
@@ -1180,6 +1184,7 @@ impl DmcChannel {
 
 /// The APU — owns the two pulse channels, the triangle channel, the noise
 /// channel, the DMC channel, and the frame counter.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Apu {
     pulse1: PulseChannel,
     pulse2: PulseChannel,

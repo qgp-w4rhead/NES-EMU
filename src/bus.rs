@@ -50,7 +50,7 @@ const PPU_REG_BASE: u16 = 0x2000;
 const APU_IO_BASE: u16 = 0x4000;
 
 /// Number of bytes in the APU / I/O register window ($4000-$4017).
-const APU_IO_REG_COUNT: usize = 0x18;
+pub const APU_IO_REG_COUNT: usize = 0x18;
 
 /// First address of cartridge space.
 const CART_BASE: u16 = 0x4020;
@@ -557,6 +557,42 @@ impl Bus {
         let c = self.dma_stall_cycles;
         self.dma_stall_cycles = 0;
         c
+    }
+
+    /// Borrow the internal CPU RAM (2 KB). Used by the save state system
+    /// (M20) to serialise RAM contents.
+    pub fn ram(&self) -> &[u8; RAM_SIZE] {
+        &self.ram
+    }
+
+    /// Mutably borrow the internal CPU RAM (2 KB). Used by the save state
+    /// system (M20) to restore RAM contents.
+    pub fn ram_mut(&mut self) -> &mut [u8; RAM_SIZE] {
+        &mut self.ram
+    }
+
+    /// Borrow the APU / I/O open-bus latch array. Used by the save state
+    /// system (M20) to serialise the open-bus state.
+    pub fn apu_open_bus(&self) -> &[u8; APU_IO_REG_COUNT] {
+        &self.apu_open_bus
+    }
+
+    /// Mutably borrow the APU / I/O open-bus latch array. Used by the save
+    /// state system (M20) to restore the open-bus state.
+    pub fn apu_open_bus_mut(&mut self) -> &mut [u8; APU_IO_REG_COUNT] {
+        &mut self.apu_open_bus
+    }
+
+    /// Set the pending OAM-DMA stall cycle count. Used by the save state
+    /// system (M20) to restore the DMA stall state.
+    pub fn set_dma_stall_cycles(&mut self, cycles: u32) {
+        self.dma_stall_cycles = cycles;
+    }
+
+    /// Current pending OAM-DMA stall cycles (without consuming). Exposed
+    /// for the save state system (M20) to serialise the DMA stall state.
+    pub fn dma_stall_cycles(&self) -> u32 {
+        self.dma_stall_cycles
     }
 
     /// Read from the APU / I/O register file (open-bus latch until M14/M16).

@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 sdl2 = "0.37"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 
 [profile.release]
 opt-level = 3

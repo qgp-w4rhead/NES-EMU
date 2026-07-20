@@ -89,6 +89,31 @@ impl EmulatorState {
         &mut self.bus
     }
 
+    /// Current audio sample accumulator (fractional CPU cycles toward the
+    /// next audio sample). Exposed for the save state system (M20).
+    pub fn sample_accumulator(&self) -> f32 {
+        self.sample_accumulator
+    }
+
+    /// Set the audio sample accumulator. Used by the save state system
+    /// (M20) to restore the accumulator.
+    pub fn set_sample_accumulator(&mut self, acc: f32) {
+        self.sample_accumulator = acc;
+    }
+
+    /// Borrow the current audio sample buffer (samples produced during the
+    /// current frame, not yet drained). Exposed for the save state system
+    /// (M20).
+    pub fn audio_buffer(&self) -> &[f32] {
+        &self.audio_buffer
+    }
+
+    /// Replace the audio sample buffer. Used by the save state system
+    /// (M20) to restore the buffer contents.
+    pub fn set_audio_buffer(&mut self, buffer: Vec<f32>) {
+        self.audio_buffer = buffer;
+    }
+
     /// Borrow the current framebuffer (256×240 ARGB). The video layer
     /// uploads this to an SDL2 texture each frame.
     pub fn framebuffer(&self) -> &[u32] {

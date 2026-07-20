@@ -68,6 +68,7 @@ pub mod flags {
 }
 
 /// The 6502 CPU.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Cpu {
     /// Accumulator.
     pub a: u8,

@@ -128,11 +128,27 @@ const NT_H_BIT: u16 = 0b0000_0100_0000_0000;
 /// Bit 1 of the nametable select (vertical wrap).
 const NT_V_BIT: u16 = 0b0000_1000_0000_0000;
 
+/// Default value for the `framebuffer` field when deserializing a save
+/// state (the framebuffer is skipped during serialization — it is derived
+/// data, recomputed on the next render). Re-allocates it to the full
+/// `256×240` size so the render path can index into it without panicking.
+fn default_framebuffer() -> Vec<u32> {
+    vec![0u32; FRAMEBUFFER_SIZE]
+}
+
+/// Default value for the `bg_pattern` field when deserializing a save
+/// state (skipped during serialization — derived data). Re-allocates it to
+/// the full `256×240` size so the sprite render path can index into it.
+fn default_bg_pattern() -> Vec<u8> {
+    vec![0u8; FRAMEBUFFER_SIZE]
+}
+
 /// The Picture Processing Unit.
 ///
 /// Owns nametable VRAM, OAM, and palette RAM. CHR pattern data (`$0000-$1FFF`)
 /// is owned by the cartridge and accessed through the bus — the PPU never
 /// touches CHR directly.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Ppu {
     // ---- writable registers (write-only; reads return open bus) ----
     ppuctrl: u8,
@@ -170,8 +186,10 @@ pub struct Ppu {
     // ---- memory ----
     /// Nametable VRAM (4 KB). For horizontal/vertical mirroring only 2 KB
     /// is meaningful; the mapping is computed by [`Ppu::map_nametable`].
+    #[serde(with = "crate::save_state::array_ser")]
     vram: [u8; VRAM_SIZE],
     /// Object Attribute Memory — 64 sprites × 4 bytes.
+    #[serde(with = "crate::save_state::array_ser")]
     oam: [u8; OAM_SIZE],
     /// Palette RAM (32 bytes). `$3F00-$3F1F` with internal mirroring.
     palette: [u8; PALETTE_SIZE],
@@ -183,6 +201,10 @@ pub struct Ppu {
     /// rendering pipeline; the video layer (M12) uploads it to an SDL2
     /// texture each frame. Allocated once at construction — no allocation
     /// in the render path.
+    ///
+    /// Skipped during serialization: it is derived data, recomputed on the
+    /// next `render_frame` call after a state restore.
+    #[serde(skip, default = "default_framebuffer")]
     framebuffer: Vec<u32>,
 
     // ---- background pattern buffer (M9: sprite priority) ----
@@ -191,6 +213,10 @@ pub struct Ppu {
     /// sprite priority: a "behind background" sprite only shows where
     /// the background is transparent (pattern 0). Heap-allocated
     /// (61 KB), filled by [`Ppu::render_background`].
+    ///
+    /// Skipped during serialization: it is derived data, recomputed on the
+    /// next `render_frame` call after a state restore.
+    #[serde(skip, default = "default_bg_pattern")]
     bg_pattern: Vec<u8>,
 
     // ---- scanline / cycle timing (M10) ----

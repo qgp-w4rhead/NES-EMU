@@ -20,6 +20,7 @@ const PRG_BANK_SIZE: usize = 16 * 1024;
 const CHR_BANK_SIZE: usize = 8 * 1024;
 
 /// CNROM cartridge state.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Cnrom {
     prg_rom: Vec<u8>,
     /// CHR data — ROM when `chr_is_ram` is false, RAM when true.
@@ -124,6 +125,19 @@ impl Mapper for Cnrom {
 
     fn has_battery(&self) -> bool {
         self.has_battery
+    }
+
+    fn save_state(&self) -> super::MapperState {
+        super::MapperState::Cnrom(self.clone())
+    }
+
+    fn restore_state(&mut self, state: super::MapperState) {
+        match state {
+            super::MapperState::Cnrom(m) => *self = m,
+            _ => {
+                panic!("Cnrom::restore_state: expected Cnrom variant, got a different mapper type")
+            }
+        }
     }
 }
 

@@ -66,7 +66,7 @@ impl From<std::io::Error> for CartridgeError {
 }
 
 /// Parsed iNES header fields relevant to emulation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InesHeader {
     /// Number of 16 KB PRG-ROM banks.
     pub prg_rom_banks: u8,
@@ -223,6 +223,29 @@ impl Cartridge {
     /// the PPU A12 line rises during rendering.
     pub fn clock_irq(&mut self) {
         self.mapper.clock_irq();
+    }
+
+    /// Capture the mapper's full internal state as a [`MapperState`]
+    /// snapshot. Used by the save state system (M20).
+    pub fn save_mapper_state(&self) -> crate::mappers::MapperState {
+        self.mapper.save_state()
+    }
+
+    /// Restore the mapper's full internal state from a [`MapperState`]
+    /// snapshot. Used by the save state system (M20).
+    pub fn restore_mapper_state(&mut self, state: crate::mappers::MapperState) {
+        self.mapper.restore_state(state);
+    }
+
+    /// Reconstruct a cartridge from a saved header and mapper state. Used
+    /// by the save state system (M20) to restore a cartridge that was
+    /// serialised via [`Cartridge::save_mapper_state`].
+    pub fn from_header_and_mapper(
+        header: InesHeader,
+        mapper_state: crate::mappers::MapperState,
+    ) -> Self {
+        let mapper = crate::mappers::MapperState::into_boxed_mapper(mapper_state);
+        Self { header, mapper }
     }
 }
 

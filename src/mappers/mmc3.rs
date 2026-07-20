@@ -49,6 +49,7 @@ const CHR_2K_SIZE: usize = 2 * 1024;
 const PRG_RAM_SIZE: usize = 8 * 1024;
 
 /// MMC3 cartridge state.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Mmc3 {
     prg_rom: Vec<u8>,
     /// CHR data — ROM when `chr_is_ram` is false, RAM when true.
@@ -334,6 +335,17 @@ impl Mapper for Mmc3 {
             }
         } else {
             self.irq_counter -= 1;
+        }
+    }
+
+    fn save_state(&self) -> super::MapperState {
+        super::MapperState::Mmc3(self.clone())
+    }
+
+    fn restore_state(&mut self, state: super::MapperState) {
+        match state {
+            super::MapperState::Mmc3(m) => *self = m,
+            _ => panic!("Mmc3::restore_state: expected Mmc3 variant, got a different mapper type"),
         }
     }
 }

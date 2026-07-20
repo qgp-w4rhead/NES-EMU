@@ -44,6 +44,7 @@ const PRG_RAM_SIZE: usize = 8 * 1024;
 const CONTROL_PRG_MODE_3: u8 = 0b01100;
 
 /// MMC1 cartridge state.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Mmc1 {
     prg_rom: Vec<u8>,
     /// CHR data — ROM when `chr_is_ram` is false, RAM when true.
@@ -291,6 +292,17 @@ impl Mapper for Mmc1 {
 
     fn has_battery(&self) -> bool {
         self.has_battery
+    }
+
+    fn save_state(&self) -> super::MapperState {
+        super::MapperState::Mmc1(self.clone())
+    }
+
+    fn restore_state(&mut self, state: super::MapperState) {
+        match state {
+            super::MapperState::Mmc1(m) => *self = m,
+            _ => panic!("Mmc1::restore_state: expected Mmc1 variant, got a different mapper type"),
+        }
     }
 }
 

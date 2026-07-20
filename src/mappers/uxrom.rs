@@ -24,6 +24,7 @@ const PRG_BANK_SIZE: usize = 16 * 1024;
 const CHR_SIZE: usize = 8 * 1024;
 
 /// UxROM cartridge state.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Uxrom {
     prg_rom: Vec<u8>,
     /// CHR data — ROM when `chr_is_ram` is false, RAM when true.
@@ -125,6 +126,19 @@ impl Mapper for Uxrom {
 
     fn has_battery(&self) -> bool {
         self.has_battery
+    }
+
+    fn save_state(&self) -> super::MapperState {
+        super::MapperState::Uxrom(self.clone())
+    }
+
+    fn restore_state(&mut self, state: super::MapperState) {
+        match state {
+            super::MapperState::Uxrom(m) => *self = m,
+            _ => {
+                panic!("Uxrom::restore_state: expected Uxrom variant, got a different mapper type")
+            }
+        }
     }
 }
 

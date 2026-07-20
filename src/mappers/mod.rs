@@ -25,10 +25,51 @@ pub mod uxrom;
 
 use crate::cartridge::CartridgeError;
 
+/// Serialised snapshot of a mapper's full internal state, used by the save
+/// state system (M20). Each variant holds a complete mapper struct (PRG-ROM,
+/// CHR, bank registers, PRG-RAM, IRQ state, etc.). The variant discriminant
+/// records which mapper type produced the snapshot so that
+/// [`Mapper::restore_state`] can downcast correctly.
+///
+/// All variants derive `Serialize`/`Deserialize` via the per-mapper struct
+/// derives; the enum itself derives them too so the entire snapshot can be
+/// serialised with `bincode` as part of a `SaveState`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum MapperState {
+    /// Mapper 0 — NROM.
+    Nrom(nrom::Nrom),
+    /// Mapper 1 — MMC1.
+    Mmc1(mmc1::Mmc1),
+    /// Mapper 2 — UxROM.
+    Uxrom(uxrom::Uxrom),
+    /// Mapper 3 — CNROM.
+    Cnrom(cnrom::Cnrom),
+    /// Mapper 4 — MMC3.
+    Mmc3(mmc3::Mmc3),
+    /// Mapper 7 — AxROM.
+    Axrom(axrom::Axrom),
+}
+
+impl MapperState {
+    /// Convert a [`MapperState`] snapshot back into a boxed `dyn Mapper`,
+    /// used by the save state system (M20) to reconstruct a cartridge from
+    /// a serialised snapshot.
+    pub fn into_boxed_mapper(self) -> Box<dyn Mapper> {
+        match self {
+            MapperState::Nrom(m) => Box::new(m),
+            MapperState::Mmc1(m) => Box::new(m),
+            MapperState::Uxrom(m) => Box::new(m),
+            MapperState::Cnrom(m) => Box::new(m),
+            MapperState::Mmc3(m) => Box::new(m),
+            MapperState::Axrom(m) => Box::new(m),
+        }
+    }
+}
+
 /// Nametable mirroring mode configured by the cartridge.
 ///
 /// See: https://www.nesdev.org/wiki/Mirroring
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mirroring {
     /// Horizontal mirroring — NT0/NT1 share the top half, NT2/NT3 the bottom.
     Horizontal,
@@ -87,6 +128,21 @@ pub trait Mapper: Send {
     /// scanline). Used by MMC3 and similar mappers for raster-effect IRQs.
     /// Default is a no-op.
     fn clock_irq(&mut self) {}
+
+    /// Capture the mapper's full internal state as a [`MapperState`]
+    /// snapshot. Used by the save state system (M20) to serialise the
+    /// cartridge. Every mapper must implement this.
+    fn save_state(&self) -> MapperState;
+
+    /// Restore the mapper's full internal state from a [`MapperState`]
+    /// snapshot. Used by the save state system (M20) to deserialise the
+    /// cartridge. Every mapper must implement this.
+    ///
+    /// Implementations should match the `MapperState` variant to `self`'s
+    /// type and copy/clone the snapshot's fields into `self`. A variant
+    /// mismatch is a programming error (the save state was produced by a
+    /// different mapper type) and should panic.
+    fn restore_state(&mut self, state: MapperState);
 }
 
 /// Construct the appropriate mapper for an iNES mapper number.

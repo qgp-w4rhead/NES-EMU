@@ -33,6 +33,7 @@ const PRG_BANK_SIZE: usize = 32 * 1024;
 const CHR_SIZE: usize = 8 * 1024;
 
 /// AxROM cartridge state.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Axrom {
     prg_rom: Vec<u8>,
     /// CHR data — ROM when `chr_is_ram` is false, RAM when true.
@@ -127,6 +128,19 @@ impl Mapper for Axrom {
 
     fn has_battery(&self) -> bool {
         self.has_battery
+    }
+
+    fn save_state(&self) -> super::MapperState {
+        super::MapperState::Axrom(self.clone())
+    }
+
+    fn restore_state(&mut self, state: super::MapperState) {
+        match state {
+            super::MapperState::Axrom(m) => *self = m,
+            _ => {
+                panic!("Axrom::restore_state: expected Axrom variant, got a different mapper type")
+            }
+        }
     }
 }
 

@@ -80,10 +80,12 @@ const ALL_BUTTONS: u8 = 0xFF;
 /// [`Joypad::set_button`] calls.
 ///
 /// See: https://www.nesdev.org/wiki/Controller_port
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Joypad {
     /// Live button state for each controller, one bit per button using the
     /// [`button`] module bit layout. Updated by the host input layer via
     /// [`Joypad::set_button`].
+    #[serde(skip)]
     current: [u8; CONTROLLER_COUNT],
 
     /// Current strobe line state (bit 0 of the last write to `$4016`).
