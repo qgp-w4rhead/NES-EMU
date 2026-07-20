@@ -89,6 +89,32 @@ impl EmulatorState {
         &mut self.bus
     }
 
+    /// Whether the loaded cartridge has battery-backed PRG-RAM. Used by the
+    /// battery-SRAM persistence layer (M21) to decide whether to load/save a
+    /// `.nessram` file alongside the ROM.
+    pub fn has_battery(&self) -> bool {
+        self.bus
+            .cartridge()
+            .map(|c| c.has_battery())
+            .unwrap_or(false)
+    }
+
+    /// Return the current contents of battery-backed PRG-RAM, or `None` if
+    /// the cartridge has no battery-backed SRAM. Used by the battery-SRAM
+    /// persistence layer (M21) to dump PRG-RAM to a `.nessram` file on exit.
+    pub fn battery_sram(&self) -> Option<Vec<u8>> {
+        self.bus.cartridge().and_then(|c| c.battery_sram())
+    }
+
+    /// Load battery-backed PRG-RAM contents from a previously-saved
+    /// `.nessram` file. Called on boot when a `.nessram` file exists
+    /// alongside the ROM. Non-battery cartridges silently ignore the call.
+    pub fn load_battery_sram(&mut self, data: &[u8]) {
+        if let Some(cart) = self.bus.cartridge_mut() {
+            cart.load_battery_sram(data);
+        }
+    }
+
     /// Current audio sample accumulator (fractional CPU cycles toward the
     /// next audio sample). Exposed for the save state system (M20).
     pub fn sample_accumulator(&self) -> f32 {

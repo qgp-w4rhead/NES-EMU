@@ -15,6 +15,7 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
 use nes_emu::audio::AudioOutput;
+use nes_emu::battery;
 use nes_emu::cartridge::Cartridge;
 use nes_emu::emulator::EmulatorState;
 use nes_emu::input::handle_key;
@@ -68,6 +69,22 @@ fn run() -> Result<(), String> {
     let cartridge = Cartridge::from_path(&rom_path)
         .map_err(|e| format!("failed to load ROM '{rom_path}': {e}"))?;
 
+    // Battery-backed PRG-RAM persistence (M21): if the cartridge advertises
+    // battery-backed SRAM and a `.nessram` sidecar file exists next to the
+    // ROM, load its contents into the cartridge's PRG-RAM before booting.
+    // A missing sidecar is not an error — the game simply starts with
+    // zeroed PRG-RAM (first run). Load errors are reported but non-fatal:
+    // the game still boots with empty SRAM so the user is not blocked.
+    let rom_path_ref = std::path::Path::new(&rom_path);
+    let mut cartridge = cartridge;
+    if cartridge.has_battery() {
+        match battery::load_for_rom(rom_path_ref) {
+            Ok(Some(data)) => cartridge.load_battery_sram(&data),
+            Ok(None) => {}
+            Err(e) => eprintln!("nes-emu: warning: could not read battery SRAM: {e}"),
+        }
+    }
+
     let mut emulator = EmulatorState::new(cartridge);
     emulator.reset();
 
@@ -116,6 +133,18 @@ fn run() -> Result<(), String> {
             // audio device is slow), drop the samples rather than blocking
             // the emulation loop.
             let _ = audio.push_samples(&samples);
+        }
+    }
+
+    // Battery-backed PRG-RAM persistence (M21): on exit, dump the
+    // cartridge's PRG-RAM to the `.nessram` sidecar file next to the ROM so
+    // the game's save data survives. Save errors are reported but non-fatal
+    // — the emulator is already shutting down.
+    if emulator.has_battery() {
+        if let Some(sram) = emulator.battery_sram() {
+            if let Err(e) = battery::save_for_rom(rom_path_ref, &sram) {
+                eprintln!("nes-emu: warning: could not save battery SRAM: {e}");
+            }
         }
     }
 

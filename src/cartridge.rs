@@ -213,6 +213,20 @@ impl Cartridge {
         self.mapper.has_battery()
     }
 
+    /// Return the current contents of battery-backed PRG-RAM, or `None` if
+    /// this cartridge has no battery-backed SRAM. Used by the battery-SRAM
+    /// persistence layer (M21) to dump PRG-RAM to a `.nessram` file on exit.
+    pub fn battery_sram(&self) -> Option<Vec<u8>> {
+        self.mapper.battery_sram()
+    }
+
+    /// Load battery-backed PRG-RAM contents from a previously-saved
+    /// `.nessram` file. Called on boot when a `.nessram` file exists
+    /// alongside the ROM. Non-battery cartridges silently ignore the call.
+    pub fn load_battery_sram(&mut self, data: &[u8]) {
+        self.mapper.load_battery_sram(data);
+    }
+
     /// Whether the mapper is currently asserting a CPU IRQ. The emulator
     /// main loop polls this to raise `Cpu::irq_pending`.
     pub fn irq_pending(&self) -> bool {

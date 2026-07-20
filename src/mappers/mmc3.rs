@@ -312,6 +312,22 @@ impl Mapper for Mmc3 {
         self.has_battery
     }
 
+    fn battery_sram(&self) -> Option<Vec<u8>> {
+        if self.has_battery {
+            Some(self.prg_ram.clone())
+        } else {
+            None
+        }
+    }
+
+    fn load_battery_sram(&mut self, data: &[u8]) {
+        if !self.has_battery {
+            return;
+        }
+        let len = self.prg_ram.len().min(data.len());
+        self.prg_ram[..len].copy_from_slice(&data[..len]);
+    }
+
     fn irq_pending(&self) -> bool {
         self.irq_pending
     }

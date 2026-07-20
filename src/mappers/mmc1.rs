@@ -294,6 +294,22 @@ impl Mapper for Mmc1 {
         self.has_battery
     }
 
+    fn battery_sram(&self) -> Option<Vec<u8>> {
+        if self.has_battery {
+            Some(self.prg_ram.clone())
+        } else {
+            None
+        }
+    }
+
+    fn load_battery_sram(&mut self, data: &[u8]) {
+        if !self.has_battery {
+            return;
+        }
+        let len = self.prg_ram.len().min(data.len());
+        self.prg_ram[..len].copy_from_slice(&data[..len]);
+    }
+
     fn save_state(&self) -> super::MapperState {
         super::MapperState::Mmc1(self.clone())
     }

@@ -129,6 +129,31 @@ pub trait Mapper: Send {
     /// Default is a no-op.
     fn clock_irq(&mut self) {}
 
+    /// Return the current contents of battery-backed PRG-RAM (`$6000-$7FFF`),
+    /// or `None` if this cartridge has no battery-backed SRAM.
+    ///
+    /// Used by the battery-SRAM persistence layer (M21) to dump PRG-RAM to a
+    /// `.nessram` file on exit. Only mappers that both *have* PRG-RAM and
+    /// *are* battery-backed (per the iNES header's battery flag) should
+    /// return `Some`. The default implementation returns `None`.
+    ///
+    /// See: https://www.nesdev.org/wiki/INES#Flags_6
+    fn battery_sram(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Load battery-backed PRG-RAM contents from a previously-saved
+    /// `.nessram` file. Called on boot when a `.nessram` file exists
+    /// alongside the ROM.
+    ///
+    /// Implementations should copy `data` into their PRG-RAM buffer, handling
+    /// length mismatches gracefully (truncating or zero-padding to the
+    /// mapper's PRG-RAM size). The default implementation is a no-op
+    /// (non-battery mappers ignore the call).
+    ///
+    /// See: https://www.nesdev.org/wiki/INES#Flags_6
+    fn load_battery_sram(&mut self, _data: &[u8]) {}
+
     /// Capture the mapper's full internal state as a [`MapperState`]
     /// snapshot. Used by the save state system (M20) to serialise the
     /// cartridge. Every mapper must implement this.
