@@ -15,12 +15,12 @@ pub const NES_BUTTON_NAMES: [&str; 8] =
     ["A", "B", "Select", "Start", "Up", "Down", "Left", "Right"];
 
 /// Default keyboard bindings for controller 1 — WASD for the D-pad,
-/// `K`/`L` for the right-hand action buttons, and `U`/`Y` for Select/Start.
+/// `L`/`K` for the right-hand action buttons, and `H`/`G` for Select/Start.
 const DEFAULT_KB1: [(&str, &str); 8] = [
-    ("A", "K"),
-    ("B", "L"),
-    ("Select", "U"),
-    ("Start", "Y"),
+    ("A", "L"),
+    ("B", "K"),
+    ("Select", "H"),
+    ("Start", "G"),
     ("Up", "W"),
     ("Down", "S"),
     ("Left", "A"),
@@ -469,12 +469,12 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.keycode_for(0, button::A),
-            Some(Keycode::K),
-            "default A should be K"
+            Some(Keycode::L),
+            "default A should be L"
         );
-        assert_eq!(c.keycode_for(0, button::B), Some(Keycode::L));
-        assert_eq!(c.keycode_for(0, button::SELECT), Some(Keycode::U));
-        assert_eq!(c.keycode_for(0, button::START), Some(Keycode::Y));
+        assert_eq!(c.keycode_for(0, button::B), Some(Keycode::K));
+        assert_eq!(c.keycode_for(0, button::SELECT), Some(Keycode::H));
+        assert_eq!(c.keycode_for(0, button::START), Some(Keycode::G));
         assert_eq!(c.keycode_for(0, button::UP), Some(Keycode::W));
         assert_eq!(c.keycode_for(0, button::DOWN), Some(Keycode::S));
         assert_eq!(c.keycode_for(0, button::LEFT), Some(Keycode::A));
@@ -578,8 +578,8 @@ mod tests {
         let c = Config::default();
         let text = c.to_toml().expect("serialize");
         let parsed = Config::from_toml(&text).expect("parse");
-        assert_eq!(parsed.keycode_for(0, button::A), Some(Keycode::K));
-        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::Y));
+        assert_eq!(parsed.keycode_for(0, button::A), Some(Keycode::L));
+        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::G));
         assert_eq!(parsed.gamepad_button_for(button::A), Some(Button::A));
         assert_eq!(parsed.gamepad_button_for(button::UP), Some(Button::DPadUp));
         assert_eq!(parsed.audio_volume, 1.0);
@@ -613,7 +613,7 @@ mod tests {
             Some(Button::LeftShoulder)
         );
         // Untouched bindings remain.
-        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::Y));
+        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::G));
     }
 
     #[test]
@@ -659,7 +659,7 @@ A = "Return"
         // Make sure it really doesn't exist.
         let _ = std::fs::remove_file(&path);
         let c = Config::load_from_path(&path).expect("missing file is not an error");
-        assert_eq!(c.keycode_for(0, button::A), Some(Keycode::K));
+        assert_eq!(c.keycode_for(0, button::A), Some(Keycode::L));
     }
 
     #[test]
@@ -678,7 +678,7 @@ A = "Return"
 
         let loaded = Config::load_from_path(&path).expect("load");
         assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::Return));
-        assert_eq!(loaded.keycode_for(0, button::B), Some(Keycode::L));
+        assert_eq!(loaded.keycode_for(0, button::B), Some(Keycode::K));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -702,7 +702,7 @@ A = "Return"
 
         // The written file parses back to defaults.
         let loaded = Config::load_from_path(&path).expect("load");
-        assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::K));
+        assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::L));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

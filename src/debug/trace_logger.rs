@@ -104,6 +104,11 @@ impl TraceLogger {
         if self.enabled {
             self.stop();
         }
+        if let Some(parent) = path.as_ref().parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let file = File::create(path.as_ref())?;
         let mut writer = BufWriter::new(file);
         // Header line so the file is self-describing.
@@ -316,6 +321,11 @@ impl RingTraceLogger {
     /// if the file cannot be created. The logger remains enabled after
     /// dumping so buffering continues for the next dump.
     pub fn dump<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<usize> {
+        if let Some(parent) = path.as_ref().parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let file = File::create(path.as_ref())?;
         let mut writer = BufWriter::new(file);
         writeln!(

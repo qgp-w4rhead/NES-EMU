@@ -24,10 +24,10 @@ use crate::joypad::{button, Joypad};
 /// New code should prefer [`InputMapper`] built from a [`Config`].
 pub fn keycode_to_button1(key: Keycode) -> Option<u8> {
     let btn = match key {
-        Keycode::K => button::A,
-        Keycode::L => button::B,
-        Keycode::U => button::SELECT,
-        Keycode::Y => button::START,
+        Keycode::L => button::A,
+        Keycode::K => button::B,
+        Keycode::H => button::SELECT,
+        Keycode::G => button::START,
         Keycode::W => button::UP,
         Keycode::S => button::DOWN,
         Keycode::A => button::LEFT,
@@ -213,10 +213,10 @@ mod tests {
 
     #[test]
     fn bound_keys_map_to_correct_buttons() {
-        assert_eq!(keycode_to_button1(Keycode::K), Some(button::A));
-        assert_eq!(keycode_to_button1(Keycode::L), Some(button::B));
-        assert_eq!(keycode_to_button1(Keycode::U), Some(button::SELECT));
-        assert_eq!(keycode_to_button1(Keycode::Y), Some(button::START));
+        assert_eq!(keycode_to_button1(Keycode::L), Some(button::A));
+        assert_eq!(keycode_to_button1(Keycode::K), Some(button::B));
+        assert_eq!(keycode_to_button1(Keycode::H), Some(button::SELECT));
+        assert_eq!(keycode_to_button1(Keycode::G), Some(button::START));
         assert_eq!(keycode_to_button1(Keycode::W), Some(button::UP));
         assert_eq!(keycode_to_button1(Keycode::S), Some(button::DOWN));
         assert_eq!(keycode_to_button1(Keycode::A), Some(button::LEFT));
@@ -235,15 +235,15 @@ mod tests {
     #[test]
     fn handle_key_press_sets_button() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::K, true);
+        handle_key(&mut j, Keycode::L, true);
         assert_eq!(j.current(0), 1 << button::A);
     }
 
     #[test]
     fn handle_key_release_clears_button() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::K, true);
-        handle_key(&mut j, Keycode::K, false);
+        handle_key(&mut j, Keycode::L, true);
+        handle_key(&mut j, Keycode::L, false);
         assert_eq!(j.current(0), 0);
     }
 
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn handle_key_only_affects_controller1() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::K, true);
+        handle_key(&mut j, Keycode::L, true);
         assert_eq!(j.current(0), 1 << button::A);
         assert_eq!(j.current(1), 0);
     }
@@ -265,9 +265,9 @@ mod tests {
     #[test]
     fn multiple_keys_press_multiple_buttons() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::K, true); // A
+        handle_key(&mut j, Keycode::L, true); // A
         handle_key(&mut j, Keycode::W, true); // Up
-        handle_key(&mut j, Keycode::Y, true); // Start
+        handle_key(&mut j, Keycode::G, true); // Start
         assert_eq!(
             j.current(0),
             (1 << button::A) | (1 << button::UP) | (1 << button::START)
@@ -279,10 +279,10 @@ mod tests {
     #[test]
     fn default_mapper_matches_legacy_bindings() {
         let m = InputMapper::default();
-        assert_eq!(m.keyboard_binding(Keycode::K), Some((0, button::A)));
-        assert_eq!(m.keyboard_binding(Keycode::L), Some((0, button::B)));
-        assert_eq!(m.keyboard_binding(Keycode::U), Some((0, button::SELECT)));
-        assert_eq!(m.keyboard_binding(Keycode::Y), Some((0, button::START)));
+        assert_eq!(m.keyboard_binding(Keycode::L), Some((0, button::A)));
+        assert_eq!(m.keyboard_binding(Keycode::K), Some((0, button::B)));
+        assert_eq!(m.keyboard_binding(Keycode::H), Some((0, button::SELECT)));
+        assert_eq!(m.keyboard_binding(Keycode::G), Some((0, button::START)));
         assert_eq!(m.keyboard_binding(Keycode::W), Some((0, button::UP)));
         assert_eq!(m.keyboard_binding(Keycode::S), Some((0, button::DOWN)));
         assert_eq!(m.keyboard_binding(Keycode::A), Some((0, button::LEFT)));
@@ -309,9 +309,9 @@ mod tests {
     fn mapper_handle_key_sets_button() {
         let mut m = InputMapper::default();
         let mut j = Joypad::new();
-        m.handle_key(&mut j, Keycode::K, true);
+        m.handle_key(&mut j, Keycode::L, true);
         assert_eq!(j.current(0), 1 << button::A);
-        m.handle_key(&mut j, Keycode::K, false);
+        m.handle_key(&mut j, Keycode::L, false);
         assert_eq!(j.current(0), 0);
     }
 
@@ -327,15 +327,15 @@ mod tests {
     #[test]
     fn custom_kb1_binding_respected() {
         let mut c = Config::default();
-        // Remap A from K to Return.
+        // Remap A from L to Return.
         c.keys
             .controller1
             .insert("A".to_string(), "Return".to_string());
         let mut m = InputMapper::from_config(&c);
 
         let mut j = Joypad::new();
-        // K is no longer bound.
-        m.handle_key(&mut j, Keycode::K, true);
+        // L is no longer bound.
+        m.handle_key(&mut j, Keycode::L, true);
         assert_eq!(j.current(0), 0);
         // Return is now A.
         m.handle_key(&mut j, Keycode::Return, true);
@@ -397,13 +397,13 @@ mod tests {
 
     #[test]
     fn keyboard_and_gamepad_work_simultaneously() {
-        // Both keyboard K and gamepad A map to NES A on controller 1.
+        // Both keyboard L and gamepad A map to NES A on controller 1.
         // Pressing either sets the button; the joypad ORs them.
         let mut m = InputMapper::default();
         let mut j = Joypad::new();
 
         // Press keyboard A.
-        m.handle_key(&mut j, Keycode::K, true);
+        m.handle_key(&mut j, Keycode::L, true);
         assert_eq!(j.current(0), 1 << button::A);
 
         // Also press gamepad A — button stays set (OR semantics).
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(j.current(0), 1 << button::A);
 
         // Release keyboard — gamepad still holding.
-        m.handle_key(&mut j, Keycode::K, false);
+        m.handle_key(&mut j, Keycode::L, false);
         assert_eq!(
             j.current(0),
             1 << button::A,
@@ -450,7 +450,7 @@ mod tests {
             .insert("A".to_string(), "NotAKey".to_string());
         let m = InputMapper::from_config(&c);
         // A is now unbound (the invalid name was skipped).
-        assert_eq!(m.keyboard_binding(Keycode::K), None);
+        assert_eq!(m.keyboard_binding(Keycode::L), None);
         assert_eq!(m.keyboard_binding_count(), 7); // 8 - 1 invalid
     }
 }

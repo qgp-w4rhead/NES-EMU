@@ -21,11 +21,11 @@ use sdl2::keyboard::Keycode;
 use crate::bus::Bus;
 use crate::debug::{CpuDebugger, MemoryViewer, PpuViewer, PpuWriteLogger, RingTraceLogger, TraceLogger};
 
-/// Default trace log file path (relative to the CWD).
-pub const DEFAULT_TRACE_LOG_PATH: &str = "trace.log";
+/// Default trace log file path (under ./logs/).
+pub const DEFAULT_TRACE_LOG_PATH: &str = "logs/trace.log";
 
-/// Default PPU write log file path (relative to the CWD).
-pub const DEFAULT_PPU_WRITE_LOG_PATH: &str = "ppu_writes.log";
+/// Default PPU write log file path (under ./logs/).
+pub const DEFAULT_PPU_WRITE_LOG_PATH: &str = "logs/ppu_writes.log";
 
 /// Bundle of M28 debug viewer state + the trace logger. Held by the
 /// main loop; [`DebugHotkeys::handle_key`] dispatches key events to the

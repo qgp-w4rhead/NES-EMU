@@ -2,7 +2,7 @@
 //!
 //! Centralizes the M29 control-feature key handling so `src/main.rs` stays
 //! under the 400-line file-size limit. The dispatcher owns the fast-forward
-//! flag and a screenshot counter (for unique filenames); it does *not* own
+//! flag and a screenshot output directory; it does *not* own
 //! any SDL2 state — the `Video` and `EmulatorState` are borrowed per call.
 //!
 //! # Hotkeys
@@ -10,7 +10,7 @@
 //! | Key            | Action                                                  |
 //! |----------------|---------------------------------------------------------|
 //! | `Ctrl+R`       | Soft reset (CPU RESET sequence; PPU/APU keep state).   |
-//! | `F9`           | Screenshot → `screenshot-<unix_ms>-<n>.png` in CWD.    |
+//! | `F9`           | Screenshot → `./screenshots/screenshot-<unix_ms>.png`. |
 //! | `Alt+Enter`    | Toggle fullscreen (desktop mode, integer-scaled).      |
 //! | `Tab`          | Toggle fast-forward (run 4 frames per vsync tick).     |
 //!
@@ -42,8 +42,8 @@ pub const TURBO_SPEEDS: [f32; 5] = [0.25, 0.5, 2.0, 3.0, 4.0];
 /// Default turbo speed index into [`TURBO_SPEEDS`] (2.0× = index 2).
 pub const DEFAULT_TURBO_SPEED_INDEX: usize = 2;
 
-/// Default directory for screenshot files (the current working directory).
-pub const DEFAULT_SCREENSHOT_DIR: &str = ".";
+/// Default directory for screenshot files.
+pub const DEFAULT_SCREENSHOT_DIR: &str = "screenshots";
 
 /// Bundle of M29 UI control state. Held by the main loop; [`UiHotkeys::handle_key`]
 /// dispatches key events to the appropriate action.
@@ -60,9 +60,6 @@ pub struct UiHotkeys {
     /// adds `turbo_ratio`; `floor(acc)` frames are stepped, then
     /// subtracted. For ≥1× ratios this always steps at least 1 frame.
     turbo_accumulator: f32,
-    /// Monotonic screenshot counter so successive screenshots get unique
-    /// filenames even within the same millisecond.
-    screenshot_counter: u64,
     /// Directory where screenshot PNGs are written.
     screenshot_dir: PathBuf,
 }
@@ -81,7 +78,6 @@ impl UiHotkeys {
             turbo_held: false,
             turbo_ratio: TURBO_SPEEDS[DEFAULT_TURBO_SPEED_INDEX],
             turbo_accumulator: 0.0,
-            screenshot_counter: 0,
             screenshot_dir,
         }
     }
@@ -197,19 +193,17 @@ impl UiHotkeys {
     }
 
     /// Write the current framebuffer to a PNG file named
-    /// `screenshot-<unix_ms>-<counter>.png` in `screenshot_dir`. Errors
+    /// `screenshot-<unix_ms>.png` in `screenshot_dir`. Errors
     /// are reported to stderr and do not crash the emulator.
     fn save_screenshot(&mut self, emulator: &EmulatorState) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let n = self.screenshot_counter;
-        self.screenshot_counter = self.screenshot_counter.wrapping_add(1);
 
         let path = self
             .screenshot_dir
-            .join(format!("screenshot-{now_ms}-{n}.png"));
+            .join(format!("screenshot-{now_ms}.png"));
 
         let fb = emulator.framebuffer();
         match screenshot::encode_to_path(
@@ -234,9 +228,4 @@ mod tests {
         assert!(!u.fast_forward());
     }
 
-    #[test]
-    fn screenshot_counter_starts_at_zero() {
-        let u = UiHotkeys::default();
-        assert_eq!(u.screenshot_counter, 0);
-    }
 }

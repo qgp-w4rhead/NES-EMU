@@ -43,7 +43,7 @@ fn default_config_file_is_written_on_first_run() {
 
     // The written file should parse back to the default config.
     let loaded = Config::load_from_path(&path).expect("load");
-    assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::K));
+    assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::L));
     assert_eq!(loaded.gamepad_button_for(button::A), Some(Button::A));
 
     cleanup(&dir);
@@ -92,7 +92,7 @@ fn custom_bindings_persist_across_save_load() {
     assert_eq!(loaded.window_scale, 4);
 
     // Untouched defaults are preserved.
-    assert_eq!(loaded.keycode_for(0, button::B), Some(Keycode::L));
+    assert_eq!(loaded.keycode_for(0, button::B), Some(Keycode::K));
     assert_eq!(loaded.gamepad_button_for(button::A), Some(Button::A));
 
     cleanup(&dir);
@@ -105,7 +105,7 @@ fn missing_config_file_yields_defaults() {
     let _ = std::fs::remove_file(&path);
 
     let c = Config::load_from_path(&path).expect("missing file is Ok");
-    assert_eq!(c.keycode_for(0, button::A), Some(Keycode::K));
+    assert_eq!(c.keycode_for(0, button::A), Some(Keycode::L));
     assert_eq!(c.gamepad_button_for(button::A), Some(Button::A));
     assert_eq!(c.audio_volume, 1.0);
     assert_eq!(c.window_scale, 3);
@@ -244,7 +244,7 @@ fn mapper_respects_custom_kb1_binding() {
     let mut m = InputMapper::from_config(&c);
 
     let mut j = Joypad::new();
-    m.handle_key(&mut j, Keycode::K, true); // K is no longer bound
+    m.handle_key(&mut j, Keycode::L, true); // L is no longer bound
     assert_eq!(j.current(0), 0);
     m.handle_key(&mut j, Keycode::Return, true); // Return is now A
     assert_eq!(j.current(0), 1 << button::A);
@@ -292,8 +292,8 @@ fn mapper_keyboard_and_gamepad_simultaneous() {
     let mut m = InputMapper::default();
     let mut j = Joypad::new();
 
-    // Press keyboard K (NES A on controller 1).
-    m.handle_key(&mut j, Keycode::K, true);
+    // Press keyboard L (NES A on controller 1).
+    m.handle_key(&mut j, Keycode::L, true);
     assert_eq!(j.current(0), 1 << button::A);
 
     // Press gamepad A (also NES A on controller 1) — button stays set.
@@ -301,7 +301,7 @@ fn mapper_keyboard_and_gamepad_simultaneous() {
     assert_eq!(j.current(0), 1 << button::A);
 
     // Release keyboard — gamepad still holding.
-    m.handle_key(&mut j, Keycode::K, false);
+    m.handle_key(&mut j, Keycode::L, false);
     assert_eq!(j.current(0), 1 << button::A);
 
     // Release gamepad — now clear.
@@ -337,7 +337,7 @@ fn mapper_skips_invalid_binding_names() {
     let m = InputMapper::from_config(&c);
     // A is now unbound; the other 7 default bindings remain.
     assert_eq!(m.keyboard_binding_count(), 7);
-    assert_eq!(m.keyboard_binding(Keycode::K), None);
+    assert_eq!(m.keyboard_binding(Keycode::L), None);
 }
 
 #[test]
@@ -372,7 +372,7 @@ fn mapper_loaded_from_disk_config_works() {
     let mut m = InputMapper::from_config(&loaded);
 
     let mut j = Joypad::new();
-    m.handle_key(&mut j, Keycode::K, true); // K no longer bound
+    m.handle_key(&mut j, Keycode::L, true); // L no longer bound
     assert_eq!(j.current(0), 0);
     m.handle_key(&mut j, Keycode::Space, true); // Space is now A
     assert_eq!(j.current(0), 1 << button::A);

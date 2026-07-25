@@ -93,6 +93,11 @@ impl PpuWriteLogger {
         if self.enabled {
             self.stop();
         }
+        if let Some(parent) = path.as_ref().parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let file = File::create(path.as_ref())?;
         let mut writer = BufWriter::new(file);
         writeln!(
