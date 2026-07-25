@@ -1,16 +1,6 @@
-//! On-screen display (OSD) — FPS / mapper / game-name / slot / rewind
-//! overlay rendered directly into the framebuffer (M30).
+//! On-screen display (OSD) — text overlay rendered into the framebuffer with 8×8 font.
 //!
-//! The OSD draws text into the emulator's 256x240 ARGB framebuffer using a
-//! hand-rolled 8x8 bitmap font (see [`font`]). No external crates are used
-//! (the tech-stack document forbids adding new dependencies).
-//!
-//! The OSD is toggled with `F10`. When enabled, [`Osd::render`] is called
-//! after the emulator has produced the frame and *before* the video layer
-//! uploads the framebuffer to the SDL2 texture, so the overlay appears on
-//! top of the game image.
-//!
-//! See: https://www.nesdev.org/wiki/PPU — native NES resolution is 256x240.
+//! Toggled with `F10`; drawn after frame render, before video upload.
 
 mod font;
 

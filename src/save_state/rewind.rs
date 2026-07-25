@@ -10,40 +10,12 @@ use crate::emulator::EmulatorState;
 /// Default rewind depth in frames — ~1 second of NTSC gameplay (60 fps).
 /// Tuned so the buffer costs at most `capacity * ~30 KB` ≈ 1.8 MB for a
 /// typical NROM snapshot, which is acceptable for an in-memory ring.
-pub const DEFAULT_REWIND_CAPACITY: usize = 60;
+pub const DEFAULT_REWIND_CAPACITY: usize = 300;
+pub const MAX_REWIND_CAPACITY: usize = 60000;
 
-/// A bounded ring buffer of recent emulator snapshots used by the rewind
-/// feature (M30). Each [`push`](Self::push) captures the full emulator
-/// state into the buffer; each [`pop`](Self::pop) restores the most
-/// recently pushed snapshot and removes it from the buffer, so repeated
-/// pops step the emulator backward through time.
+/// Ring buffer of recent emulator snapshots for backward stepping (rewind).
 ///
-/// The buffer has a fixed capacity; once full, the oldest snapshot is
-/// dropped on the next `push` (FIFO eviction). The buffer is *not*
-/// pre-allocated with placeholder entries — `len` starts at 0 and grows
-/// up to `capacity`.
-///
-/// # Allocation note
-///
-/// Each `push` serialises the full emulator state into a fresh `Vec<u8>`
-/// via `bincode`. This is a per-frame allocation (~13–30 KB) that
-/// technically violates tech-stack.md's "no allocation in main loop" rule.
-/// It is an accepted exception because: (1) the rewind feature is
-/// throttled to every `REWIND_INTERVAL`-th frame (default 2), halving the
-/// cost; (2) the allocation is bounded by the buffer capacity; (3) the
-/// serialisation itself is sub-microsecond on modern CPUs. A future
-/// optimisation could use a buffer pool of pre-allocated `Vec<u8>` slots
-/// rotated through the ring to eliminate the per-push allocation.
-///
-/// # Audio note
-///
-/// Rewind restores are best-effort with respect to audio: the APU state
-/// is part of the serialised snapshot, so the audio buffer is restored
-/// exactly. The host audio device may briefly underrun during a rewind
-/// pop (the restored samples are slightly stale relative to the audio
-/// thread's read pointer), but this is unavoidable without host-side
-/// audio buffering changes and matches the behaviour of other emulators
-/// (e.g. FCEUX rewind).
+/// `push` captures state; `pop` restores and removes the most recent snapshot.
 #[derive(Debug)]
 pub struct RewindBuffer {
     /// Ring of serialised snapshots, oldest first.
@@ -122,6 +94,32 @@ impl RewindBuffer {
     /// Drop every snapshot. The capacity is preserved.
     pub fn clear(&mut self) {
         self.buffer.clear();
+    }
+
+    /// Peek at the most recently pushed snapshot without removing it.
+    /// Returns `None` if the buffer is empty.
+    pub fn peek_back(&self) -> Option<&Vec<u8>> {
+        self.buffer.back()
+    }
+
+    /// Pop the most recently pushed snapshot blob without loading it
+    /// into an emulator. Returns `None` if the buffer is empty.
+    pub fn pop_blob(&mut self) -> Option<Vec<u8>> {
+        self.buffer.pop_back()
+    }
+
+    /// Push a raw blob (already serialised) into the buffer. If the
+    /// buffer is full, the oldest snapshot is dropped first.
+    pub fn push_blob(&mut self, blob: Vec<u8>) {
+        if self.buffer.len() >= self.capacity {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(blob);
+    }
+
+    /// Iterate over snapshot blobs from oldest to newest.
+    pub fn iter_blobs(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.buffer.iter()
     }
 }
 

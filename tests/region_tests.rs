@@ -420,10 +420,8 @@ fn config_default_region_is_auto() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn save_state_version_is_six() {
-    // M35 bumped the version: new mapper variants (Vrc7, Namco163) and
-    // Fme7 gained a ym2149 field (Sunsoft 5B audio).
-    assert_eq!(SAVE_STATE_VERSION, 6);
+fn save_state_version_is_eight() {
+    assert_eq!(SAVE_STATE_VERSION, 8);
 }
 
 #[test]

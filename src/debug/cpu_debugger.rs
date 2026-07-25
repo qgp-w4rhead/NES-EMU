@@ -1,23 +1,6 @@
-//! CPU debugger — register snapshot, breakpoints, and pause / step logic.
+//! CPU debugger — register snapshot, breakpoints, and pause/step logic.
 //!
-//! This module is the M27 deliverable: a live CPU debugger with register
-//! view, single-step, and address / value breakpoints. It is deliberately
-//! *pure logic* — it owns no emulator state and performs only
-//! side-effect-free reads via [`crate::bus::Bus::peek`]. The main loop
-//! (`src/main.rs`) drives it:
-//!
-//! - **F1** toggles pause / resume.
-//! - **F2** single-steps one CPU instruction while paused.
-//! - **F3** toggles run-to-breakpoint mode (run until a breakpoint fires).
-//!
-//! While paused, the main loop prints the register snapshot and a
-//! disassembly window (current instruction + next N) to stderr — a
-//! console "overlay" that works without a GUI toolkit. A graphical
-//! overlay (egui) lands in M28 alongside the PPU / memory viewers.
-//!
-//! The disassembler itself lives in [`super::disasm`].
-//!
-//! See: https://www.nesdev.org/wiki/CPU_registers (status flag bit layout)
+//! Pure logic (side-effect-free reads via `Bus::peek`); driven by F1/F2/F3 hotkeys.
 
 use crate::bus::Bus;
 use crate::cpu::flags;

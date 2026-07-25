@@ -1,17 +1,6 @@
-//! SDL2 audio output for the NES emulator.
-//!
-//! Owns an `AudioQueue<f32>` opened at 44.1 kHz mono. The emulation core
-//! produces `f32` samples in `[-1.0, 1.0]` each frame (via
-//! [`crate::emulator::EmulatorState::take_audio_samples`]) and queues them
-//! here; SDL2's audio thread drains the queue at the device's sample rate.
-//!
-//! No ring buffer is needed — SDL2's `AudioQueue` handles internal
-//! buffering. The emulation produces ~735 samples per frame (44100 / 60),
-//! which exactly matches the playback rate, so the queue depth stays
-//! bounded.
+//! SDL2 audio output — 44.1 kHz mono `AudioQueue<f32>`.
 //!
 //! See: https://www.nesdev.org/wiki/APU#Output
-//! See: https://wiki.libsdl.org/SDL2/SDL_QueueAudio
 
 #![allow(dead_code)]
 
@@ -24,9 +13,11 @@ pub const SAMPLE_RATE: i32 = 44_100;
 /// mixed channel.
 pub const CHANNELS: u8 = 1;
 
-/// SDL2 audio buffer size in samples (per channel). 1024 is a reasonable
-/// default that balances latency against underrun risk.
-pub const BUFFER_SAMPLES: u16 = 1024;
+/// SDL2 audio buffer size in samples (per channel). 2048 (~46 ms at
+/// 44.1 kHz) gives enough headroom to absorb frame-timing jitter from the
+/// OS scheduler without underrunning, while keeping latency below human
+/// perceptibility.
+pub const BUFFER_SAMPLES: u16 = 2048;
 
 /// NES CPU clock rate in Hz (NTSC). Used to compute the number of CPU
 /// cycles per audio sample.

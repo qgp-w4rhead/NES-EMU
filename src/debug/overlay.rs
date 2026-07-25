@@ -50,5 +50,5 @@ pub fn print_debug_overlay(emulator: &EmulatorState, debugger: &CpuDebugger) {
             "OFF"
         }
     );
-    eprintln!("F1=resume  F2=step  F3=toggle-run-to-breakpoint");
+    eprintln!("F1=help  F2=resume  F3=breakpoint  N=step");
 }

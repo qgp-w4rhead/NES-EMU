@@ -1,0 +1,44 @@
+audio_volume = 1.0
+window_scale = 3
+region = "auto"
+recent_roms = [
+    'C:\Users\W4RHEAD\Documents\Downloads\MarioBros.NES',
+    'C:\Users\W4RHEAD\Documents\Downloads\Mega-Man.NES',
+]
+rewind_capacity = 3000
+turbo_speed = 4.0
+
+[keys.controller1]
+A = "L"
+B = "K"
+Down = "S"
+Left = "A"
+Right = "D"
+Select = "H"
+Start = "G"
+Up = "W"
+
+[keys.controller2]
+
+[gamepad]
+A = "a"
+B = "b"
+Down = "dpdown"
+Left = "dpleft"
+Right = "dpright"
+Select = "back"
+Start = "start"
+Up = "dpup"
+
+[audio_channels]
+pulse1 = 1.0
+pulse2 = 1.0
+triangle = 1.0
+noise = 1.0
+dmc = 1.0
+
+[debug]
+slant_corruption = false
+ring_buffer_trace = true
+use_inaccurate_palette = false
+nmi_retrigger = false

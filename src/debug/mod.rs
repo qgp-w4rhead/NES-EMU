@@ -21,6 +21,7 @@ pub mod hotkeys;
 pub mod memory_viewer;
 pub mod overlay;
 pub mod ppu_viewer;
+pub mod ppu_write_logger;
 pub mod trace_logger;
 
 pub use cpu_debugger::{Breakpoint, CpuDebugger, RegisterSnapshot};
@@ -29,4 +30,5 @@ pub use hotkeys::{handle_debugger_key, DebugHotkeys, DEFAULT_TRACE_LOG_PATH};
 pub use memory_viewer::{MemoryRegion, MemoryViewer};
 pub use overlay::print_debug_overlay;
 pub use ppu_viewer::{PpuView, PpuViewer};
-pub use trace_logger::TraceLogger;
+pub use ppu_write_logger::PpuWriteLogger;
+pub use trace_logger::{RingTraceLogger, TraceLogger, DEFAULT_RING_CAPACITY};

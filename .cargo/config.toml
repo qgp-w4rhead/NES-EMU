@@ -1,0 +1,15 @@
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+[build]
+# sccache caches compiled artifacts across builds — big speedup for rebuilds.
+# Install with: cargo install sccache
+rustc-wrapper = "sccache"
+incremental = true
+
+[target.x86_64-pc-windows-msvc]
+# Use rust-lld (LLVM linker) shipped with the Rust toolchain — significantly
+# faster than the default MSVC link.exe for large projects.
+linker = "rust-lld"
+# SDL2 system library path — needed since we dropped the "bundled" feature.
+rustflags = ["-L", "native=C:\\SDL2\\SDL2-2.32.10\\lib\\x64"]

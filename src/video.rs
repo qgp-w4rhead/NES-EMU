@@ -27,11 +27,11 @@ pub const DEFAULT_SCALE: u32 = 3;
 pub const BLACK_ARGB: u32 = 0xFF00_0000;
 
 /// A frame's worth of ARGB pixels, row-major, top-to-bottom.
-pub type Framebuffer = Vec<u32>;
+pub type Framebuffer = Box<[u32]>;
 
 /// Allocate a fresh framebuffer filled with opaque black.
 pub fn new_framebuffer() -> Framebuffer {
-    vec![BLACK_ARGB; (NES_WIDTH * NES_HEIGHT) as usize]
+    vec![BLACK_ARGB; (NES_WIDTH * NES_HEIGHT) as usize].into_boxed_slice()
 }
 
 /// Bundles the SDL2 video resources needed to present one framebuffer per

@@ -1,30 +1,6 @@
-//! Famicom Disk System (FDS) disk image parser and BIOS loader (M36).
-//!
-//! The FDS uses a proprietary disk format distinct from iNES. Disk images
-//! (`.fds`) consist of a 16-byte header followed by one or more disk sides,
-//! each 65,500 bytes of raw disk data. The FDS BIOS (`disksys.rom`, 8 KB)
-//! is required to boot games — it is loaded from disk and mapped at
-//! `$E000-$FFFF`.
-//!
-//! # Disk image format
-//!
-//! ```text
-//! Offset  Size  Content
-//! 0       4     "FDS\x1A" magic
-//! 4       1     Number of disk sides (usually 1)
-//! 5       11    Padding (0xFF or 0x00)
-//! 16      65500 Disk side 0 (raw disk data)
-//! 65516   65500 Disk side 1 (if present)
-//! ...
-//! ```
-//!
-//! Each disk side is a sequence of blocks:
-//! - Block type `$80`: Disk info block (56 bytes)
-//! - Block type `$01`: File header block (16 bytes)
-//! - Block type `$02`: File data block (1 + file_size bytes)
+//! Famicom Disk System (FDS) disk image parser and BIOS loader.
 //!
 //! See: https://www.nesdev.org/wiki/FDS_disk_format
-//! See: https://www.nesdev.org/wiki/Famicom_Disk_System
 
 use std::path::{Path, PathBuf};
 

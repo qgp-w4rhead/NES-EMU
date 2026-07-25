@@ -272,24 +272,47 @@ fn mid_scanline_ppuaddr_scroll_change_takes_effect_at_correct_pixel() {
         universal_bg,
         "pixel 4 should be transparent (fine_x=0)"
     );
-    // After the scroll change at pixel 50, fine_x=4. The next pixel
-    // (pixel 50) uses fine_x=4, which is bit 3 of the tile pattern.
-    // With the half tile (0xF0), bit 3 = 0 → transparent.
-    // But wait — the resync happens at pixel 50, so pixel 50 uses the
-    // new fine_x=4. The tile at coarse_x=0 (since we didn't change
-    // coarse X), pattern 0xF0, bit 7-4=3 → opaque.
-    // Actually, with fine_x=4, bit = 7-4 = 3. Pattern 0xF0 >> 3 = 0x1F,
-    // bit 0 = 1 → opaque (red).
+    // ---- M-PPU-09: 2-pixel fetch pipeline delay ----
+    //
+    // The scroll change happens after pixel 49 is rendered (between PPU
+    // cycles 50 and 51). With the 2-pixel fetch pipeline, the data for
+    // pixel N is fetched 2 cycles earlier. So:
+    // - Pixel 50: uses data fetched at cycle 49 (before the scroll change)
+    //   → old fine_x=0, effective fine_x = 50&7 = 2, bit 5 of 0xF0 = 1 → red
+    // - Pixel 51: uses data fetched at cycle 50 (before the scroll change)
+    //   → old fine_x=0, effective fine_x = 51&7 = 3, bit 4 of 0xF0 = 1 → red
+    // - Pixel 52: uses data fetched at cycle 51 (after the scroll change)
+    //   → new fine_x=4, resync_px=50, advance=2, eff_fine_x=(4+2)&7=6, bit 1 of 0xF0 = 0 → transparent
+    // - Pixel 53: uses data fetched at cycle 52 (after the scroll change)
+    //   → new fine_x=4, advance=3, eff_fine_x=(4+3)&7=7, bit 0 of 0xF0 = 0 → transparent
+    // - Pixel 54: new data, advance=4, eff_fine_x=(4+4)&7=0, cx_inc=1, bit 7 of 0xF0 = 1 → red
+
+    // Pixel 50 should still be red (2-pixel pipeline delay — old data).
     let pixel_50 = fb[y * SCREEN_WIDTH + 50];
-    // The scroll change should have taken effect. With fine_x=4, the
-    // pixel at position 50 reads bit 3 of the tile, which for 0xF0 is 0
-    // (transparent). But the coarse_x was also reset to 0 by the
-    // PPUSCROLL write, so we're reading from the start of the tile with
-    // fine_x=4.
-    // 0xF0 = 1111_0000. Bit 3 (counting from bit 7) = 0. So transparent.
     assert_eq!(
-        pixel_50, universal_bg,
-        "pixel 50 after scroll change should be transparent (fine_x=4, bit 3 of 0xF0 = 0)"
+        pixel_50, red,
+        "pixel 50 should be red (2-pixel pipeline delay: old fine_x=0, bit 5 of 0xF0 = 1)"
+    );
+
+    // Pixel 51 should also be red (old data fetched before scroll change).
+    let pixel_51 = fb[y * SCREEN_WIDTH + 51];
+    assert_eq!(
+        pixel_51, red,
+        "pixel 51 should be red (2-pixel pipeline delay: old fine_x=0, bit 4 of 0xF0 = 1)"
+    );
+
+    // Pixel 52 should be transparent (new fine_x=4, effective fine_x=6, bit 1 = 0).
+    let pixel_52 = fb[y * SCREEN_WIDTH + 52];
+    assert_eq!(
+        pixel_52, universal_bg,
+        "pixel 52 should be transparent (new fine_x=4, effective fine_x=6, bit 1 of 0xF0 = 0)"
+    );
+
+    // Pixel 54 should be red (new fine_x=4, advance=4, effective fine_x=0, bit 7 = 1).
+    let pixel_54 = fb[y * SCREEN_WIDTH + 54];
+    assert_eq!(
+        pixel_54, red,
+        "pixel 54 should be red (new fine_x=4, effective fine_x=0, bit 7 of 0xF0 = 1)"
     );
 }
 
@@ -398,5 +421,100 @@ fn per_pixel_rendering_produces_visible_output() {
         fb[SCREEN_WIDTH * 120 + 128],
         red,
         "pixel (128,120) should be red"
+    );
+}
+
+// ---- Test: mid-scanline CHR-RAM write delayed by 2 pixels (M-PPU-09) ----
+
+#[test]
+fn mid_scanline_chr_write_takes_effect_2_pixels_later() {
+    // Verify the 2-pixel fetch pipeline: when CHR-RAM is rewritten
+    // mid-scanline, the change affects the pixel rendered 2 cycles later,
+    // not the immediately next pixel.
+    //
+    // Setup:
+    // - Tile 1 = solid (all 0xFF, pattern 3 → opaque).
+    // - Nametable filled with tile 1.
+    // - Palette: bg pal 0 color 3 = 0x16 (red), universal bg = 0x00 (black).
+    //
+    // Procedure:
+    // - Render 50 cycles (pixels 0-49, all red).
+    // - Overwrite tile 1's CHR data to all zeros (transparent).
+    // - Continue rendering.
+    //
+    // Expected (with 2-pixel pipeline):
+    // - Pixels 0-51: red (data fetched before the CHR write).
+    // - Pixel 52+: transparent (data fetched after the CHR write).
+
+    let cart = make_cart();
+    let mut bus = Bus::with_cartridge(cart);
+
+    // Write solid tile at tile index 1 in CHR-RAM ($0000 table).
+    write_tile_pattern(&mut bus, 1, SOLID_TILE_PLANE0, SOLID_TILE_PLANE1);
+    // Fill nametable 0 with tile index 1.
+    fill_nametable_tiles(&mut bus, 0x2000, 1, 32 * 30);
+    // Set palette: bg palette 0, color 3 = 0x16 (red).
+    set_palette(&mut bus, 0x3F03, 0x16);
+    // Reset scroll to nametable 0 origin.
+    set_scroll(&mut bus, 0, 0);
+    // Enable background rendering.
+    bus.write(PPUMASK, MASK_BG);
+
+    // Advance to scanline 0, cycle 0.
+    advance_to(&mut bus, 0, 0);
+    // Step 50 cycles → renders pixels 0-49 (cycle 1 → px 0, ..., cycle 50 → px 49).
+    bus.step_ppu(50);
+
+    // Now overwrite tile 1's pattern data in CHR-RAM to all zeros.
+    // Tile 1 starts at CHR address $0010 (tile_index << 4).
+    // The PPUADDR writes change `v` but do NOT set v_dirty, so the
+    // per-pixel renderer continues from its snapshot — the scroll
+    // position is unaffected.
+    set_vram_addr(&mut bus, 0x0010);
+    for _ in 0..16 {
+        bus.write(PPUDATA, 0x00);
+    }
+
+    // Continue stepping to the end of the scanline (cycles 51-256).
+    bus.step_ppu(256 - 50);
+
+    let fb = bus.ppu().framebuffer();
+    let y = 0;
+    let red = nes_color_to_argb(0x16);
+    let universal_bg = nes_color_to_argb(0); // palette[0] = 0
+
+    // Pixel 49: rendered before the CHR write → red.
+    assert_eq!(
+        fb[y * SCREEN_WIDTH + 49],
+        red,
+        "pixel 49 should be red (before CHR write)"
+    );
+
+    // Pixel 50: 2-pixel delay — data fetched at cycle 49, before the write.
+    assert_eq!(
+        fb[y * SCREEN_WIDTH + 50],
+        red,
+        "pixel 50 should be red (2-pixel pipeline delay: fetched before CHR write)"
+    );
+
+    // Pixel 51: 2-pixel delay — data fetched at cycle 50, before the write.
+    assert_eq!(
+        fb[y * SCREEN_WIDTH + 51],
+        red,
+        "pixel 51 should be red (2-pixel pipeline delay: fetched before CHR write)"
+    );
+
+    // Pixel 52: data fetched at cycle 51, after the CHR write → transparent.
+    assert_eq!(
+        fb[y * SCREEN_WIDTH + 52],
+        universal_bg,
+        "pixel 52 should be transparent (new CHR data, 2-pixel delay elapsed)"
+    );
+
+    // Pixel 100: well past the write → transparent.
+    assert_eq!(
+        fb[y * SCREEN_WIDTH + 100],
+        universal_bg,
+        "pixel 100 should be transparent (well after CHR write)"
     );
 }

@@ -34,7 +34,7 @@
 //! See: https://www.nesdev.org/wiki/CPU_unofficial_opcodes
 //! See: https://www.nesdev.org/6502.txt — "Unofficial opcodes" section.
 
-use super::Cpu;
+use super::{Cpu, Dummy};
 use crate::bus::Bus;
 
 impl Cpu {
@@ -64,7 +64,7 @@ impl Cpu {
             }
             // Zero-page,X NOPs (4 cycles): 0x14, 0x34, 0x54, 0x74, 0xD4, 0xF4.
             0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 => {
-                let _ = self.am_zero_page_x_dr(bus);
+                let _ = self.am_zero_page_x(bus, Dummy::Rmw);
                 4
             }
             // Absolute NOP (4 cycles): 0x0C.
@@ -76,112 +76,43 @@ impl Cpu {
             // 0x7C, 0xDC, 0xFC. These are *read*-style NOPs: the dummy read
             // fires on page cross and the +1 penalty applies.
             0x1C | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => {
-                let (_, pc) = self.am_absolute_x_read(bus);
+                let (_, pc) = self.am_absolute_x(bus, Dummy::Read);
                 4 + u8::from(pc)
             }
 
             // ---- LAX (load A and X) ------------------------------------
-            0xA7 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPage);
-                self.lax(self.read_operand(bus, op));
-                3
-            }
-            0xB7 => {
-                let a = self.am_zero_page_y_dr(bus);
-                self.lax(bus.read(a));
-                4
-            }
-            0xAF => {
-                let op = self.resolve(bus, super::AddrMode::Absolute);
-                self.lax(self.read_operand(bus, op));
-                4
-            }
-            0xBF => {
-                let (a, pc) = self.am_absolute_y_read(bus);
-                self.lax(bus.read(a));
-                4 + u8::from(pc)
-            }
-            0xA3 => {
-                let a = self.am_indirect_x(bus);
-                self.lax(bus.read(a));
-                6
-            }
-            0xB3 => {
-                let (a, pc) = self.am_indirect_y_read(bus);
-                self.lax(bus.read(a));
-                5 + u8::from(pc)
-            }
+            0xA7 => { let v = self.rd_zp(bus); self.lax(v); 3 }
+            0xB7 => { let v = self.rd_zp_y(bus); self.lax(v); 4 }
+            0xAF => { let v = self.rd_abs(bus); self.lax(v); 4 }
+            0xBF => { let (v, pc) = self.rd_abs_y(bus); self.lax(v); 4 + u8::from(pc) }
+            0xA3 => { let v = self.rd_ind_x(bus); self.lax(v); 6 }
+            0xB3 => { let (v, pc) = self.rd_ind_y(bus); self.lax(v); 5 + u8::from(pc) }
 
             // ---- SAX (store A & X) -------------------------------------
-            0x87 => {
-                let op = self.resolve(bus, super::AddrMode::ZeroPage);
-                self.write_operand(bus, op, self.a & self.x);
-                3
-            }
-            0x97 => {
-                let a = self.am_zero_page_y_dr(bus);
-                bus.write(a, self.a & self.x);
-                4
-            }
-            0x8F => {
-                let op = self.resolve(bus, super::AddrMode::Absolute);
-                self.write_operand(bus, op, self.a & self.x);
-                4
-            }
-            0x83 => {
-                let a = self.am_indirect_x(bus);
-                bus.write(a, self.a & self.x);
-                6
-            }
+            0x87 => { self.wr_zp(bus, self.a & self.x); 3 }
+            0x97 => { self.wr_zp_y(bus, self.a & self.x); 4 }
+            0x8F => { self.wr_abs(bus, self.a & self.x); 4 }
+            0x83 => { self.wr_ind_x(bus, self.a & self.x); 6 }
 
             // ---- ANC (AND then copy N to C) ----------------------------
             // 0x0B and 0x2B are both ANC. A = A & imm; C = N = bit 7 of A.
-            0x0B | 0x2B => {
-                let v = self.fetch_byte(bus);
-                self.anc(v);
-                2
-            }
+            0x0B | 0x2B => { let v = self.rd_imm(bus); self.anc(v); 2 }
 
             // ---- ALR (AND then LSR) ------------------------------------
             // A = (A & imm) >> 1; C = old bit 0 of (A & imm).
-            0x4B => {
-                let v = self.fetch_byte(bus);
-                self.alr(v);
-                2
-            }
+            0x4B => { let v = self.rd_imm(bus); self.alr(v); 2 }
 
             // ---- ARR (AND then ROR, special V/C) -----------------------
-            0x6B => {
-                let v = self.fetch_byte(bus);
-                self.arr(v);
-                2
-            }
+            0x6B => { let v = self.rd_imm(bus); self.arr(v); 2 }
 
             // ---- AXS / SBX (subtract imm from A&X, store in X) ---------
-            0xCB => {
-                let v = self.fetch_byte(bus);
-                self.axs(v);
-                2
-            }
+            0xCB => { let v = self.rd_imm(bus); self.axs(v); 2 }
 
             // ---- XAA (unstable: A = (A | magic) & X & imm) -------------
-            0x8B => {
-                let v = self.fetch_byte(bus);
-                self.xaa(v);
-                2
-            }
+            0x8B => { let v = self.rd_imm(bus); self.xaa(v); 2 }
 
             // ---- LAS / LAR (A = X = SP = M & SP) -----------------------
-            0xBB => {
-                let (a, pc) = self.am_absolute_y_read(bus);
-                let v = bus.read(a);
-                let result = v & self.sp;
-                self.a = result;
-                self.x = result;
-                self.sp = result;
-                self.set_nz(result);
-                4 + u8::from(pc)
-            }
+            0xBB => { let (v, pc) = self.rd_abs_y(bus); let r = v & self.sp; self.a = r; self.x = r; self.sp = r; self.set_nz(r); 4 + u8::from(pc) }
 
             // ---- KIL / JAM / HLT (halt the CPU) ------------------------
             // 0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2,
@@ -189,7 +120,7 @@ impl Cpu {
             // consume 1 cycle and set the halted flag — `step` becomes a
             // 1-cycle no-op thereafter so the PPU/APU keep advancing.
             0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => {
-                self.halted = true;
+                self.set_halted(true);
                 1
             }
 

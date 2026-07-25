@@ -163,7 +163,7 @@ fn nmi_via_pending_flag_services_on_next_step() {
     // instead of fetching the opcode at PC.
     let mut bus = bus_with_vectors(&[0xEA], 0x6000, 0, 0); // NOP at PC0
     let mut cpu = cpu_at_pc0(0xFF);
-    cpu.nmi_pending = true;
+    cpu.set_nmi_pending(true);
     let cycles = cpu.step(&mut bus);
     assert_eq!(cycles, 7);
     assert_eq!(cpu.pc, 0x6000);
@@ -171,7 +171,7 @@ fn nmi_via_pending_flag_services_on_next_step() {
     // not at PC0+1.
     assert_ne!(cpu.pc, PC0 + 1);
     // Pending flag cleared after servicing.
-    assert!(!cpu.nmi_pending);
+    assert!(!cpu.nmi_pending());
 }
 
 // ===========================================================================
@@ -218,12 +218,12 @@ fn irq_via_pending_flag_masked_by_i_flag() {
     let mut bus = bus_with_vectors(&[0xEA], 0, 0, 0x4000); // NOP
     let mut cpu = cpu_at_pc0(0xFF);
     cpu.set_interrupt_disable(true);
-    cpu.irq_pending = true;
+    cpu.set_irq_pending(true);
     let cycles = cpu.step(&mut bus);
     assert_eq!(cycles, 2, "NOP should execute, not the IRQ");
     assert_eq!(cpu.pc, PC0 + 1, "NOP advanced PC");
     // irq_pending remains set because it was not serviced.
-    assert!(cpu.irq_pending);
+    assert!(cpu.irq_pending());
 }
 
 #[test]
@@ -231,11 +231,11 @@ fn irq_via_pending_flag_serviced_when_i_clear() {
     let mut bus = bus_with_vectors(&[0xEA], 0, 0, 0x4000); // NOP
     let mut cpu = cpu_at_pc0(0xFF);
     cpu.set_interrupt_disable(false);
-    cpu.irq_pending = true;
+    cpu.set_irq_pending(true);
     let cycles = cpu.step(&mut bus);
     assert_eq!(cycles, 7);
     assert_eq!(cpu.pc, 0x4000);
-    assert!(!cpu.irq_pending);
+    assert!(!cpu.irq_pending());
 }
 
 // ===========================================================================
@@ -248,12 +248,12 @@ fn nmi_takes_priority_over_irq_in_step() {
     let mut bus = bus_with_vectors(&[0xEA], 0x1111, 0, 0x2222);
     let mut cpu = cpu_at_pc0(0xFF);
     cpu.set_interrupt_disable(false);
-    cpu.nmi_pending = true;
-    cpu.irq_pending = true;
+    cpu.set_nmi_pending(true);
+    cpu.set_irq_pending(true);
     cpu.step(&mut bus);
     assert_eq!(cpu.pc, 0x1111, "NMI vector should be loaded");
-    assert!(!cpu.nmi_pending, "NMI flag cleared");
-    assert!(cpu.irq_pending, "IRQ flag still pending after NMI serviced");
+    assert!(!cpu.nmi_pending(), "NMI flag cleared");
+    assert!(cpu.irq_pending(), "IRQ flag still pending after NMI serviced");
 }
 
 // ===========================================================================

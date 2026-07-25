@@ -1,53 +1,6 @@
-//! SDL2 keyboard + gamepad event → NES joypad button mapping, with
-//! configurable bindings loaded from [`crate::config::Config`].
-//!
-//! This module bridges the host input layer (SDL2 `Keycode` and
-//! `GameControllerButton` events) into the emulator-core
-//! [`Joypad`](crate::joypad::Joypad) struct, which has no SDL2 dependency.
-//! Keeping the SDL2 types out of `joypad.rs` means the emulation core stays
-//! portable and unit-testable without an SDL2 context.
-//!
-//! # Default key bindings
-//!
-//! | NES button | Keyboard key |
-//! |------------|--------------|
-//! | A          | Z            |
-//! | B          | X            |
-//! | Select     | A            |
-//! | Start      | S            |
-//! | Up         | Up arrow     |
-//! | Down       | Down arrow   |
-//! | Left       | Left arrow   |
-//! | Right      | Right arrow  |
-//!
-//! These mirror the layout used by common NES emulators (FCEUX / Nestopia):
-//! `Z`/`X` for the right-hand action buttons, arrow keys for the D-pad, and
-//! `A`/`S` for Select/Start on the left side of the keyboard. Only
-//! controller 1 is mapped by default; controller 2 bindings can be added in
-//! `config.toml`.
-//!
-//! # Gamepad bindings (default — Xbox-style)
-//!
-//! | NES button | Gamepad button |
-//! |------------|----------------|
-//! | A          | A              |
-//! | B          | B              |
-//! | Select     | Back           |
-//! | Start      | Start          |
-//! | Up         | DPadUp         |
-//! | Down       | DPadDown       |
-//! | Left       | DPadLeft       |
-//! | Right      | DPadRight      |
-//!
-//! Gamepad `N` maps to NES controller `N` (clamped to 0 or 1). Both
-//! keyboard and gamepad work simultaneously — pressing either source for
-//! the same NES button sets the button; releasing either source releases
-//! it. (The NES hardware reports the OR of all pressed sources, which is
-//! exactly what [`Joypad::set_button`](crate::joypad::Joypad::set_button)
-//! does when called with the same button from multiple sources.)
+//! SDL2 keyboard + gamepad → NES joypad button mapping with configurable bindings.
 //!
 //! See: https://www.nesdev.org/wiki/Controller_port
-//! See: https://wiki.libsdl.org/SDL_GameControllerButton
 
 #![allow(dead_code)]
 
@@ -71,14 +24,14 @@ use crate::joypad::{button, Joypad};
 /// New code should prefer [`InputMapper`] built from a [`Config`].
 pub fn keycode_to_button1(key: Keycode) -> Option<u8> {
     let btn = match key {
-        Keycode::Z => button::A,
-        Keycode::X => button::B,
-        Keycode::A => button::SELECT,
-        Keycode::S => button::START,
-        Keycode::Up => button::UP,
-        Keycode::Down => button::DOWN,
-        Keycode::Left => button::LEFT,
-        Keycode::Right => button::RIGHT,
+        Keycode::K => button::A,
+        Keycode::L => button::B,
+        Keycode::U => button::SELECT,
+        Keycode::Y => button::START,
+        Keycode::W => button::UP,
+        Keycode::S => button::DOWN,
+        Keycode::A => button::LEFT,
+        Keycode::D => button::RIGHT,
         _ => return None,
     };
     Some(btn)
@@ -260,14 +213,14 @@ mod tests {
 
     #[test]
     fn bound_keys_map_to_correct_buttons() {
-        assert_eq!(keycode_to_button1(Keycode::Z), Some(button::A));
-        assert_eq!(keycode_to_button1(Keycode::X), Some(button::B));
-        assert_eq!(keycode_to_button1(Keycode::A), Some(button::SELECT));
-        assert_eq!(keycode_to_button1(Keycode::S), Some(button::START));
-        assert_eq!(keycode_to_button1(Keycode::Up), Some(button::UP));
-        assert_eq!(keycode_to_button1(Keycode::Down), Some(button::DOWN));
-        assert_eq!(keycode_to_button1(Keycode::Left), Some(button::LEFT));
-        assert_eq!(keycode_to_button1(Keycode::Right), Some(button::RIGHT));
+        assert_eq!(keycode_to_button1(Keycode::K), Some(button::A));
+        assert_eq!(keycode_to_button1(Keycode::L), Some(button::B));
+        assert_eq!(keycode_to_button1(Keycode::U), Some(button::SELECT));
+        assert_eq!(keycode_to_button1(Keycode::Y), Some(button::START));
+        assert_eq!(keycode_to_button1(Keycode::W), Some(button::UP));
+        assert_eq!(keycode_to_button1(Keycode::S), Some(button::DOWN));
+        assert_eq!(keycode_to_button1(Keycode::A), Some(button::LEFT));
+        assert_eq!(keycode_to_button1(Keycode::D), Some(button::RIGHT));
     }
 
     #[test]
@@ -275,20 +228,22 @@ mod tests {
         assert_eq!(keycode_to_button1(Keycode::Return), None);
         assert_eq!(keycode_to_button1(Keycode::Space), None);
         assert_eq!(keycode_to_button1(Keycode::Q), None);
+        assert_eq!(keycode_to_button1(Keycode::Z), None);
+        assert_eq!(keycode_to_button1(Keycode::X), None);
     }
 
     #[test]
     fn handle_key_press_sets_button() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::Z, true);
+        handle_key(&mut j, Keycode::K, true);
         assert_eq!(j.current(0), 1 << button::A);
     }
 
     #[test]
     fn handle_key_release_clears_button() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::Z, true);
-        handle_key(&mut j, Keycode::Z, false);
+        handle_key(&mut j, Keycode::K, true);
+        handle_key(&mut j, Keycode::K, false);
         assert_eq!(j.current(0), 0);
     }
 
@@ -302,7 +257,7 @@ mod tests {
     #[test]
     fn handle_key_only_affects_controller1() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::Z, true);
+        handle_key(&mut j, Keycode::K, true);
         assert_eq!(j.current(0), 1 << button::A);
         assert_eq!(j.current(1), 0);
     }
@@ -310,9 +265,9 @@ mod tests {
     #[test]
     fn multiple_keys_press_multiple_buttons() {
         let mut j = Joypad::new();
-        handle_key(&mut j, Keycode::Z, true); // A
-        handle_key(&mut j, Keycode::Up, true); // Up
-        handle_key(&mut j, Keycode::S, true); // Start
+        handle_key(&mut j, Keycode::K, true); // A
+        handle_key(&mut j, Keycode::W, true); // Up
+        handle_key(&mut j, Keycode::Y, true); // Start
         assert_eq!(
             j.current(0),
             (1 << button::A) | (1 << button::UP) | (1 << button::START)
@@ -324,14 +279,14 @@ mod tests {
     #[test]
     fn default_mapper_matches_legacy_bindings() {
         let m = InputMapper::default();
-        assert_eq!(m.keyboard_binding(Keycode::Z), Some((0, button::A)));
-        assert_eq!(m.keyboard_binding(Keycode::X), Some((0, button::B)));
-        assert_eq!(m.keyboard_binding(Keycode::A), Some((0, button::SELECT)));
-        assert_eq!(m.keyboard_binding(Keycode::S), Some((0, button::START)));
-        assert_eq!(m.keyboard_binding(Keycode::Up), Some((0, button::UP)));
-        assert_eq!(m.keyboard_binding(Keycode::Down), Some((0, button::DOWN)));
-        assert_eq!(m.keyboard_binding(Keycode::Left), Some((0, button::LEFT)));
-        assert_eq!(m.keyboard_binding(Keycode::Right), Some((0, button::RIGHT)));
+        assert_eq!(m.keyboard_binding(Keycode::K), Some((0, button::A)));
+        assert_eq!(m.keyboard_binding(Keycode::L), Some((0, button::B)));
+        assert_eq!(m.keyboard_binding(Keycode::U), Some((0, button::SELECT)));
+        assert_eq!(m.keyboard_binding(Keycode::Y), Some((0, button::START)));
+        assert_eq!(m.keyboard_binding(Keycode::W), Some((0, button::UP)));
+        assert_eq!(m.keyboard_binding(Keycode::S), Some((0, button::DOWN)));
+        assert_eq!(m.keyboard_binding(Keycode::A), Some((0, button::LEFT)));
+        assert_eq!(m.keyboard_binding(Keycode::D), Some((0, button::RIGHT)));
         // 8 keyboard bindings on controller 1, none on controller 2.
         assert_eq!(m.keyboard_binding_count(), 8);
     }
@@ -354,9 +309,9 @@ mod tests {
     fn mapper_handle_key_sets_button() {
         let mut m = InputMapper::default();
         let mut j = Joypad::new();
-        m.handle_key(&mut j, Keycode::Z, true);
+        m.handle_key(&mut j, Keycode::K, true);
         assert_eq!(j.current(0), 1 << button::A);
-        m.handle_key(&mut j, Keycode::Z, false);
+        m.handle_key(&mut j, Keycode::K, false);
         assert_eq!(j.current(0), 0);
     }
 
@@ -372,15 +327,15 @@ mod tests {
     #[test]
     fn custom_kb1_binding_respected() {
         let mut c = Config::default();
-        // Remap A from Z to Return.
+        // Remap A from K to Return.
         c.keys
             .controller1
             .insert("A".to_string(), "Return".to_string());
         let mut m = InputMapper::from_config(&c);
 
         let mut j = Joypad::new();
-        // Z is no longer bound.
-        m.handle_key(&mut j, Keycode::Z, true);
+        // K is no longer bound.
+        m.handle_key(&mut j, Keycode::K, true);
         assert_eq!(j.current(0), 0);
         // Return is now A.
         m.handle_key(&mut j, Keycode::Return, true);
@@ -442,13 +397,13 @@ mod tests {
 
     #[test]
     fn keyboard_and_gamepad_work_simultaneously() {
-        // Both keyboard Z and gamepad A map to NES A on controller 1.
+        // Both keyboard K and gamepad A map to NES A on controller 1.
         // Pressing either sets the button; the joypad ORs them.
         let mut m = InputMapper::default();
         let mut j = Joypad::new();
 
         // Press keyboard A.
-        m.handle_key(&mut j, Keycode::Z, true);
+        m.handle_key(&mut j, Keycode::K, true);
         assert_eq!(j.current(0), 1 << button::A);
 
         // Also press gamepad A — button stays set (OR semantics).
@@ -456,7 +411,7 @@ mod tests {
         assert_eq!(j.current(0), 1 << button::A);
 
         // Release keyboard — gamepad still holding.
-        m.handle_key(&mut j, Keycode::Z, false);
+        m.handle_key(&mut j, Keycode::K, false);
         assert_eq!(
             j.current(0),
             1 << button::A,
@@ -495,7 +450,7 @@ mod tests {
             .insert("A".to_string(), "NotAKey".to_string());
         let m = InputMapper::from_config(&c);
         // A is now unbound (the invalid name was skipped).
-        assert_eq!(m.keyboard_binding(Keycode::Z), None);
+        assert_eq!(m.keyboard_binding(Keycode::K), None);
         assert_eq!(m.keyboard_binding_count(), 7); // 8 - 1 invalid
     }
 }

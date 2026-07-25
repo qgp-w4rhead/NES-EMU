@@ -21,6 +21,7 @@
 //! See: https://www.nesdev.org/wiki/Tracing
 //! See: FCEUX trace format reference (https://fceux.com/web/help/fceux.html)
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,11 @@ use std::path::{Path, PathBuf};
 use crate::bus::Bus;
 use crate::cpu::Cpu;
 use crate::debug::disassemble_at;
+
+/// Default ring buffer capacity (number of instruction lines kept in
+/// memory). At ~30K instructions/frame, this is roughly 1/3 of a frame —
+/// enough to capture the last ~10K instructions before a corruption event.
+pub const DEFAULT_RING_CAPACITY: usize = 10_000;
 
 /// A trace logger that writes one line per executed instruction to a
 /// file. The logger owns a buffered writer; flushing happens on
@@ -195,6 +201,136 @@ impl Drop for TraceLogger {
     fn drop(&mut self) {
         // Ensure the file is flushed even if the caller forgets to stop.
         self.stop();
+    }
+}
+
+/// A ring buffer trace logger that keeps the last N instruction lines in
+/// memory instead of writing to a file. When the user pauses the emulator
+/// (or presses a dump key), the buffer is flushed to a file, giving a
+/// focused window around the moment of interest rather than millions of
+/// lines from boot.
+///
+/// The ring buffer is *opt-in*: when `enabled` is false (the default),
+/// [`RingTraceLogger::log_instruction`] is a no-op. The main loop calls
+/// [`RingTraceLogger::start`] to enable buffering and
+/// [`RingTraceLogger::dump`] to flush the buffer to a file.
+pub struct RingTraceLogger {
+    /// In-memory ring buffer of formatted trace lines.
+    buffer: VecDeque<String>,
+    /// Maximum number of lines to keep in the buffer.
+    capacity: usize,
+    /// Whether buffering is currently active.
+    enabled: bool,
+    /// Cumulative CPU cycles since buffering started.
+    cycle_count: u64,
+    /// Total lines logged (may exceed capacity since older lines are
+    /// evicted).
+    total_lines: u64,
+}
+
+impl Default for RingTraceLogger {
+    fn default() -> Self {
+        Self::new(DEFAULT_RING_CAPACITY)
+    }
+}
+
+impl RingTraceLogger {
+    /// Construct a stopped ring buffer with the given capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buffer: VecDeque::with_capacity(capacity.min(65536)),
+            capacity,
+            enabled: false,
+            cycle_count: 0,
+            total_lines: 0,
+        }
+    }
+
+    /// Is buffering currently active?
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Number of lines currently in the buffer.
+    pub fn buffered_lines(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Start buffering. Clears any previous buffer contents.
+    pub fn start(&mut self) {
+        self.buffer.clear();
+        self.enabled = true;
+        self.cycle_count = 0;
+        self.total_lines = 0;
+    }
+
+    /// Stop buffering without dumping. Clears the buffer.
+    pub fn stop(&mut self) {
+        self.enabled = false;
+        self.buffer.clear();
+        self.cycle_count = 0;
+        self.total_lines = 0;
+    }
+
+    /// Log one instruction into the ring buffer. If the buffer is full,
+    /// the oldest line is evicted. No-op when buffering is disabled.
+    pub fn log_instruction(&mut self, cpu: &Cpu, bus: &Bus, cycles: u32) {
+        if !self.enabled {
+            return;
+        }
+        let instr = disassemble_at(bus, cpu.pc);
+        let mut bytes_col = String::new();
+        for (i, &b) in instr.bytes[..instr.len as usize].iter().enumerate() {
+            if i > 0 {
+                bytes_col.push(' ');
+            }
+            bytes_col.push_str(&format!("{:02X}", b));
+        }
+        while bytes_col.len() < 8 {
+            bytes_col.push(' ');
+        }
+        let disasm_col = format!("{:<12}", instr.text);
+        let line = format!(
+            "{:04X}  {}  {}  A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X} CYC:{}",
+            cpu.pc,
+            bytes_col,
+            disasm_col,
+            cpu.a,
+            cpu.x,
+            cpu.y,
+            cpu.status,
+            cpu.sp,
+            self.cycle_count,
+        );
+        if self.buffer.len() >= self.capacity {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(line);
+        self.cycle_count = self.cycle_count.saturating_add(cycles as u64);
+        self.total_lines = self.total_lines.saturating_add(1);
+    }
+
+    /// Dump the buffered lines to a file at `path`. Writes a header line
+    /// followed by all buffered lines, then clears the buffer. Returns
+    /// the number of lines written (excluding the header), or an error
+    /// if the file cannot be created. The logger remains enabled after
+    /// dumping so buffering continues for the next dump.
+    pub fn dump<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<usize> {
+        let file = File::create(path.as_ref())?;
+        let mut writer = BufWriter::new(file);
+        writeln!(
+            writer,
+            "# nes-emu ring trace dump — {} lines (of {} total logged)",
+            self.buffer.len(),
+            self.total_lines
+        )?;
+        for line in &self.buffer {
+            writeln!(writer, "{line}")?;
+        }
+        writer.flush()?;
+        let written = self.buffer.len();
+        self.buffer.clear();
+        Ok(written)
     }
 }
 

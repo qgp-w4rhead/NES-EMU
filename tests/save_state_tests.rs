@@ -338,10 +338,9 @@ fn load_state_rejects_empty_data() {
 }
 
 #[test]
-fn save_state_version_is_six() {
-    // M36 bumped the version: new Fds mapper variant and read_prg_mut
-    // trait method, shifting the MapperState enum tag layout.
-    assert_eq!(SAVE_STATE_VERSION, 6);
+fn save_state_version_is_eight() {
+    // M-BUS-06: gained cpu_cycle_count field for OAM-DMA alignment.
+    assert_eq!(SAVE_STATE_VERSION, 8);
 }
 
 // ---- No-cartridge save/restore -----------------------------------------

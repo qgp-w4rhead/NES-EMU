@@ -1,28 +1,6 @@
-//! Hand-written decompression for Gzip and ZIP ROM archives (M34).
+//! Hand-written Gzip and ZIP decompression for ROM archives (no external crates).
 //!
-//! The tech-stack document forbids adding new external crates, so this
-//! module implements just enough of RFC 1951 (DEFLATE), RFC 1952 (Gzip),
-//! and the ZIP archive format to decompress single-file `.nes` ROM
-//! archives. No compression is performed — only decompression.
-//!
-//! # Supported formats
-//!
-//! - **Gzip** (`.gz`): RFC 1952 wrapper around a single DEFLATE stream.
-//!   Common for individual ROM files compressed as `game.nes.gz`.
-//! - **ZIP** (`.zip`): PKZIP archive. We scan the local file headers,
-//!   pick the first entry whose name ends in `.nes` (or the first entry
-//!   if none match), and decompress it. Stored (method 0) and Deflate
-//!   (method 8) entries are supported.
-//!
-//! # DEFLATE coverage
-//!
-//! All three block types are supported: stored (BTYPE=00), fixed Huffman
-//! (BTYPE=01), and dynamic Huffman (BTYPE=10). This is sufficient for
-//! every Gzip/ZIP file produced by standard tools.
-//!
-//! See: https://datatracker.ietf.org/doc/html/rfc1951 (DEFLATE)
-//! See: https://datatracker.ietf.org/doc/html/rfc1952 (Gzip)
-//! See: https://en.wikipedia.org/wiki/ZIP_(file_format) (ZIP)
+//! Supports DEFLATE (RFC 1951), Gzip (RFC 1952), and ZIP formats.
 
 use std::fmt;
 

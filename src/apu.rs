@@ -1,46 +1,10 @@
-//! APU (Audio Processing Unit) — pulse wave channels 1 & 2.
-//!
-//! This module implements the two pulse channels of the NES APU, the first
-//! piece of the audio subsystem (M14). Each pulse channel has four
-//! sub-components driven by the channel's 11-bit timer:
-//!
-//! - **Waveform generator** — 4 selectable duty-cycle patterns (8-step
-//!   sequence) clocked each time the timer reloads.
-//! - **Envelope** — downward sawtooth volume envelope with configurable
-//!   divider, loop/halt, and constant-volume mode.
-//! - **Sweep** — periodically shifts the timer period up or down; can mute
-//!   the channel when the result goes out of range.
-//! - **Length counter** — automatic note duration; silences the channel
-//!   when it reaches zero (unless halted).
-//!
-//! The frame counter (M16) clocks the envelope at the quarter-frame rate
-//! (≈240 Hz NTSC) and the length counter + sweep at the half-frame rate
-//! (≈120 Hz). Until M16 lands, [`Apu::clock_quarter_frame`] and
-//! [`Apu::clock_half_frame`] are exposed so the sub-components can be
-//! unit-tested and so the frame counter can drive them later.
-//!
-//! Register map (see <https://www.nesdev.org/wiki/APU_Pulse>):
-//!
-//! | Register        | Bits          | Function                                     |
-//! |-----------------|---------------|----------------------------------------------|
-//! | `$4000`/`$4004` | `DDLC VVVV`   | Duty, halt/loop, constant-volume, volume     |
-//! | `$4001`/`$4005` | `EPPP NSSS`   | Sweep enable/period/negate/shift             |
-//! | `$4002`/`$4006` | `TTTT TTTT`   | Timer low 8 bits                             |
-//! | `$4003`/`$4007` | `LLLL LTTT`   | Length load + timer high 3 bits              |
+//! APU (Audio Processing Unit) — pulse, triangle, noise, and DMC channels.
 //!
 //! See: https://www.nesdev.org/wiki/APU
-//! See: https://www.nesdev.org/wiki/APU_Pulse
-//! See: https://www.nesdev.org/wiki/APU_Envelope
-//! See: https://www.nesdev.org/wiki/APU_Sweep
-//! See: https://www.nesdev.org/wiki/APU_Length_Counter
 
 #![allow(dead_code)]
 
-/// 4 duty-cycle patterns, each an 8-step sequence clocked by the timer.
-/// The bit at the current sequence position selects whether the channel
-/// outputs its volume or is silent for that timer period.
-///
-/// See: https://www.nesdev.org/wiki/APU_Pulse#Sequencer
+/// 4 duty-cycle patterns (8-step sequences). See: https://www.nesdev.org/wiki/APU_Pulse#Sequencer
 const DUTY_PATTERNS: [[u8; 8]; 4] = [
     [0, 1, 0, 0, 0, 0, 0, 0], // 0: 12.5%
     [0, 1, 1, 0, 0, 0, 0, 0], // 1: 25%
@@ -48,11 +12,7 @@ const DUTY_PATTERNS: [[u8; 8]; 4] = [
     [1, 0, 0, 0, 1, 1, 1, 1], // 3: 25% negated
 ];
 
-/// Length-counter lookup table indexed by the 5-bit length index (bits 7-3
-/// of `$4003`/`$4007`/`$400B`/`$400F`). Each entry is the loaded length
-/// value (in half-frame clocks).
-///
-/// See: https://www.nesdev.org/wiki/APU_Length_Counter#Length_table
+/// Length-counter lookup table (5-bit index → half-frame clocks). See: https://www.nesdev.org/wiki/APU_Length_Counter#Length_table
 const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
     192, 24, 72, 26, 16, 28, 32, 30,
@@ -65,29 +25,18 @@ const MAX_PERIOD: u16 = 0x7FF;
 /// unit mute). See: https://www.nesdev.org/wiki/APU_Sweep
 const MIN_AUDIBLE_PERIOD: u16 = 8;
 
-/// 32-step triangle waveform sequence. The channel outputs one value per
-/// timer period; the sequence ramps 15→0 then 0→15, producing a triangle
-/// wave at 1/32 the timer frequency. There is no envelope — the output
-/// level is taken directly from this table.
-///
-/// See: https://www.nesdev.org/wiki/APU_Triangle#Sequencer
+/// 32-step triangle waveform (15→0→15). See: https://www.nesdev.org/wiki/APU_Triangle#Sequencer
 const TRIANGLE_SEQUENCE: [u8; 32] = [
     15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     13, 14, 15,
 ];
 
-/// Noise channel timer periods indexed by the 4-bit period select
-/// (`$400E` bits 0-3). Each entry is the timer reload value in APU cycles.
-///
-/// See: https://www.nesdev.org/wiki/APU_Noise#Tableref
+/// Noise channel timer periods (4-bit period select → APU cycles). See: https://www.nesdev.org/wiki/APU_Noise#Tableref
 const NOISE_PERIOD_TABLE: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
 ];
 
-/// One of the two NES pulse wave channels.
-///
-/// `pulse2` selects the pulse-2 sweep negate variant, which subtracts one
-/// extra from the target period (a hardware quirk; see APU_Sweep).
+/// One of the two NES pulse wave channels (`pulse2` enables the sweep negate quirk).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct PulseChannel {
     /// `true` for pulse channel 2 (affects sweep negate target).
@@ -173,12 +122,7 @@ impl PulseChannel {
         }
     }
 
-    /// Write to one of the four pulse channel registers.
-    ///
-    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
-    /// the channel base `$4000` or `$4004`).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Pulse#Registers
+    /// Write to pulse channel register `reg` (0..=3). See: https://www.nesdev.org/wiki/APU_Pulse#Registers
     pub fn write_register(&mut self, reg: u8, value: u8) {
         match reg {
             0 => {
@@ -224,10 +168,7 @@ impl PulseChannel {
         }
     }
 
-    /// Set the channel enable flag from `$4015`. When cleared, the length
-    /// counter is immediately forced to 0 (silencing the channel).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Status
+    /// Set channel enable from `$4015`; clearing forces length counter to 0.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
@@ -265,19 +206,7 @@ impl PulseChannel {
         self.sequence
     }
 
-    /// Compute the sweep target period for the current settings.
-    ///
-    /// When the sweep is disabled or the shift count is zero, the target
-    /// equals the current period (no change). Otherwise:
-    ///
-    /// - negate clear: `target = period + (period >> shift)`
-    /// - negate set, pulse 1: `target = period - (period >> shift)`
-    /// - negate set, pulse 2: `target = period - (period >> shift) - 1`
-    ///
-    /// Subtraction uses wrapping arithmetic; an underflow produces a value
-    /// greater than `MAX_PERIOD`, which the mute check catches.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Sweep#Calculating_the_target_period
+    /// Compute sweep target period (wrapping). See: https://www.nesdev.org/wiki/APU_Sweep#Calculating_the_target_period
     fn sweep_target(&self) -> u16 {
         if !self.sweep_enabled || self.sweep_shift == 0 {
             return self.timer_period;
@@ -294,21 +223,12 @@ impl PulseChannel {
         }
     }
 
-    /// Whether the sweep unit is currently muting the channel. This happens
-    /// when the current period is below 8 or the sweep target exceeds the
-    /// 11-bit range. The mute applies regardless of whether the sweep is
-    /// enabled.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Sweep#Muting
+    /// Whether the sweep unit is muting (period < 8 or target > 11-bit range).
     fn is_muted(&self) -> bool {
         self.timer_period < MIN_AUDIBLE_PERIOD || self.sweep_target() > MAX_PERIOD
     }
 
-    /// Advance the channel by one APU cycle (half a CPU cycle). The timer
-    /// counts down; on reaching zero it reloads to the period and the
-    /// waveform sequencer advances one step.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Pulse#Timer
+    /// Advance by one APU cycle: timer counts down, sequencer advances on reload.
     pub fn tick(&mut self) {
         if self.timer == 0 {
             self.timer = self.timer_period;
@@ -318,9 +238,7 @@ impl PulseChannel {
         }
     }
 
-    /// Clock the envelope (quarter-frame signal from the frame counter).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Envelope#Clocking
+    /// Clock the envelope (quarter-frame). See: https://www.nesdev.org/wiki/APU_Envelope#Clocking
     pub fn clock_envelope(&mut self) {
         if self.envelope_start {
             self.envelope_start = false;
@@ -339,27 +257,14 @@ impl PulseChannel {
         }
     }
 
-    /// Clock the length counter (half-frame signal). The counter is held
-    /// (not decremented) when the halt flag is set.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Length_Counter#Clocking
+    /// Clock the length counter (half-frame); held when halt flag is set.
     fn clock_length(&mut self) {
         if !self.halt && self.length_counter > 0 {
             self.length_counter -= 1;
         }
     }
 
-    /// Clock the sweep unit (half-frame signal).
-    ///
-    /// Per NESdev, two things happen on each half-frame clock:
-    /// 1. If the divider is zero (and the sweep is enabled, shift nonzero,
-    ///    and not muting), the target period is applied. The reload flag
-    ///    does **not** trigger target application — only a zero divider does.
-    /// 2. If the divider is zero **or** the reload flag is set, the divider
-    ///    is reloaded to `period` and the reload flag cleared; otherwise the
-    ///    divider is decremented.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Sweep#Clocking
+    /// Clock the sweep unit (half-frame). See: https://www.nesdev.org/wiki/APU_Sweep#Clocking
     fn clock_sweep(&mut self) {
         let divider_zero = self.sweep_divider == 0;
         // Step 1: apply the target only when the divider reached zero.
@@ -389,11 +294,7 @@ impl PulseChannel {
         self.clock_sweep();
     }
 
-    /// Current output sample (0..=15). Returns 0 when the channel is
-    /// silenced (disabled, length counter zero, sweep mute, or the duty bit
-    /// at the current sequence position is 0).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Pulse#Output
+    /// Current output sample (0..=15), or 0 if silenced.
     pub fn sample(&self) -> u8 {
         if !self.enabled || self.length_counter == 0 || self.is_muted() {
             return 0;
@@ -410,30 +311,8 @@ impl PulseChannel {
     }
 }
 
-/// The NES triangle wave channel.
-///
-/// The triangle channel produces a 32-step waveform (15→0→15) at full
-/// volume — there is no envelope. Two counters gate the output:
-///
-/// - **Linear counter** — 7-bit, clocked at the quarter-frame rate. The
-///   halt flag (`$4008` bit 7) doubles as the length-counter halt flag.
-/// - **Length counter** — clocked at the half-frame rate, same table as
-///   the pulse channels.
-///
-/// The 11-bit timer ticks at the APU clock rate (CPU/2); each time it
-/// reloads the 32-step sequence advances one position.
-///
-/// Register map (see <https://www.nesdev.org/wiki/APU_Triangle>):
-///
-/// | Register  | Bits          | Function                                     |
-/// |-----------|---------------|----------------------------------------------|
-/// | `$4008`   | `Clll llll`   | Halt/loop + linear counter reload value      |
-/// | `$4009`   | `---- ----`   | Unused                                       |
-/// | `$400A`   | `TTTT TTTT`   | Timer low 8 bits                             |
-/// | `$400B`   | `LLLL LTTT`   | Length load + timer high 3 bits              |
-///
+/// The NES triangle wave channel (32-step waveform, no envelope).
 /// See: https://www.nesdev.org/wiki/APU_Triangle
-/// See: https://www.nesdev.org/wiki/APU_Length_Counter
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct TriangleChannel {
     // ---- $4008: linear counter control ---------------------------------
@@ -480,12 +359,7 @@ impl TriangleChannel {
         }
     }
 
-    /// Write to one of the triangle channel registers.
-    ///
-    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
-    /// the channel base `$4008`).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Triangle#Registers
+    /// Write to triangle channel register `reg` (0..=3). See: https://www.nesdev.org/wiki/APU_Triangle#Registers
     pub fn write_register(&mut self, reg: u8, value: u8) {
         match reg {
             0 => {
@@ -524,10 +398,7 @@ impl TriangleChannel {
         }
     }
 
-    /// Set the channel enable flag from `$4015`. When cleared, the length
-    /// counter is immediately forced to 0 (silencing the channel).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Status
+    /// Set channel enable from `$4015`; clearing forces length counter to 0.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
@@ -565,11 +436,7 @@ impl TriangleChannel {
         self.sequence
     }
 
-    /// Advance the channel by one APU cycle (half a CPU cycle). The timer
-    /// counts down; on reaching zero it reloads to the period and the
-    /// 32-step waveform sequencer advances one step.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Triangle#Timer
+    /// Advance by one APU cycle: timer counts down, sequencer advances on reload.
     pub fn tick(&mut self) {
         if self.timer == 0 {
             self.timer = self.timer_period;
@@ -579,16 +446,7 @@ impl TriangleChannel {
         }
     }
 
-    /// Clock the linear counter (quarter-frame signal from the frame
-    /// counter).
-    ///
-    /// Per NESdev:
-    /// 1. If the start flag is set, reload the counter and clear start.
-    /// 2. Else if the counter is non-zero, decrement it.
-    /// 3. If the halt flag is set, set the start flag (so step 1 runs next
-    ///    quarter-frame — the counter never decrements while halt is set).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Triangle#Linear_counter
+    /// Clock the linear counter (quarter-frame). See: https://www.nesdev.org/wiki/APU_Triangle#Linear_counter
     fn clock_linear(&mut self) {
         if self.linear_start {
             self.linear_start = false;
@@ -601,11 +459,7 @@ impl TriangleChannel {
         }
     }
 
-    /// Clock the length counter (half-frame signal). The counter is held
-    /// (not decremented) when the halt flag is set (shared with the linear
-    /// counter halt).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Length_Counter#Clocking
+    /// Clock the length counter (half-frame); held when halt flag is set.
     fn clock_length(&mut self) {
         if !self.halt && self.length_counter > 0 {
             self.length_counter -= 1;
@@ -617,19 +471,12 @@ impl TriangleChannel {
         self.clock_linear();
     }
 
-    /// Half-frame clock: clocks the length counter (the linear counter is
-    /// also clocked at the quarter-frame rate, which the frame counter
-    /// calls separately).
+    /// Half-frame clock: clocks the length counter.
     pub fn clock_half_frame(&mut self) {
         self.clock_length();
     }
 
-    /// Current output sample (0..=15). Returns 0 when the channel is
-    /// disabled or silenced by the length counter or the linear counter
-    /// reaching zero. The triangle channel has no envelope — the output
-    /// level is taken directly from the 32-step waveform sequence.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Triangle#Output
+    /// Current output sample (0..=15), or 0 if silenced.
     pub fn sample(&self) -> u8 {
         if !self.enabled || self.length_counter == 0 || self.linear_counter == 0 {
             return 0;
@@ -638,26 +485,8 @@ impl TriangleChannel {
     }
 }
 
-/// The NES noise channel.
-///
-/// The noise channel produces pseudo-random audio via a 15-bit linear-
-/// feedback shift register (LFSR). Two feedback taps are selectable via
-/// the mode bit (`$400E` bit 7): bits 0+1 (default, periodic) or bits 0+6
-/// (metallic). The channel shares the envelope + length-counter design
-/// of the pulse channels but has no sweep and a fixed lookup-table period.
-///
-/// Register map (see <https://www.nesdev.org/wiki/APU_Noise>):
-///
-/// | Register  | Bits          | Function                                     |
-/// |-----------|---------------|----------------------------------------------|
-/// | `$400C`   | `--LC VVVV`   | Halt/loop + constant-volume + volume         |
-/// | `$400D`   | `---- ----`   | Unused                                       |
-/// | `$400E`   | `L--- PPPP`   | Mode + period select (index into table)      |
-/// | `$400F`   | `LLLL L---`   | Length load + envelope restart               |
-///
+/// The NES noise channel (15-bit LFSR, envelope + length counter, no sweep).
 /// See: https://www.nesdev.org/wiki/APU_Noise
-/// See: https://www.nesdev.org/wiki/APU_Envelope
-/// See: https://www.nesdev.org/wiki/APU_Length_Counter
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct NoiseChannel {
     // ---- $400C: envelope / length control ------------------------------
@@ -705,9 +534,7 @@ pub struct NoiseChannel {
 }
 
 impl NoiseChannel {
-    /// Create a new, fully-reset noise channel. The LFSR is initialized
-    /// to 1 per the NESdev wiki and the timer period defaults to the
-    /// first entry of the noise period table.
+    /// Create a reset noise channel (LFSR=1, period=table[0]).
     fn new() -> Self {
         Self {
             halt: false,
@@ -726,12 +553,7 @@ impl NoiseChannel {
         }
     }
 
-    /// Write to one of the noise channel registers.
-    ///
-    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
-    /// the channel base `$400C`).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Noise#Registers
+    /// Write to noise channel register `reg` (0..=3). See: https://www.nesdev.org/wiki/APU_Noise#Registers
     pub fn write_register(&mut self, reg: u8, value: u8) {
         match reg {
             0 => {
@@ -762,10 +584,7 @@ impl NoiseChannel {
         }
     }
 
-    /// Set the channel enable flag from `$4015`. When cleared, the length
-    /// counter is immediately forced to 0 (silencing the channel).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Status
+    /// Set channel enable from `$4015`; clearing forces length counter to 0.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
@@ -838,9 +657,7 @@ impl NoiseChannel {
         }
     }
 
-    /// Clock the envelope (quarter-frame signal from the frame counter).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Envelope#Clocking
+    /// Clock the envelope (quarter-frame). See: https://www.nesdev.org/wiki/APU_Envelope#Clocking
     pub fn clock_envelope(&mut self) {
         if self.envelope_start {
             self.envelope_start = false;
@@ -858,10 +675,7 @@ impl NoiseChannel {
         }
     }
 
-    /// Clock the length counter (half-frame signal). The counter is held
-    /// (not decremented) when the halt flag is set.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Length_Counter#Clocking
+    /// Clock the length counter (half-frame); held when halt flag is set.
     fn clock_length(&mut self) {
         if !self.halt && self.length_counter > 0 {
             self.length_counter -= 1;
@@ -878,12 +692,7 @@ impl NoiseChannel {
         self.clock_length();
     }
 
-    /// Current output sample (0..=15). Returns 0 when the channel is
-    /// silenced (length counter zero) or when LFSR bit 0 is set (the
-    /// hardware gates the output on the inverted bit 0). Otherwise the
-    /// output is the envelope decay level (or constant volume).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Noise#Output
+    /// Current output sample (0..=15), or 0 if silenced.
     pub fn sample(&self) -> u8 {
         if !self.enabled || self.length_counter == 0 {
             return 0;
@@ -899,36 +708,12 @@ impl NoiseChannel {
     }
 }
 
-/// DMC rate table (NTSC) — timer period in APU cycles (CPU clock / 2).
-/// The NESdev wiki lists these in CPU cycles: [428, 380, 340, 320, 298,
-/// 276, 254, 226, 214, 190, 170, 160, 142, 126, 108, 84]. Dividing by 2
-/// gives the APU-cycle period since the DMC timer is clocked at the APU
-/// rate alongside the other channel timers.
-///
-/// See: https://www.nesdev.org/wiki/APU_DMC#Rate_table
+/// DMC rate table (NTSC, APU cycles). See: https://www.nesdev.org/wiki/APU_DMC#Rate_table
 const DMC_RATE_TABLE: [u16; 16] = [
     214, 190, 170, 160, 149, 138, 127, 113, 107, 95, 85, 80, 71, 63, 54, 42,
 ];
 
-/// The NES DMC (Delta Modulation Channel) — plays DMA-fetched 1-bit delta
-/// samples from CPU memory at a configurable rate. The output is a 7-bit
-/// DAC counter (0..=127) that increments by 2 on a `1` bit and decrements
-/// by 2 on a `0` bit (saturating at both ends).
-///
-/// The channel has no length counter; instead it plays a fixed-length
-/// sample (1..=4081 bytes) starting at a configurable address
-/// (`$C000 + ($4012 << 6)`). When the sample completes, the channel
-/// optionally raises an IRQ (if `$4010` bit 7 is set) or loops.
-///
-/// Register map (see <https://www.nesdev.org/wiki/APU_DMC>):
-///
-/// | Register  | Bits          | Function                                     |
-/// |-----------|---------------|----------------------------------------------|
-/// | `$4010`   | `IL-- RRRR`   | IRQ enable, loop, rate index                 |
-/// | `$4011`   | `-DDD DDDD`   | Direct DAC load (bits 0-6; bit 7 ignored)    |
-/// | `$4012`   | `AAAA AAAA`   | Sample address (base = value << 6 + $C000)   |
-/// | `$4013`   | `LLLL LLLL`   | Sample length (value << 4 + 1 bytes)         |
-///
+/// The NES DMC (Delta Modulation Channel) — DMA-fetched 1-bit delta samples.
 /// See: https://www.nesdev.org/wiki/APU_DMC
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct DmcChannel {
@@ -976,8 +761,7 @@ pub struct DmcChannel {
 }
 
 impl DmcChannel {
-    /// Create a new, fully-reset DMC channel. The output counter starts
-    /// at 0 and the timer period defaults to the first rate-table entry.
+    /// Create a reset DMC channel (output=0, rate=table[0]).
     fn new() -> Self {
         Self {
             irq_enable: false,
@@ -997,12 +781,7 @@ impl DmcChannel {
         }
     }
 
-    /// Write to one of the DMC channel registers.
-    ///
-    /// `reg` is `0..=3` (the low 2 bits of the address after subtracting
-    /// the channel base `$4010`).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_DMC#Registers
+    /// Write to DMC register `reg` (0..=3). See: https://www.nesdev.org/wiki/APU_DMC#Registers
     pub fn write_register(&mut self, reg: u8, value: u8) {
         match reg {
             0 => {
@@ -1029,12 +808,7 @@ impl DmcChannel {
         }
     }
 
-    /// Set the channel enable flag from `$4015` bit 4. When enabled and
-    /// the sample is not already playing (`bytes_remaining == 0`), the
-    /// sample is restarted from the base address. When disabled, bytes
-    /// remaining is forced to 0 but the output counter keeps its value.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Status
+    /// Set channel enable from `$4015` bit 4; enabling restarts sample if idle.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if enabled {
@@ -1112,13 +886,7 @@ impl DmcChannel {
         self.irq_flag = false;
     }
 
-    /// Advance the channel by one APU cycle (half a CPU cycle). The timer
-    /// counts down; on reaching zero it reloads to the period and the
-    /// output unit clocks one bit. `read` is a closure that fetches a
-    /// byte from CPU memory at the given address (used for DMA sample
-    /// fetches).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_DMC#Output_unit
+    /// Advance by one APU cycle; `read` fetches bytes from CPU memory for DMA.
     pub fn tick(&mut self, read: &mut impl FnMut(u16) -> u8) {
         if self.timer == 0 {
             self.timer = self.timer_period;
@@ -1128,15 +896,7 @@ impl DmcChannel {
         }
     }
 
-    /// Clock the output unit: optionally fetch a byte from memory, then
-    /// shift one bit out and update the output counter.
-    ///
-    /// Per NESdev, each timer tick does the following in order:
-    /// 1. If the sample buffer is empty and bytes remain, fetch a byte.
-    /// 2. If the sample buffer is non-empty, shift one bit out and update
-    ///    the output counter.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_DMC#Output_unit
+    /// Clock the output unit: fetch byte if buffer empty, shift one bit, update DAC.
     fn clock_output_unit(&mut self, read: &mut impl FnMut(u16) -> u8) {
         // Step 1: refill the sample buffer if empty and bytes remain.
         if self.buffer_bits == 0 && self.bytes_remaining > 0 {
@@ -1172,11 +932,7 @@ impl DmcChannel {
         }
     }
 
-    /// Current output sample (0..=127). The DMC always outputs its DAC
-    /// counter value regardless of the enabled flag (the counter retains
-    /// its value after the channel is disabled).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_DMC#Output
+    /// Current output sample (0..=127) — always outputs DAC value.
     pub fn sample(&self) -> u8 {
         self.output_counter
     }
@@ -1198,28 +954,37 @@ pub struct Apu {
     cycle_accumulator: u32,
 
     // ---- Per-channel volume / mute (M31) --------------------------------
-    /// Per-channel volume scalars in `[0.0, 1.0]`, indexed as
-    /// `[pulse1, pulse2, triangle, noise, dmc]`. Applied to each
-    /// channel's raw sample before the non-linear mix. `0.0` is
-    /// equivalent to mute (but distinct from `channel_muted` so a
-    /// "reset" can restore the configured volume). Defaults to `1.0`
-    /// (full volume). Set at startup from `config.toml`
-    /// `[audio_channels]` and adjustable at runtime via hotkeys.
+    /// Per-channel volume scalars `[0.0, 1.0]` (pulse1..dmc).
     channel_volumes: [f32; 5],
-    /// Per-channel mute flags. A muted channel contributes 0 to the
-    /// mix regardless of its volume scalar. Toggled at runtime via
-    /// `Alt+1`..`Alt+5` + `Alt+M` (M31).
+    /// Per-channel mute flags, toggled at runtime via hotkeys.
     channel_muted: [bool; 5],
-    /// Currently-selected channel index (0..4) for volume adjustment
-    /// hotkeys (`Alt+Up`/`Alt+Down`). Advanced by `Alt+1`..`Alt+5`.
+    /// Selected channel index (0..4) for volume adjustment hotkeys.
     selected_channel: u8,
 
     // ---- Low-pass filter (M31) ------------------------------------------
-    /// Previous output sample held by the one-pole low-pass filter.
-    /// The LPF smooths harsh square-wave harmonics above ~12 kHz.
-    /// Updated each `output()` call; serialized so save states preserve
-    /// filter state.
+    /// Previous output sample for the one-pole low-pass filter.
     lpf_prev: f32,
+
+    // ---- DC blocker -----------------------------------------------------
+    /// DC blocker (one-pole high-pass ~20 Hz) previous input/output.
+    #[serde(default)]
+    dc_prev_x: f32,
+    #[serde(default)]
+    dc_prev_y: f32,
+
+    // ---- Anti-alias decimation -----------------------------------------
+    /// Accumulator for raw mixed output before decimation/LPF.
+    #[serde(default)]
+    mix_accumulator: f32,
+    /// Number of APU ticks accumulated toward the next decimated sample.
+    #[serde(default)]
+    mix_count: u32,
+    /// Fractional APU-cycle accumulator toward next output sample.
+    #[serde(default)]
+    sample_accumulator: f32,
+    /// Most recently decimated output sample (before LPF/DC blocker).
+    #[serde(default)]
+    last_decimated: f32,
 
     // ---- Frame counter ($4017) -----------------------------------------
     /// `true` for 5-step mode (bit 7 of `$4017`), `false` for 4-step mode.
@@ -1239,10 +1004,7 @@ pub struct Apu {
     frame_reset_delay: u32,
 
     // ---- Region / TV system (M32) --------------------------------------
-    /// TV system / region. Controls the APU frame-counter thresholds
-    /// (NTSC/Dendy use 7457/14913/22371/29828; PAL uses
-    /// 8314/16627/24941/33255). Defaults to NTSC. Dendy uses NTSC
-    /// thresholds (its APU is NTSC-style despite the 50 Hz video frame).
+    /// TV system / region (controls frame-counter thresholds).
     #[serde(default)]
     region: crate::region::Region,
 }
@@ -1264,6 +1026,14 @@ impl Apu {
             // (all channels off) produces a steady -1.0 immediately,
             // with no startup transient ramping 0 → -1.0 (audible click).
             lpf_prev: -1.0,
+            // DC blocker starts at 0 (no DC offset before any audio).
+            dc_prev_x: -1.0,
+            dc_prev_y: 0.0,
+            // Anti-alias decimation starts empty.
+            mix_accumulator: 0.0,
+            mix_count: 0,
+            sample_accumulator: 0.0,
+            last_decimated: -1.0, // silence level
             frame_mode_5step: false,
             frame_irq_inhibit: false,
             frame_cycle: 0,
@@ -1323,12 +1093,7 @@ impl Apu {
         &mut self.dmc
     }
 
-    /// Write the status register `$4015`. Bits 0-3 enable/disable the
-    /// pulse 1, pulse 2, triangle, and noise channels (clearing a bit
-    /// forces that channel's length counter to zero). Bit 4 enables the
-    /// DMC channel (restarting the sample from its base address).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Status
+    /// Write `$4015` status register (channel enable/disable bits). See: https://www.nesdev.org/wiki/APU_Status
     pub fn write_status(&mut self, value: u8) {
         self.pulse1.set_enabled(value & 0x01 != 0);
         self.pulse2.set_enabled(value & 0x02 != 0);
@@ -1337,12 +1102,7 @@ impl Apu {
         self.dmc.set_enabled(value & 0x10 != 0);
     }
 
-    /// Read the status register `$4015`. Bits 0-4 reflect whether each
-    /// channel's length counter / bytes-remaining is non-zero. Bit 6 is
-    /// the frame counter IRQ flag; bit 7 is the DMC IRQ flag. Reading
-    /// `$4015` clears both IRQ flags (matching real hardware).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Status
+    /// Read `$4015` status (channel active bits + IRQ flags; clears IRQs). See: https://www.nesdev.org/wiki/APU_Status
     pub fn read_status(&mut self) -> u8 {
         let mut v = 0u8;
         if self.pulse1.length_counter > 0 {
@@ -1372,16 +1132,7 @@ impl Apu {
         v
     }
 
-    /// Write the frame counter control register `$4017`.
-    ///
-    /// - Bit 7: mode (`0` = 4-step, `1` = 5-step).
-    /// - Bit 6: IRQ inhibit (`1` = suppress frame counter IRQ).
-    ///
-    /// On write, the frame counter is reset after a short delay (~3-4 CPU
-    /// cycles on real hardware; modeled here as a 4-cycle delay). In 5-step
-    /// mode, an immediate quarter+half-frame clock is also performed.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Frame_Counter
+    /// Write `$4017` frame counter control (mode + IRQ inhibit). See: https://www.nesdev.org/wiki/APU_Frame_Counter
     pub fn write_frame_counter(&mut self, value: u8) {
         let new_mode_5step = (value & 0x80) != 0;
         self.frame_irq_inhibit = (value & 0x40) != 0;
@@ -1403,39 +1154,33 @@ impl Apu {
         self.frame_mode_5step = new_mode_5step;
     }
 
-    /// Whether the APU has a pending IRQ (frame counter or DMC). The
-    /// emulator main loop polls this after each CPU step and raises
-    /// `Cpu::irq_pending` when it returns `true`.
+    /// Whether the APU has a pending IRQ (frame counter or DMC).
     pub fn irq_pending(&self) -> bool {
         self.frame_irq || self.dmc.irq_flag
     }
 
-    /// Current TV system / region (M32). Controls the APU frame-counter
-    /// thresholds.
+    /// Current TV system / region.
     pub fn region(&self) -> crate::region::Region {
         self.region
     }
 
-    /// Set the TV system / region (M32). The frame-counter thresholds
-    /// and reset point are derived from the region on each
-    /// `step_frame_counter` call, so no state rebasing is needed.
+    /// Set the TV system / region.
     pub fn set_region(&mut self, region: crate::region::Region) {
         self.region = region;
     }
 
-    /// Advance the APU by `cpu_cycles` CPU cycles. All channel timers
-    /// (including the DMC) tick once per APU cycle (every 2 CPU cycles).
-    /// The frame counter advances at the CPU clock rate and triggers
-    /// quarter/half-frame clocks at the appropriate cycle counts. `read`
-    /// is a closure that fetches a byte from CPU memory at the given
-    /// address (used by the DMC for DMA sample fetches).
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Frame_Counter
+    /// Advance APU by `cpu_cycles` CPU cycles; `read` fetches bytes for DMC DMA.
     pub fn step(&mut self, cpu_cycles: u32, mut read: impl FnMut(u16) -> u8) {
         // ---- Frame counter (CPU clock rate) ----
         self.step_frame_counter(cpu_cycles);
 
         // ---- Channel timers (APU clock rate = CPU / 2) ----
+        // Each APU tick advances all channel timers and accumulates the
+        // raw mixed output. When enough APU cycles have been accumulated
+        // for one 44.1 kHz output sample, the average is computed and
+        // stored in `last_decimated`. This box-filter decimation prevents
+        // aliasing of high-frequency pulse channels (e.g. fireball whine).
+        let apu_cycles_per_sample = self.region.cpu_cycles_per_sample() / 2.0;
         self.cycle_accumulator = self.cycle_accumulator.saturating_add(cpu_cycles);
         while self.cycle_accumulator >= 2 {
             self.cycle_accumulator -= 2;
@@ -1444,27 +1189,23 @@ impl Apu {
             self.triangle.tick();
             self.noise.tick();
             self.dmc.tick(&mut read);
+
+            self.mix_accumulator += self.mix_raw();
+            self.mix_count += 1;
+            self.sample_accumulator += 1.0;
+
+            if self.sample_accumulator >= apu_cycles_per_sample {
+                self.sample_accumulator -= apu_cycles_per_sample;
+                if self.mix_count > 0 {
+                    self.last_decimated = self.mix_accumulator / self.mix_count as f32;
+                    self.mix_accumulator = 0.0;
+                    self.mix_count = 0;
+                }
+            }
         }
     }
 
-    /// Advance the frame counter by `cpu_cycles` CPU cycles, firing
-    /// quarter/half-frame clocks and IRQ at the appropriate thresholds.
-    ///
-    /// 4-step mode thresholds (NTSC, CPU cycles):
-    /// - 7457: quarter-frame
-    /// - 14913: quarter + half-frame
-    /// - 22371: quarter-frame
-    /// - 29828: quarter + half-frame + IRQ (if not inhibited)
-    /// - 29830: counter resets
-    ///
-    /// 5-step mode thresholds:
-    /// - 7457: quarter-frame
-    /// - 14913: quarter + half-frame
-    /// - 22371: quarter-frame
-    /// - 37281: quarter + half-frame (no IRQ)
-    /// - 37282: counter resets
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Frame_Counter
+    /// Advance frame counter by `cpu_cycles`, firing quarter/half-frame clocks and IRQ. See: https://www.nesdev.org/wiki/APU_Frame_Counter
     fn step_frame_counter(&mut self, cpu_cycles: u32) {
         // Handle the pending reset delay from a $4017 write.
         if self.frame_reset_delay > 0 {
@@ -1522,9 +1263,7 @@ impl Apu {
         }
     }
 
-    /// Quarter-frame signal — clocks the pulse/noise envelopes and the
-    /// triangle linear counter. Called by the frame counter (M16) at
-    /// ≈240 Hz NTSC.
+    /// Quarter-frame signal — clocks envelopes and triangle linear counter.
     pub fn clock_quarter_frame(&mut self) {
         self.pulse1.clock_quarter_frame();
         self.pulse2.clock_quarter_frame();
@@ -1532,10 +1271,7 @@ impl Apu {
         self.noise.clock_quarter_frame();
     }
 
-    /// Half-frame signal — clocks the length counters (all four channels)
-    /// and the pulse sweep units. The triangle linear counter is clocked
-    /// separately at the quarter-frame rate by `clock_quarter_frame`.
-    /// Called by the frame counter (M16) at ≈120 Hz NTSC.
+    /// Half-frame signal — clocks length counters and pulse sweep units.
     pub fn clock_half_frame(&mut self) {
         self.pulse1.clock_half_frame();
         self.pulse2.clock_half_frame();
@@ -1543,11 +1279,7 @@ impl Apu {
         self.noise.clock_half_frame();
     }
 
-    /// Mix the current channel samples into a single 0..=15 value (linear
-    /// sum, clamped). This is the simple linear mixer used for debug
-    /// inspection; the actual audio path uses the hardware-accurate
-    /// non-linear mixer in [`Apu::output`] (M31). The DMC is not included
-    /// here; see [`Apu::output`] for the full mix including DMC.
+    /// Linear mix of 4 channels (0..=15, clamped). Debug-only; use `output()` for audio.
     pub fn mix(&self) -> u8 {
         let s = self.pulse1.sample() as u16
             + self.pulse2.sample() as u16
@@ -1560,55 +1292,14 @@ impl Apu {
         }
     }
 
-    /// Full audio output sample as an `f32` in `[-1.0, 1.0]`, including
-    /// all five channels (M31: non-linear hardware-accurate mixing).
-    ///
-    /// The NES APU mixer is non-linear: the two pulse channels share one
-    /// mixing junction and the triangle/noise/DMC share another. The
-    /// formulas (from the NESdev wiki "APU Mixer" page) are:
-    ///
-    /// - `pulse_out = 95.52 / (8128.0 / (p1 + p2) + 100.0)` (0 if p1+p2 = 0)
-    /// - `tnd_out = 163.67 / (1.0 / (tri/8227 + noise/12241 + dmc/22638) + 100.0)`
-    ///   (0 if the inner sum is 0)
-    ///
-    /// Each channel's raw sample is first scaled by its per-channel
-    /// volume scalar and zeroed if muted (M31). The mixed value
-    /// (`pulse_out + tnd_out`, range ~0..1.017) is then mapped to
-    /// `[-1.0, 1.0]` via `out = mixed * 2.0 - 1.0` (so silence → -1.0,
-    /// matching the pre-M31 centered mapping for backward compatibility
-    /// with the DC-offset acceptance documented in M16) and run through
-    /// a one-pole low-pass filter (~12 kHz cutoff) to smooth harsh
-    /// square-wave harmonics.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU_Mixer
+    /// Full audio output `[-1.0, 1.0]` with non-linear mixing + LPF + DC blocker. See: https://www.nesdev.org/wiki/APU_Mixer
     pub fn output(&mut self) -> f32 {
-        // Per-channel raw samples, scaled by volume and muted.
-        let p1 = self.scaled_sample(0, self.pulse1.sample());
-        let p2 = self.scaled_sample(1, self.pulse2.sample());
-        let tri = self.scaled_sample(2, self.triangle.sample());
-        let noise = self.scaled_sample(3, self.noise.sample());
-        let dmc = self.scaled_sample(4, self.dmc.sample());
-
-        // Non-linear pulse junction.
-        // https://www.nesdev.org/wiki/APU_Mixer
-        let pulse_sum = p1 + p2;
-        let pulse_out = if pulse_sum > 0.0 {
-            95.52 / (8128.0 / pulse_sum + 100.0)
-        } else {
-            0.0
-        };
-
-        // Non-linear triangle/noise/DMC junction.
-        let tnd_inner = tri / 8227.0 + noise / 12241.0 + dmc / 22638.0;
-        let tnd_out = if tnd_inner > 0.0 {
-            163.67 / (1.0 / tnd_inner + 100.0)
-        } else {
-            0.0
-        };
-
-        // Map [0, ~1.017] → [-1.0, ~1.034] and clamp to [-1.0, 1.0].
-        let mixed = (pulse_out + tnd_out) * 2.0 - 1.0;
-        let clamped = mixed.clamp(-1.0, 1.0);
+        // Use the most recently decimated sample from `step()`. The
+        // decimation happens inside `step()` at the correct 44.1 kHz rate,
+        // so this value is always a proper box-filter average of ~20 APU
+        // ticks, regardless of how many times `output()` is called between
+        // `step()` calls.
+        let clamped = self.last_decimated;
 
         // One-pole low-pass filter (cutoff ≈ 12 kHz at 44.1 kHz).
         // y[n] = a * x[n] + (1 - a) * y[n-1], where
@@ -1616,12 +1307,47 @@ impl Apu {
         const LPF_ALPHA: f32 = 0.8192;
         let filtered = LPF_ALPHA * clamped + (1.0 - LPF_ALPHA) * self.lpf_prev;
         self.lpf_prev = filtered;
-        filtered
+
+        // DC blocker (one-pole high-pass filter at ~20 Hz).
+        // Removes the -1.0 DC offset from the non-linear mixer's silence
+        // mapping so that sudden channel starts/stops don't produce
+        // audible clicks.  R = 1 - 2*pi*fc/fs ≈ 0.99715 for fc=20Hz,
+        // fs=44100Hz.
+        // y[n] = x[n] - x[n-1] + R * y[n-1]
+        const DC_R: f32 = 0.99715;
+        let dc_out = filtered - self.dc_prev_x + DC_R * self.dc_prev_y;
+        self.dc_prev_x = filtered;
+        self.dc_prev_y = dc_out;
+        dc_out
     }
 
-    /// Return a channel's raw sample scaled by its per-channel volume
-    /// scalar and zeroed if muted. `idx` is 0=pulse1, 1=pulse2,
-    /// 2=triangle, 3=noise, 4=dmc. Out-of-range indices return 0.0.
+    /// Raw non-linear mix mapped to [-1.0, 1.0] (before LPF/DC blocker).
+    fn mix_raw(&self) -> f32 {
+        let p1 = self.scaled_sample(0, self.pulse1.sample());
+        let p2 = self.scaled_sample(1, self.pulse2.sample());
+        let tri = self.scaled_sample(2, self.triangle.sample());
+        let noise = self.scaled_sample(3, self.noise.sample());
+        let dmc = self.scaled_sample(4, self.dmc.sample());
+
+        let pulse_sum = p1 + p2;
+        let pulse_out = if pulse_sum > 0.0 {
+            95.52 / (8128.0 / pulse_sum + 100.0)
+        } else {
+            0.0
+        };
+
+        let tnd_inner = tri / 8227.0 + noise / 12241.0 + dmc / 22638.0;
+        let tnd_out = if tnd_inner > 0.0 {
+            163.67 / (1.0 / tnd_inner + 100.0)
+        } else {
+            0.0
+        };
+
+        let mixed = (pulse_out + tnd_out) * 2.0 - 1.0;
+        mixed.clamp(-1.0, 1.0)
+    }
+
+    /// Scale a channel's sample by its volume scalar (0 if muted).
     fn scaled_sample(&self, idx: usize, raw: u8) -> f32 {
         if idx >= self.channel_volumes.len() || self.channel_muted[idx] {
             return 0.0;
@@ -3042,15 +2768,22 @@ mod tests {
         let mut apu = Apu::new();
         // DMC output = 127, all other channels silent.
         apu.dmc_mut().write_register(1, 0x7F);
+        // Step enough CPU cycles to produce one decimated sample
+        // (~20.29 APU cycles = ~40.58 CPU cycles). DMC output is
+        // constant, so the decimated average equals the instantaneous.
+        apu.step(42, |_| 0);
         let out = apu.output();
         // M31 non-linear mixer: pulse_out = 0 (no pulse), tnd_out with
         // only DMC = 127 → 163.67 / (1/(127/22638) + 100) ≈ 0.5883.
         // mixed = 0.5883 * 2 - 1 = 0.1766. LPF starts at -1.0 (silence)
-        // so first sample = 0.8192*0.1766 + 0.1808*(-1.0) ≈ -0.0359.
-        // Allow tolerance for the LPF transient from the silence init.
+        // so first LPF sample = 0.8192*0.1766 + 0.1808*(-1.0) ≈ -0.0359.
+        // DC blocker first sample = -0.0359 - (-1.0) + 0.99715*0.0 ≈ 0.9641.
+        // This is the expected transient as the DC blocker removes the
+        // -1.0 silence offset. After many samples the output converges
+        // toward 0 (constant DMC is DC, which the blocker removes).
         assert!(
-            (out - (-0.0359)).abs() < 2e-2,
-            "expected ~-0.0359 (non-linear DMC + LPF from silence), got {out}"
+            (out - 0.9641).abs() < 2e-2,
+            "expected ~0.9641 (non-linear DMC + LPF + DC blocker transient), got {out}"
         );
     }
 
@@ -3058,42 +2791,46 @@ mod tests {
     fn apu_output_with_both_ptn_and_dmc() {
         let mut apu = Apu::new();
         apu.write_status(0x01);
-        // Duty 3 (bits 6-7 = 11) → sequence [1,0,0,0,1,1,1,1], seq[0] = 1.
-        // Const vol 15 (bit 4 + bits 0-3 = 0x1F). So $4000 = 0xDF.
-        apu.pulse1_mut().write_register(0, 0b1101_1111); // duty 3, const vol 15
-                                                         // Period must be >= MIN_AUDIBLE_PERIOD (8) to avoid muting.
-        apu.pulse1_mut().write_register(2, 0x08); // timer low = 8
+        // Duty 2 (bits 6-7 = 10) → sequence [0,1,1,1,1,1,1,1], seq[1] = 1.
+        // Const vol 15 (bit 4 + bits 0-3 = 0x1F). Period 255 so the waveform
+        // doesn't change over one decimation window (~21 APU ticks).
+        apu.pulse1_mut().write_register(0, 0b1011_1111); // duty 2, const vol 15
+        apu.pulse1_mut().write_register(2, 0xFF); // timer low = 255
         apu.pulse1_mut().write_register(3, 0x00); // length 10, timer high = 0
         apu.dmc_mut().write_register(1, 0x7F); // DMC = 127
+                                               // Step enough CPU cycles to produce one decimated sample.
+                                               // After the first APU tick, seq advances from 0 to 1 (duty_bit=1
+                                               // for duty 2), and with period 255 it stays there for all 21 ticks.
+        apu.step(42, |_| 0);
         let out = apu.output();
         // M31 non-linear: pulse_out = 95.52/(8128/15+100) ≈ 0.1488,
         // tnd_out ≈ 0.5883 (DMC only). mixed = (0.1488+0.5883)*2-1 ≈ 0.4742.
         // LPF from silence (-1.0): 0.8192*0.4742 + 0.1808*(-1.0) ≈ 0.2081.
+        // DC blocker first sample = 0.2081 - (-1.0) + 0.99715*0.0 ≈ 1.2081.
+        // This transient is expected; the emulator clamps to [-1, 1].
         assert!(
-            (out - 0.2081).abs() < 2e-2,
-            "expected ~0.2081 (non-linear pulse+DMC + LPF from silence), got {out}"
+            (out - 1.2081).abs() < 2e-2,
+            "expected ~1.2081 (non-linear pulse+DMC + LPF + DC blocker transient), got {out}"
         );
     }
 
     #[test]
-    fn apu_output_silence_is_negative_one() {
+    fn apu_output_silence_is_zero() {
         let mut apu = Apu::new();
         // All channels off, DMC = 0. Non-linear mixer: pulse_out = 0,
         // tnd_out = 0 → mixed = 0*2 - 1 = -1.0. The LPF is initialized
-        // to -1.0 (the silence level) so there is no boot transient —
-        // the very first sample is already -1.0.
+        // to -1.0 (the silence level) so the LPF output is -1.0.
+        // The DC blocker removes the -1.0 DC offset: first sample =
+        // -1.0 - (-1.0) + R*0.0 = 0.0.
         let out = apu.output();
         assert!(
-            (out - (-1.0_f32)).abs() < 1e-6,
-            "expected silence to be -1.0 from first sample, got {out}"
+            out.abs() < 1e-6,
+            "expected silence to be 0.0 from first sample (DC blocker), got {out}"
         );
-        // Stays at -1.0.
+        // Stays at 0.0.
         for _ in 0..10 {
             let out = apu.output();
-            assert!(
-                (out - (-1.0_f32)).abs() < 1e-6,
-                "silence should stay at -1.0, got {out}"
-            );
+            assert!(out.abs() < 1e-6, "silence should stay at 0.0, got {out}");
         }
     }
 

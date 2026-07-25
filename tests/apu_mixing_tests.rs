@@ -22,10 +22,13 @@ fn pulse_audible(apu: &mut Apu, pulse2: bool, volume: u8) {
     };
     // duty 3 (bits 6-7 = 11), const vol (bit 4), volume bits 0-3.
     p.write_register(0, 0b1101_0000 | (volume & 0x0F));
-    // period low = 8 (>= MIN_AUDIBLE_PERIOD to avoid mute).
-    p.write_register(2, 0x08);
-    // length 10, timer high = 0.
-    p.write_register(3, 0x00);
+    // period low = 0xFF (>= MIN_AUDIBLE_PERIOD to avoid mute).
+    p.write_register(2, 0xFF);
+    // length 10 (idx 0), timer high = 7 → timer = 0x0700 = 1792.
+    // This keeps the sequence at position 0 during the ~21-tick
+    // decimation window (timer won't reach 0), so the pulse output
+    // is constant for box-filter averaging.
+    p.write_register(3, 0x07);
 }
 
 /// Set the triangle channel to output its sequence position 0 value
@@ -33,8 +36,10 @@ fn pulse_audible(apu: &mut Apu, pulse2: bool, volume: u8) {
 /// The caller must enable the triangle channel via `write_status`.
 fn triangle_audible(apu: &mut Apu) {
     apu.triangle_mut().write_register(0, 0x7F); // halt + linear 127
-    apu.triangle_mut().write_register(2, 0x00); // period low 0
-    apu.triangle_mut().write_register(3, 0x00); // length 10, timer high 0
+    apu.triangle_mut().write_register(2, 0xFF); // period low 0xFF
+                                                // length 10 (idx 0), timer high = 7 → timer = 0x0700 = 1792.
+                                                // Keeps sequence at position 0 (output = 15) during decimation.
+    apu.triangle_mut().write_register(3, 0x07);
     apu.clock_quarter_frame(); // start linear counter
 }
 
@@ -46,6 +51,14 @@ fn noise_audible(apu: &mut Apu, volume: u8) {
         .write_register(0, 0b0001_0000 | (volume & 0x0F));
     apu.noise_mut().write_register(3, 0x00); // length 10
     let _ = volume;
+}
+
+/// Step the APU by enough CPU cycles to produce one decimated output
+/// sample (~40.58 CPU cycles = ~20.29 APU cycles). This is needed
+/// because `output()` returns the most recently decimated sample from
+/// `step()`, not an instantaneous mix.
+fn step_one_sample(apu: &mut Apu) {
+    apu.step(42, |_| 0);
 }
 
 /// Set the DMC output counter directly via $4011.
@@ -77,20 +90,27 @@ fn lpf_step(prev: f32, input: f32) -> f32 {
     ALPHA * input + (1.0 - ALPHA) * prev
 }
 
+/// Apply the DC blocker first-sample transform. The DC blocker removes
+/// the -1.0 silence DC offset: first sample = lpf_out - (-1.0) + R*0.0
+/// = lpf_out + 1.0, where R ≈ 0.99715.
+fn dc_block_first(lpf_out: f32) -> f32 {
+    lpf_out + 1.0
+}
+
 // ---- Silence ----------------------------------------------------------
 
 #[test]
-fn silence_outputs_near_negative_one_after_warmup() {
+fn silence_outputs_near_zero_after_warmup() {
     let mut apu = Apu::new();
     // All channels off; DMC = 0. Non-linear mix = 0 → mapped to -1.0.
-    // LPF converges to -1.0 after a few samples.
+    // LPF converges to -1.0, then DC blocker removes the DC offset → 0.0.
     let mut last = 0.0;
     for _ in 0..200 {
         last = apu.output();
     }
     assert!(
-        (last - (-1.0_f32)).abs() < 1e-3,
-        "silence should converge to -1.0, got {last}"
+        last.abs() < 1e-3,
+        "silence should converge to 0.0 (DC blocker), got {last}"
     );
 }
 
@@ -109,12 +129,13 @@ fn pulse_only_nonlinear_value() {
         (expected_raw - (-0.70236)).abs() < 1e-3,
         "raw {expected_raw}"
     );
-    // After one LPF step from 0: 0.8188 * (-0.70236) ≈ -0.5747.
+    // LPF from silence (-1.0), then DC blocker first sample.
+    step_one_sample(&mut apu);
     let out = apu.output();
-    let expected_lpf = lpf_step(-1.0, expected_raw);
+    let expected = dc_block_first(lpf_step(-1.0, expected_raw));
     assert!(
-        (out - expected_lpf).abs() < 1e-3,
-        "expected {expected_lpf}, got {out}"
+        (out - expected).abs() < 1e-2,
+        "expected {expected}, got {out}"
     );
 }
 
@@ -131,11 +152,12 @@ fn both_pulses_nonlinear_value() {
         (expected_raw - (-0.48506)).abs() < 1e-3,
         "raw {expected_raw}"
     );
+    step_one_sample(&mut apu);
     let out = apu.output();
-    let expected_lpf = lpf_step(-1.0, expected_raw);
+    let expected = dc_block_first(lpf_step(-1.0, expected_raw));
     assert!(
-        (out - expected_lpf).abs() < 1e-3,
-        "expected {expected_lpf}, got {out}"
+        (out - expected).abs() < 1e-2,
+        "expected {expected}, got {out}"
     );
 }
 
@@ -149,11 +171,12 @@ fn dmc_only_nonlinear_value() {
     // mixed = 0.58827*2 - 1 = 0.17654.
     let expected_raw = expected_mix(0.0, 0.0, 0.0, 0.0, 127.0);
     assert!((expected_raw - 0.17654).abs() < 1e-3, "raw {expected_raw}");
+    step_one_sample(&mut apu);
     let out = apu.output();
-    let expected_lpf = lpf_step(-1.0, expected_raw);
+    let expected = dc_block_first(lpf_step(-1.0, expected_raw));
     assert!(
-        (out - expected_lpf).abs() < 1e-3,
-        "expected {expected_lpf}, got {out}"
+        (out - expected).abs() < 1e-2,
+        "expected {expected}, got {out}"
     );
 }
 
@@ -169,11 +192,12 @@ fn triangle_and_dmc_nonlinear_value() {
     // tnd_out = 163.67 / (1/0.004348 + 100) ≈ 0.6883.
     // mixed = 0.6883*2 - 1 = 0.3766.
     let expected_raw = expected_mix(0.0, 0.0, 15.0, 0.0, 127.0);
+    step_one_sample(&mut apu);
     let out = apu.output();
-    let expected_lpf = lpf_step(-1.0, expected_raw);
+    let expected = dc_block_first(lpf_step(-1.0, expected_raw));
     assert!(
-        (out - expected_lpf).abs() < 1e-2,
-        "expected {expected_lpf}, got {out}"
+        (out - expected).abs() < 1e-2,
+        "expected {expected}, got {out}"
     );
 }
 
@@ -190,7 +214,13 @@ fn all_channels_max_does_not_exceed_one() {
     // Noise may or may not be audible depending on LFSR; the mixer
     // should still clamp to [-1, 1].
     noise_audible(&mut apu, 15);
-    // Warm up the LPF and check all outputs stay in [-1, 1].
+    // Warm up the LPF + DC blocker and check outputs stay in [-1, 1].
+    // The DC blocker transient from silence → active audio decays with a
+    // time constant of ~350 samples (~8 ms at 44.1 kHz); allow 3000
+    // samples (~68 ms) for it to settle well below the [-1, 1] bounds.
+    for _ in 0..3000 {
+        let _ = apu.output();
+    }
     for _ in 0..100 {
         let out = apu.output();
         assert!((-1.0..=1.0).contains(&out), "output out of range: {out}");
@@ -207,11 +237,12 @@ fn per_channel_volume_scales_pulse() {
     apu.set_channel_volume(0, 0.5); // pulse1 at 50%
                                     // Effective pulse1 = 15 * 0.5 = 7.5.
     let expected_raw = expected_mix(7.5, 0.0, 0.0, 0.0, 0.0);
+    step_one_sample(&mut apu);
     let out = apu.output();
-    let expected_lpf = lpf_step(-1.0, expected_raw);
+    let expected = dc_block_first(lpf_step(-1.0, expected_raw));
     assert!(
-        (out - expected_lpf).abs() < 1e-2,
-        "expected {expected_lpf}, got {out}"
+        (out - expected).abs() < 1e-2,
+        "expected {expected}, got {out}"
     );
 }
 
@@ -221,14 +252,14 @@ fn per_channel_volume_zero_silences_channel() {
     apu.write_status(0x01);
     pulse_audible(&mut apu, false, 15);
     apu.set_channel_volume(0, 0.0);
-    // pulse1 effectively 0 → silence → -1.0 after LPF warmup.
+    // pulse1 effectively 0 → silence → DC blocker converges to 0.0.
     let mut last = 0.0;
     for _ in 0..200 {
         last = apu.output();
     }
     assert!(
-        (last - (-1.0_f32)).abs() < 1e-3,
-        "zero volume should silence channel, got {last}"
+        last.abs() < 1e-3,
+        "zero volume should silence channel (DC blocker → 0.0), got {last}"
     );
 }
 
@@ -259,11 +290,12 @@ fn mute_zeros_channel_contribution() {
     apu.set_channel_muted(0, true); // mute pulse1
                                     // pulse1 muted → only DMC contributes.
     let expected_raw = expected_mix(0.0, 0.0, 0.0, 0.0, 127.0);
+    step_one_sample(&mut apu);
     let out = apu.output();
-    let expected_lpf = lpf_step(-1.0, expected_raw);
+    let expected = dc_block_first(lpf_step(-1.0, expected_raw));
     assert!(
-        (out - expected_lpf).abs() < 1e-2,
-        "expected {expected_lpf}, got {out}"
+        (out - expected).abs() < 1e-2,
+        "expected {expected}, got {out}"
     );
 }
 
@@ -351,19 +383,27 @@ fn lpf_smooths_step_input() {
     let mut apu = Apu::new();
     // Set DMC to 127 → raw mix ≈ 0.1765 every sample. The LPF should
     // exponentially approach this value rather than jumping there
-    // immediately.
+    // immediately. The DC blocker then removes the DC offset.
     dmc_set(&mut apu, 127);
     let expected_raw = expected_mix(0.0, 0.0, 0.0, 0.0, 127.0);
     // LPF initializes to -1.0 (silence level) to avoid boot click.
-    let mut prev = -1.0;
+    // DC blocker initializes with dc_prev_x = -1.0, dc_prev_y = 0.0.
+    let mut prev_lpf = -1.0;
+    let mut prev_dc_x = -1.0;
+    let mut prev_dc_y = 0.0;
+    const DC_R: f32 = 0.99715;
     for _ in 0..5 {
+        step_one_sample(&mut apu);
         let out = apu.output();
-        let expected = lpf_step(prev, expected_raw);
+        let lpf = lpf_step(prev_lpf, expected_raw);
+        let dc = lpf - prev_dc_x + DC_R * prev_dc_y;
         assert!(
-            (out - expected).abs() < 1e-3,
-            "LPF step mismatch: expected {expected}, got {out}"
+            (out - dc).abs() < 1e-2,
+            "LPF+DC step mismatch: expected {dc}, got {out}"
         );
-        prev = out;
+        prev_lpf = lpf;
+        prev_dc_x = lpf;
+        prev_dc_y = dc;
     }
 }
 
@@ -371,14 +411,17 @@ fn lpf_smooths_step_input() {
 fn lpf_converges_to_steady_input() {
     let mut apu = Apu::new();
     dmc_set(&mut apu, 64);
-    let expected_raw = expected_mix(0.0, 0.0, 0.0, 0.0, 64.0);
+    // With a constant input, the LPF converges to the raw mix value,
+    // but the DC blocker removes the DC component → converges to 0.0.
+    // The DC blocker time constant is ~350 samples; use 3000 to converge
+    // well within 1e-2.
     let mut last = 0.0;
-    for _ in 0..500 {
+    for _ in 0..3000 {
         last = apu.output();
     }
     assert!(
-        (last - expected_raw).abs() < 1e-3,
-        "LPF should converge to raw {expected_raw}, got {last}"
+        last.abs() < 1e-2,
+        "LPF+DC should converge to 0.0 for constant input (DC removed), got {last}"
     );
 }
 

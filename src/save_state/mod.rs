@@ -1,43 +1,4 @@
-//! Save state — serialisation and deserialisation of the full emulator state.
-//!
-//! The entire `EmulatorState` (CPU registers + RAM, PPU state + VRAM + OAM +
-//! palette, APU state, Bus state, Mapper state, cycle counters) is captured
-//! into a [`SaveState`] struct, which derives `Serialize`/`Deserialize` and
-//! is encoded with [`bincode`] for a compact binary `.nessav` file.
-//!
-//! A [`SAVE_STATE_VERSION`] constant is embedded in every save state. On
-//! load, the version is checked — a mismatch returns an error so that
-//! forward-incompatible save states are rejected cleanly rather than
-//! deserialising into a corrupt state.
-//!
-//! # Submodules
-//!
-//! - [`slots`] — 10 save state slots (F5 save / F7 load + number-key
-//!   selection).
-//! - [`rewind`] — ring buffer of recent snapshots for the rewind feature
-//!   (Backspace pops one frame).
-//!
-//! # What is serialised
-//!
-//! | Component          | Fields                                                  |
-//! |--------------------|---------------------------------------------------------|
-//! | CPU                | A, X, Y, SP, PC, status, nmi_pending, irq_pending       |
-//! | Bus RAM            | 2 KB internal RAM                                       |
-//! | PPU                | All registers, VRAM, OAM, palette, scroll, scanline/cycle |
-//! | APU open bus       | 24-byte register latch array                            |
-//! | APU                | All 5 channels + frame counter state                    |
-//! | Joypad             | Strobe, shift registers, read counters (live buttons skipped) |
-//! | Cartridge          | iNES header + full mapper state (PRG/CHR, banks, PRG-RAM, IRQ) |
-//! | Bus DMA stall      | Pending OAM-DMA stall cycles                            |
-//! | Emulator           | Audio sample accumulator + audio buffer                 |
-//!
-//! # What is NOT serialised
-//!
-//! - **PPU framebuffer** (`256×240` ARGB) — derived data, recomputed on the
-//!   next `render_frame` call after a state restore.
-//! - **PPU bg_pattern buffer** — derived data, recomputed during rendering.
-//! - **Joypad live button state** — host input, re-poled each frame by the
-//!   input layer; restored to "no buttons pressed" on load.
+//! Save state — serialisation/deserialisation of full emulator state via bincode.
 //!
 //! See: https://www.nesdev.org/wiki/Save_state
 
@@ -46,7 +7,7 @@
 mod rewind;
 mod slots;
 
-pub use rewind::{RewindBuffer, DEFAULT_REWIND_CAPACITY};
+pub use rewind::{RewindBuffer, DEFAULT_REWIND_CAPACITY, MAX_REWIND_CAPACITY};
 pub use slots::{SaveStateSlots, SAVE_STATE_SLOT_COUNT};
 
 use serde::{Deserialize, Serialize};
@@ -113,7 +74,12 @@ use crate::ppu::Ppu;
 /// - `6` — M36: new `Fds` mapper variant and `read_prg_mut` trait
 ///   method. The new `MapperState::Fds` enum variant shifts the bincode
 ///   tag layout, so existing v5 save states will fail the version check.
-pub const SAVE_STATE_VERSION: u32 = 6;
+/// - `7` — Cpu struct layout change: three `bool` fields (nmi_pending,
+///   irq_pending, halted) packed into a single `u8 flags` field.
+/// - `8` — M-BUS-06: `SaveState` gained `cpu_cycle_count: u64` for
+///   OAM-DMA even/odd alignment tracking. The new field is at the end of
+///   the struct, so existing v7 save states will fail the version check.
+pub const SAVE_STATE_VERSION: u32 = 8;
 
 /// Errors that can occur during save state serialisation or deserialisation.
 #[derive(Debug)]
@@ -195,6 +161,8 @@ pub struct SaveState {
     pub cartridge: Option<CartridgeSnapshot>,
     /// Pending OAM-DMA stall cycles.
     pub dma_stall_cycles: u32,
+    /// Total CPU cycles elapsed since power-on (for OAM-DMA alignment).
+    pub cpu_cycle_count: u64,
     /// Audio sample accumulator (fractional CPU cycles toward next sample).
     pub sample_accumulator: f32,
     /// Audio samples produced during the current frame (not yet drained).
@@ -229,6 +197,7 @@ impl EmulatorState {
             // serialise the actual bus value for completeness — a
             // mid-frame save could theoretically capture a non-zero value.
             dma_stall_cycles: self.bus().dma_stall_cycles(),
+            cpu_cycle_count: self.bus().cpu_cycle_count(),
             sample_accumulator: self.sample_accumulator(),
             audio_buffer: self.audio_buffer().to_vec(),
         };
@@ -275,6 +244,7 @@ impl EmulatorState {
         *self.bus_mut().apu_mut() = state.apu;
         *self.bus_mut().joypad_mut() = state.joypad;
         self.bus_mut().set_dma_stall_cycles(state.dma_stall_cycles);
+        self.bus_mut().set_cpu_cycle_count(state.cpu_cycle_count);
 
         // ---- Cartridge ----
         // Rebuild the cartridge from the snapshot (header + mapper state)

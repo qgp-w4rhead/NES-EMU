@@ -30,10 +30,10 @@ fn make_ines(mapper: u8, prg_banks: usize, chr_banks: usize) -> Vec<u8> {
     let mut bytes = vec![b'N', b'E', b'S', 0x1A];
     bytes.push(prg_banks as u8);
     bytes.push(chr_banks as u8);
-    // byte 6: low nibble = mapper low, bit 1 = battery, bit 0 = mirroring
+    // byte 6: bits 4-7 = low nibble of mapper number
+    bytes.push((mapper & 0x0F) << 4);
+    // byte 7: bits 4-7 = high nibble of mapper number
     bytes.push(mapper & 0xF0);
-    // byte 7: high nibble = mapper high
-    bytes.push((mapper >> 4) & 0xF0);
     bytes.extend_from_slice(&[0u8; 8]);
     let prg_size = prg_banks * 16 * 1024;
     let chr_size = chr_banks * 8 * 1024;
@@ -327,8 +327,10 @@ fn emulator_mixes_expansion_audio_for_vrc7_cart() {
     emu.bus_mut().write(0x9030, 0x40);
     emu.bus_mut().write(0x9010, 0x40);
     emu.bus_mut().write(0x9030, 0x12);
-    // Step a few frames to let the audio path run.
-    for _ in 0..3 {
+    // Step enough frames to let the VRC7 produce oscillating audio.
+    // The DC blocker removes constant DC offsets, so we need enough
+    // frames for the OPLL to start producing actual AC audio.
+    for _ in 0..10 {
         emu.step_frame();
     }
     let samples = emu.take_audio_samples();
@@ -356,6 +358,6 @@ fn emulator_expansion_audio_zero_for_non_audio_cart() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn save_state_version_is_six() {
-    assert_eq!(SAVE_STATE_VERSION, 6);
+fn save_state_version_is_eight() {
+    assert_eq!(SAVE_STATE_VERSION, 8);
 }

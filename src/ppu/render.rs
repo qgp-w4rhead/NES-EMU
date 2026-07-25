@@ -1,59 +1,14 @@
-//! PPU rendering pipeline (M8 background + M9 sprites).
-//!
-//! # Background (M8)
-//!
-//! Renders the background layer from nametables, attribute tables, and
-//! pattern tables into the PPU's framebuffer (`256×240` ARGB pixels).
-//!
-//! This module implements the *pixel pipeline* — the per-pixel decode of
-//! nametable byte → attribute byte → pattern-table bitplanes → palette
-//! entry → ARGB output. Scanline timing, VBlank NMI signalling, and the
-//! fine/coarse scroll increment machinery (`v` register updates during
-//! rendering) are deferred to M10; here we render a full frame on demand
-//! from the current scroll position recorded in the `t` register and
-//! `fine_x`, which is sufficient to validate the decode against a static
-//! test screen.
-//!
-//! # Sprites (M9)
-//!
-//! Renders sprites from OAM in 8×8 mode with horizontal/vertical flip,
-//! palette selection (sprite palettes 4-7 at `$3F10-$3F1F`), and
-//! priority (in front of / behind the background). The hardware limit of
-//! 8 sprites per scanline is enforced; the sprite-overflow flag is set
-//! when more than 8 sprites are in range on any scanline. Sprite zero
-//! hit detection lands in M11. 8×16 sprite mode lands in M23.
-//!
-//! # Background pixel pipeline (per visible pixel)
-//!
-//! 1. Add the scroll offset (coarse/fine X and Y from `t` + `fine_x`) to
-//!    the pixel's screen coordinates to get global tile-space coordinates.
-//! 2. Resolve the nametable select from the base nametable (PPUCTRL bits
-//!    0-1) XOR the wrap bits produced when scrolling past a 256-pixel
-//!    nametable boundary.
-//! 3. Fetch the tile index from the nametable at
-//!    `$2000 | (nt << 10) | (row << 5) | col`.
-//! 4. Fetch the two pattern-table bitplanes for the tile at
-//!    `bg_table | (tile << 4) | fine_y` and `+ 8`.
-//! 5. Combine the bitplane bits at `7 - fine_x` into a 2-bit pattern value.
-//! 6. Fetch the attribute byte at
-//!    `$2000 | (nt << 10) | $03C0 | (attr_row << 3) | attr_col` and extract
-//!    the 2-bit palette-select pair for this 32×32 quadrant.
-//! 7. Look up the NES color index in palette RAM:
-//!    - pattern 0 → `$3F00` (universal background)
-//!    - pattern != 0 → `$3F00 | (pal << 2) | pattern`
-//! 8. Convert the 6-bit NES color index to ARGB via the [`NES_PALETTE`]
-//!    table and store it in the framebuffer.
+//! PPU rendering pipeline — background and sprite pixel generation.
 //!
 //! See: https://www.nesdev.org/wiki/PPU_rendering
-//! See: https://www.nesdev.org/wiki/PPU_palettes
 
 #![allow(dead_code)]
 
 use crate::ppu::{
-    Ppu, COARSE_X_MASK, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000, CTRL_SPRITE_PATTERN_1000,
-    CTRL_SPRITE_SIZE_16, MASK_SHOW_BG, MASK_SHOW_BG_LEFT, MASK_SHOW_SPRITES,
-    MASK_SHOW_SPRITES_LEFT, MAX_SPRITES_PER_SCANLINE, NT_H_BIT, NT_V_BIT, SCREEN_HEIGHT,
-    SCREEN_WIDTH,
+    ChrReader, Ppu, COARSE_X_MASK, CTRL_BASE_NT_MASK, CTRL_BG_PATTERN_1000,
+    CTRL_SPRITE_PATTERN_1000, CTRL_SPRITE_SIZE_16, MASK_SHOW_BG, MASK_SHOW_BG_LEFT,
+    MASK_SHOW_SPRITES, MASK_SHOW_SPRITES_LEFT, MAX_SPRITES_PER_SCANLINE, NT_H_BIT, NT_V_BIT,
+    SCREEN_HEIGHT, SCREEN_WIDTH,
 };
 
 /// Nametable tile grid is 32×30 tiles (256×240 pixels).
@@ -91,26 +46,90 @@ const SPRITE_WIDTH: u16 = 8;
 /// Values `$EF-$FE` are out of range but do not halt sprite evaluation;
 /// only `$FF` halts evaluation (see [`Ppu::render_sprites`]).
 const OAM_Y_HIDDEN: u8 = 0xEF;
-/// OAM Y value that halts sprite evaluation ($FF). On real hardware the
-/// sprite evaluation unit stops scanning OAM when it encounters a sprite
-/// with Y = `$FF`; sprites after it are never checked. This is the
-/// hardware-accurate "sprite overflow bug" behaviour — see
-/// https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow.
+/// OAM Y value that halts sprite evaluation ($FF). See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
 const OAM_Y_HALT: u8 = 0xFF;
 /// Sprite 0 hit is not triggered at x = 255 (hardware quirk).
 /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
 const SPRITE_ZERO_HIT_MAX_X: u16 = 255;
 
-/// NES 2C02 (NTSC) reference palette — 64 entries × RGB.
+/// Transient per-pixel rendering pipeline state.
 ///
-/// Each entry maps a 6-bit NES color index (`$00-$3F`) to an approximate
-/// sRGB triple. The real NES produces an analog signal with no canonical
-/// RGB mapping; this table is a widely-used approximation (see the
-/// "2C02" palette on the nesdev wiki). Color emphasis (PPUMASK bits 4-6)
-/// is not yet applied — it lands with the full PPUMASK implementation.
-///
-/// See: https://www.nesdev.org/wiki/PPU_palettes
-pub const NES_PALETTE: [[u8; 3]; 64] = [
+/// All fields are recomputed every scanline and are not part of the
+/// architectural PPU state. Skipped during save-state serialization;
+/// defaults to zero on restore — the pipeline refills on the next
+/// visible scanline.
+#[derive(Clone, Default)]
+pub(super) struct RenderPipeline {
+    /// Per-scanline vertical position snapshot: coarse Y (bits 5-9).
+    pub(super) coarse_y: u16,
+    /// Per-scanline vertical position snapshot: fine Y (bits 12-14).
+    pub(super) fine_y: u16,
+    /// Per-scanline vertical position snapshot: vertical nametable bit.
+    pub(super) nt_v: u16,
+
+    /// Horizontal render position snapshot — coarse X at last snapshot point.
+    pub(super) coarse_x_start: u16,
+    /// Horizontal render position snapshot — horizontal nametable bit.
+    pub(super) nt_h_start: u16,
+    /// Horizontal render position snapshot — fine X (0-7) at last snapshot.
+    pub(super) fine_x_start: u8,
+    /// Pixel X (0-255) at which the last snapshot/re-sync happened.
+    pub(super) resync_px: u16,
+
+    /// Whether the per-scanline render snapshot has been taken.
+    pub(super) scanline_initialized: bool,
+    /// Set when `v` is modified mid-scanline (triggers render re-sync).
+    pub(super) v_dirty: bool,
+    /// Whether the renderer produced output this frame.
+    pub(super) rendered_this_frame: bool,
+
+    /// Sprite evaluation result for the current scanline.
+    pub(super) sprites: [(usize, u8, u8, u8, u8); MAX_SPRITES_PER_SCANLINE],
+    /// Number of valid entries in `sprites`.
+    pub(super) sprite_count: usize,
+    /// Whether sprite overflow was detected for the current scanline.
+    pub(super) overflow: bool,
+    /// Whether sprite 0 hit has been set during the current frame.
+    pub(super) sprite_zero_hit: bool,
+
+    /// Debug: enable fine-X scroll corruption bug.
+    pub(super) slant_corruption: bool,
+    /// Debug: use the inaccurate NES palette (yellow pipes etc.).
+    pub(super) use_inaccurate_palette: bool,
+    /// Debug: retrigger NMI on every PPUCTRL write with bit 7 set during
+    /// VBlank (the old buggy behavior, fixed). Causes spurious extra NMIs
+    /// that waste VBlank time on redundant OAM DMAs, forcing VRAM writes
+    /// to spill into visible scanlines where scroll increments corrupt
+    /// the target addresses.
+    pub(super) nmi_retrigger: bool,
+
+    // ---- M-PPU-09: 2-pixel lookahead fetch pipeline ----
+    //
+    // Real hardware fetches tile data (NT, AT, BG low, BG high) 2 cycles
+    // before the pixel is rendered. We model this with a 2-entry ring
+    // buffer: each pixel cycle, we fetch CHR for pixel `px + 2` and store
+    // the result; the pixel output uses the entry fetched 2 cycles ago.
+    //
+    // This means a mid-scanline CHR bank switch affects pixels 2 cycles
+    // later than the renderer would otherwise predict.
+
+    /// Ring buffer holding (pattern, pal_select) for the 2 most recent
+    /// prefetches. `fetch_idx` points to the slot to read/output next;
+    /// the other slot holds the newer prefetch.
+    pub(super) fetch_buffer: [(u8, u8); 2],
+    /// Read index into `fetch_buffer` (toggles 0↔1). The slot at
+    /// `fetch_idx` holds the oldest prefetch (for the current pixel);
+    /// `fetch_idx ^ 1` holds the newer one.
+    pub(super) fetch_idx: u8,
+    /// Whether the fetch buffer has been primed with 2 entries. Reset at
+    /// each scanline start and when bg rendering is disabled.
+    pub(super) pipeline_primed: bool,
+}
+
+/// Inaccurate NTSC palette — the previous (incorrect) RGB values that
+/// produced wrong colors (e.g. yellow pipes in Mario Bros). Kept for
+/// debug toggle purposes. See `use_inaccurate_palette` on `RenderState`.
+pub const NES_PALETTE_INACCURATE: [[u8; 3]; 64] = [
     // 0x00-0x0F — dark/unsaturated row
     [0x84, 0x84, 0x84],
     [0x00, 0x1D, 0x2C],
@@ -162,11 +181,7 @@ pub const NES_PALETTE: [[u8; 3]; 64] = [
     [0x70, 0xC0, 0x14],
     [0x50, 0xC8, 0x24],
     [0x00, 0x00, 0x00],
-    // 0x30-0x3F — bright row. The canonical 2C02 palette has these as
-    // near-mirrors of 0x20-0x2F (the NES colour generator produces 56
-    // unique colours; $10/$14/$18/$1C mirror $00/$04/$08/$0C, and the
-    // $3x row is a bright variant of $2x). We mirror $20-$2F here, which
-    // is the approximation used by most emulators.
+    // 0x30-0x3F — mirrors of 0x20-0x2F
     [0xFF, 0xFF, 0xFF],
     [0x9C, 0xDC, 0xFF],
     [0xB8, 0xB8, 0xFF],
@@ -185,17 +200,83 @@ pub const NES_PALETTE: [[u8; 3]; 64] = [
     [0x00, 0x00, 0x00],
 ];
 
-/// NES 2C07 (PAL) reference palette — 64 entries × RGB.
-///
-/// The PAL NES uses a different PPU (2C07) whose colour generator
-/// produces a slightly different gamut from the NTSC 2C02. This table
-/// is a widely-used approximation (see the "2C07" palette on the nesdev
-/// wiki). The most visible differences from NTSC are: colour `$0D` is
-/// not pure black (it is a very dark blue on PAL), and several hues
-/// shift slightly. Dendy uses the NTSC 2C02 palette despite PAL timing,
-/// so this table is only selected for [`Region::Pal`].
-///
-/// See: https://www.nesdev.org/wiki/PPU_palettes#Palettes
+/// NES 2C02 (NTSC) reference palette — 64 entries × RGB. See: https://www.nesdev.org/wiki/PPU_palettes
+pub const NES_PALETTE: [[u8; 3]; 64] = [
+    // 0x00-0x0F — dark/unsaturated row
+    [0x7C, 0x7C, 0x7C],
+    [0x00, 0x00, 0xFC],
+    [0x00, 0x00, 0xBC],
+    [0x44, 0x28, 0xBC],
+    [0x94, 0x00, 0x84],
+    [0xA8, 0x00, 0x20],
+    [0xA8, 0x10, 0x00],
+    [0x88, 0x14, 0x00],
+    [0x50, 0x30, 0x00],
+    [0x00, 0x78, 0x00],
+    [0x00, 0x68, 0x00],
+    [0x00, 0x58, 0x00],
+    [0x00, 0x40, 0x58],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00],
+    // 0x10-0x1F — medium row
+    [0xBC, 0xBC, 0xBC],
+    [0x00, 0x78, 0xF8],
+    [0x00, 0x58, 0xF8],
+    [0x68, 0x44, 0xFC],
+    [0xD8, 0x00, 0xCC],
+    [0xE4, 0x00, 0x58],
+    [0xF8, 0x38, 0x00],
+    [0xE4, 0x5C, 0x10],
+    [0xAC, 0x7C, 0x00],
+    [0x00, 0xB8, 0x00],
+    [0x00, 0xA8, 0x00],
+    [0x00, 0xA8, 0x44],
+    [0x00, 0x88, 0x88],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00],
+    // 0x20-0x2F — bright row
+    [0xF8, 0xF8, 0xF8],
+    [0x3C, 0xBC, 0xFC],
+    [0x68, 0x88, 0xFC],
+    [0x98, 0x78, 0xF8],
+    [0xF8, 0x78, 0xF8],
+    [0xF8, 0x58, 0x98],
+    [0xF8, 0x78, 0x58],
+    [0xFC, 0xA0, 0x44],
+    [0xF8, 0xB8, 0x00],
+    [0xB8, 0xF8, 0x18],
+    [0x58, 0xD8, 0x54],
+    [0x58, 0xF8, 0x98],
+    [0x00, 0xE8, 0xD8],
+    [0x78, 0x78, 0x78],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00],
+    // 0x30-0x3F — bright row. The canonical 2C02 palette has these as
+    // near-mirrors of 0x20-0x2F (the NES colour generator produces 56
+    // unique colours; $10/$14/$18/$1C mirror $00/$04/$08/$0C, and the
+    // $3x row is a bright variant of $2x). We mirror $20-$2F here, which
+    // is the approximation used by most emulators.
+    [0xFC, 0xFC, 0xFC],
+    [0xA4, 0xE4, 0xFC],
+    [0xB8, 0xB8, 0xF8],
+    [0xD8, 0xB8, 0xF8],
+    [0xF8, 0xB8, 0xF8],
+    [0xF8, 0xA4, 0xC0],
+    [0xF0, 0xD0, 0xB0],
+    [0xFC, 0xE0, 0xA8],
+    [0xF8, 0xD8, 0x78],
+    [0xD8, 0xF8, 0x78],
+    [0xB8, 0xF8, 0xB8],
+    [0xB8, 0xF8, 0xD8],
+    [0x00, 0xFC, 0xFC],
+    [0xF8, 0xD8, 0xF8],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00],
+];
+
+/// NES 2C07 (PAL) reference palette — 64 entries × RGB. See: https://www.nesdev.org/wiki/PPU_palettes#Palettes
 pub const PAL_PALETTE: [[u8; 3]; 64] = [
     // 0x00-0x0F
     [0x84, 0x84, 0x84],
@@ -271,16 +352,7 @@ pub const PAL_PALETTE: [[u8; 3]; 64] = [
 /// Alpha value for all framebuffer pixels (fully opaque).
 const ALPHA: u32 = 0xFF;
 
-/// Convert a 6-bit NES color index to an ARGB (`0xAARRGGBB`) pixel
-/// using the region-appropriate palette (M32).
-///
-/// `Region::Pal` uses [`PAL_PALETTE`] (2C07); `Ntsc` and `Dendy` use
-/// [`NES_PALETTE`] (2C02 — Dendy keeps the NTSC palette despite PAL
-/// timing).
-///
-/// The index is masked to 6 bits (`& 0x3F`) — the upper two bits of
-/// palette RAM reads are open-bus garbage on real hardware and are
-/// discarded here.
+/// Convert NES color index to ARGB using region-appropriate palette.
 pub fn nes_color_to_argb_for(index: u8, region: crate::region::Region) -> u32 {
     let idx = (index & 0x3F) as usize;
     let [r, g, b] = if region.is_pal_palette() {
@@ -291,443 +363,292 @@ pub fn nes_color_to_argb_for(index: u8, region: crate::region::Region) -> u32 {
     (ALPHA << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// Convert a 6-bit NES color index to an ARGB (`0xAARRGGBB`) pixel
-/// using the NTSC palette. Equivalent to
-/// [`nes_color_to_argb_for`]`(index, `[`Region::Ntsc`]`)`.
-///
-/// Kept for backward compatibility with code that does not track the
-/// current region (e.g. the debug PPU viewer, which always renders with
-/// the NTSC palette for consistency).
+/// Convert NES color index to ARGB using NTSC palette (backward compat).
 pub fn nes_color_to_argb(index: u8) -> u32 {
     nes_color_to_argb_for(index, crate::region::Region::Ntsc)
 }
 
 impl Ppu {
     /// Render the entire visible background (256×240) into the framebuffer.
-    ///
-    /// `chr_read` supplies pattern-table bytes from CHR (owned by the
-    /// cartridge and accessed via the bus). The PPU's own VRAM and palette
-    /// RAM are read directly.
-    ///
-    /// Honours PPUMASK: if the background is disabled (bit 3 clear) the
-    /// framebuffer is filled with the universal background color; if the
-    /// left 8 pixels are masked (bit 1 clear) they are also filled with
-    /// the universal background color.
-    ///
-    /// Scroll position is taken from the `t` register (coarse X/Y, fine Y,
-    /// and nametable select bits) plus `fine_x`. This matches what a game
-    /// sets up via PPUSCROLL / PPUADDR before the frame; the per-scanline
-    /// `v`-register increment and horizontal/vertical scroll wrap timing
-    /// are implemented in M10.
+    /// Delegates to [`Ppu::render_background_scanline`] per scanline.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_rendering#Background
     pub fn render_background(&mut self, mut chr_read: impl FnMut(u16) -> u8) {
-        let bg_enabled = (self.ppumask & MASK_SHOW_BG) != 0;
-        let bg_left_enabled = (self.ppumask & MASK_SHOW_BG_LEFT) != 0;
-        let universal_bg = self.universal_bg_argb();
-
-        if !bg_enabled {
-            self.framebuffer.fill(universal_bg);
-            // Background is fully transparent when disabled → bg_pattern = 0
-            // everywhere, so sprites with "behind background" priority show
-            // through.
-            self.bg_pattern.fill(0);
-            return;
-        }
-
-        // Background pattern table base: $0000 or $1000 (PPUCTRL bit 4).
-        let bg_table: u16 = if (self.ppuctrl & CTRL_BG_PATTERN_1000) != 0 {
-            0x1000
-        } else {
-            0x0000
-        };
-        // Base nametable select (PPUCTRL bits 0-1): $2000/$2400/$2800/$2C00.
-        let base_nt: u16 = ((self.ppuctrl & CTRL_BASE_NT_MASK) as u16) << 10;
-
-        // Scroll position from the t register + fine_x.
-        //   coarse X = t bits 0-4,  fine X = fine_x (3 bits)
-        //   coarse Y = t bits 5-9,  fine Y = t bits 12-14
-        //   nametable select from t bits 10-11 is *not* used here —
-        //   PPUCTRL's base nametable (bits 0-1) is the authoritative
-        //   source during rendering. On real hardware, writing PPUCTRL
-        //   copies bits 0-1 into t's nt bits (10-11); that copy is not
-        //   yet implemented (deferred to M10), so we read PPUCTRL
-        //   directly to avoid divergence if a game used PPUADDR to set
-        //   a different nametable.
-        let coarse_x = self.t & 0x1F;
-        let coarse_y = (self.t >> 5) & 0x1F;
-        let fine_y = (self.t >> 12) & 0x07;
-        let scroll_x = (coarse_x << 3) | (self.fine_x as u16);
-        let scroll_y = (coarse_y << 3) | fine_y;
-
         for py in 0..SCREEN_HEIGHT as u16 {
-            let gy = py + scroll_y;
-            let fine_y = gy & 0x07;
-            let tile_row = (gy >> 3) & 0x1F; // wraps within a 256px nametable
-                                             // Vertical nametable wrap: bit 1 of nt select toggles when
-                                             // coarse Y crosses a 256px boundary (tile 32+).
-            let nt_v = (gy >> 8) & 1;
-            let row_base = (py as usize) * SCREEN_WIDTH;
-
-            for px in 0..SCREEN_WIDTH as u16 {
-                let col = row_base + px as usize;
-
-                // Left-column mask: pixels 0-7 are blanked if bit 1 clear.
-                if px < 8 && !bg_left_enabled {
-                    self.framebuffer[col] = universal_bg;
-                    self.bg_pattern[col] = 0;
-                    continue;
-                }
-
-                let gx = px + scroll_x;
-                let fine_x = gx & 0x07;
-                let tile_col = (gx >> 3) & 0x1F; // wraps within a 256px nametable
-                                                 // Horizontal nametable wrap: bit 0 of nt select toggles
-                                                 // when coarse X crosses a 256px boundary.
-                let nt_h = (gx >> 8) & 1;
-
-                // Resolve the effective nametable select (0..3).
-                let nt = ((base_nt >> 10) ^ nt_h ^ (nt_v << 1)) & 0x03;
-                let nt_addr = NT_BASE | (nt << 10) | (tile_row << 5) | tile_col;
-
-                // 1) Nametable fetch → tile index.
-                let tile_index = self.read_nametable(nt_addr) as u16;
-
-                // 2) Pattern-table fetch (two bitplanes).
-                let pattern_addr = bg_table | (tile_index << 4) | fine_y;
-                let plane0 = chr_read(pattern_addr);
-                let plane1 = chr_read(pattern_addr | 0x08);
-                let bit = 7 - fine_x;
-                let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
-
-                // 3) Attribute-table fetch → 2-bit palette select.
-                let attr_col = tile_col >> 2;
-                let attr_row = tile_row >> 2;
-                let attr_addr =
-                    NT_BASE | (nt << 10) | ATTR_TABLE_OFFSET | (attr_row << 3) | attr_col;
-                let attr_byte = self.read_nametable(attr_addr);
-                // Each attribute byte covers a 4×4-tile (32×32-px) block;
-                // the 2-bit pair is selected by bit 1 of tile_col (left/right
-                // 16px half → shift 0/2) and bit 1 of tile_row (top/bottom
-                // 16px half → shift 0/4).
-                let shift = ((tile_row & 0x02) << 1) | (tile_col & 0x02);
-                let pal_select = (attr_byte >> shift) & 0x03;
-
-                // Record the background pattern value for sprite priority.
-                self.bg_pattern[col] = pattern;
-
-                // 4) Palette lookup.
-                let color_addr = if pattern == 0 {
-                    PAL_BASE // universal background
-                } else {
-                    PAL_BASE | ((pal_select as u16) << 2) | (pattern as u16)
-                };
-                let nes_index = self.read_palette(color_addr);
-
-                // 5) Convert to ARGB and write.
-                self.framebuffer[col] = self.color_to_argb(nes_index);
-            }
+            self.render_background_scanline(py, &mut chr_read);
         }
     }
 
     /// The universal background color (palette entry `$3F00`) as ARGB.
     /// Used to fill the framebuffer when background rendering is disabled
     /// or when the left 8 pixels are masked.
-    pub fn universal_bg_argb(&self) -> u32 {
+    #[inline] pub fn universal_bg_argb(&self) -> u32 {
         self.color_to_argb(self.read_palette(PAL_BASE))
     }
 
     /// Convert a 6-bit NES color index to an ARGB pixel using the PPU's
     /// current region (M32). NTSC/Dendy use [`NES_PALETTE`]; PAL uses
-    /// [`PAL_PALETTE`].
-    fn color_to_argb(&self, index: u8) -> u32 {
-        nes_color_to_argb_for(index, self.region)
+    /// [`PAL_PALETTE`]. When `use_inaccurate_palette` is set, the old
+    /// inaccurate NTSC palette ([`NES_PALETTE_INACCURATE`]) is used instead
+    /// for NTSC/Dendy, reproducing the yellow-pipes color bug.
+    #[inline] fn color_to_argb(&self, index: u8) -> u32 {
+        let idx = (index & 0x3F) as usize;
+        let [r, g, b] = if self.region.is_pal_palette() {
+            PAL_PALETTE[idx]
+        } else if self.render.use_inaccurate_palette {
+            NES_PALETTE_INACCURATE[idx]
+        } else {
+            NES_PALETTE[idx]
+        };
+        (ALPHA << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
     }
 
-    /// Render all sprites from OAM in 8×8 mode, compositing on top of the
-    /// existing framebuffer (which must have been produced by a prior
-    /// [`Ppu::render_background`] call — `render_frame` does this in the
-    /// right order).
-    ///
-    /// `chr_read` supplies pattern-table bytes from CHR (owned by the
-    /// cartridge and accessed via the bus).
-    ///
-    /// # Behaviour
-    ///
-    /// - Honours PPUMASK bit 4 (show sprites) and bit 2 (show left 8
-    ///   pixels of sprites).
-    /// - Uses PPUCTRL bit 3 to select the sprite pattern table
-    ///   (`$0000` or `$1000`) in 8×8 mode. In 8×16 mode (PPUCTRL bit 5
-    ///   set) bit 3 is ignored — the pattern table is selected per
-    ///   sprite by bit 0 of its tile index (even → `$0000`, odd →
-    ///   `$1000`), the top 8 rows fetch tile `index & 0xFE`, and the
-    ///   bottom 8 rows fetch `tile + 1` (`index | 1`). Vertical flip
-    ///   mirrors the entire 16-pixel range.
-    /// - A sprite is visible on scanline `s` when its OAM Y byte `y`
-    ///   satisfies `y + 1 <= s <= y + height` (height = 8 or 16) and
-    ///   `y < $EF` (matching the one-scanline delay documented on the
-    ///   NESdev wiki — "subtract 1 from the sprite's Y coordinate
-    ///   before writing it here").
-    /// - At most 8 sprites are rendered per scanline (the first 8 in OAM
-    ///   order); if a 9th would be in range, the sprite-overflow flag
-    ///   (PPUSTATUS bit 5) is set. Sprite evaluation halts when a sprite
-    ///   with Y = `$FF` is encountered (hardware-accurate behaviour —
-    ///   sprites after a `$FF` entry are never checked).
-    /// - **Sprite zero hit** (M11): when sprite 0 (OAM index 0) is
-    ///   rendered and its pixel is opaque, and the background pixel at
-    ///   the same position is also opaque, the sprite-0-hit flag
-    ///   (PPUSTATUS bit 6) is set. The hit is not triggered at x = 255
-    ///   or in the clipped left 8 pixels. The priority bit (attribute
-    ///   bit 5) does **not** affect hit detection — the hit triggers
-    ///   even if sprite 0 is behind the background. The flag is set once
-    ///   per frame (first hit) and cleared at the prerender scanline by
-    ///   [`Ppu::step`].
-    /// - Sprite-to-sprite priority: lower OAM index = in front. The
-    ///   first non-transparent sprite (scanning OAM 0 → 63) claims each
-    ///   pixel; no lower-priority sprite can override it.
-    /// - Background priority: if the claiming sprite's attribute bit 5
-    ///   is set ("behind background"), the sprite only shows where the
-    ///   background pattern is 0 (transparent); otherwise the background
-    ///   pixel is kept.
-    /// - Horizontal/vertical flip (attribute bits 6/7) mirror the
-    ///   8×8 tile pixels within the sprite's bounding box.
-    /// - Sprite palettes are at `$3F10-$3F1F` (palettes 4-7); the
-    ///   sprite's 2-bit palette select picks one of four 4-color
-    ///   palettes. Pattern 0 is always transparent.
+    /// Render all sprites, compositing on top of the existing framebuffer.
+    /// Delegates to [`Ppu::render_sprites_scanline`] per scanline.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_OAM
-    /// See: https://www.nesdev.org/wiki/PPU_rendering#Sprites
-    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
     pub fn render_sprites(&mut self, mut chr_read: impl FnMut(u16) -> u8) {
-        // Clear the per-frame status flags at the start of the frame. On
-        // real hardware this happens at the prerender scanline (M10);
-        // without scanline-locked rendering we clear them here so the
-        // flags reflect the current frame rather than sticking from a
-        // prior frame. This must happen even when sprites are disabled
-        // (a prior frame may have set a flag that needs clearing).
         self.set_sprite_overflow(false);
         self.set_sprite_zero_hit(false);
+        let mut overflow_this_frame = false;
+        let mut sprite_zero_hit_set = false;
+        for scanline in 0..SCREEN_HEIGHT as u16 {
+            self.render_sprites_scanline(
+                scanline,
+                &mut chr_read,
+                &mut overflow_this_frame,
+                &mut sprite_zero_hit_set,
+            );
+        }
+        if overflow_this_frame {
+            self.set_sprite_overflow(true);
+        }
+    }
 
+    /// Render one scanline of background into the framebuffer and bg_pattern.
+    fn render_background_scanline(&mut self, py: u16, chr_read: &mut impl FnMut(u16) -> u8) {
+        let bg_enabled = (self.ppumask & MASK_SHOW_BG) != 0;
+        let bg_left_enabled = (self.ppumask & MASK_SHOW_BG_LEFT) != 0;
+        let universal_bg = self.universal_bg_argb();
+        let row_base = (py as usize) * SCREEN_WIDTH;
+
+        if !bg_enabled {
+            for px in 0..SCREEN_WIDTH {
+                self.framebuffer[row_base + px] = universal_bg;
+                self.bg_pattern[px] = 0;
+            }
+            return;
+        }
+
+        let bg_table: u16 = if (self.ppuctrl & CTRL_BG_PATTERN_1000) != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+        let base_nt: u16 = ((self.ppuctrl & CTRL_BASE_NT_MASK) as u16) << 10;
+        let coarse_x = self.t & 0x1F;
+        let coarse_y = (self.t >> 5) & 0x1F;
+        let fine_y = (self.t >> 12) & 0x07;
+        let scroll_x = (coarse_x << 3) | (self.fine_x as u16);
+        let scroll_y = (coarse_y << 3) | fine_y;
+
+        let gy = py + scroll_y;
+        let fine_y = gy & 0x07;
+        let tile_row = (gy >> 3) & 0x1F;
+        let nt_v = (gy >> 8) & 1;
+
+        for px in 0..SCREEN_WIDTH as u16 {
+            if px < 8 && !bg_left_enabled {
+                self.framebuffer[row_base + px as usize] = universal_bg;
+                self.bg_pattern[px as usize] = 0;
+                continue;
+            }
+
+            let gx = px + scroll_x;
+            let fine_x = gx & 0x07;
+            let tile_col = (gx >> 3) & 0x1F;
+            let nt_h = (gx >> 8) & 1;
+            let nt = ((base_nt >> 10) ^ nt_h ^ (nt_v << 1)) & 0x03;
+            let nt_addr = NT_BASE | (nt << 10) | (tile_row << 5) | tile_col;
+            let tile_index = self.read_nametable(nt_addr) as u16;
+            let pattern_addr = bg_table | (tile_index << 4) | fine_y;
+            let plane0 = chr_read(pattern_addr);
+            let plane1 = chr_read(pattern_addr | 0x08);
+            let bit = 7 - fine_x;
+            let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
+            let attr_col = tile_col >> 2;
+            let attr_row = tile_row >> 2;
+            let attr_addr = NT_BASE | (nt << 10) | ATTR_TABLE_OFFSET | (attr_row << 3) | attr_col;
+            let attr_byte = self.read_nametable(attr_addr);
+            let shift = ((tile_row & 0x02) << 1) | (tile_col & 0x02);
+            let pal_select = (attr_byte >> shift) & 0x03;
+            self.bg_pattern[px as usize] = pattern;
+            let color_addr = if pattern == 0 {
+                PAL_BASE
+            } else {
+                PAL_BASE | ((pal_select as u16) << 2) | (pattern as u16)
+            };
+            let nes_index = self.read_palette(color_addr);
+            self.framebuffer[row_base + px as usize] = self.color_to_argb(nes_index);
+        }
+    }
+
+    /// Render sprites for one scanline, compositing on top of the existing
+    /// framebuffer. `overflow_this_frame` and `sprite_zero_hit_set` are
+    /// shared across scanlines for the whole frame.
+    fn render_sprites_scanline(
+        &mut self,
+        scanline: u16,
+        chr_read: &mut impl FnMut(u16) -> u8,
+        overflow_this_frame: &mut bool,
+        sprite_zero_hit_set: &mut bool,
+    ) {
         let sprites_enabled = (self.ppumask & MASK_SHOW_SPRITES) != 0;
         if !sprites_enabled {
             return;
         }
         let sprites_left_enabled = (self.ppumask & MASK_SHOW_SPRITES_LEFT) != 0;
-
-        // Sprite size: 8×8 (default) or 8×16 (PPUCTRL bit 5).
-        // See: https://www.nesdev.org/wiki/PPU_OAM#8x16_sprites
         let sprite_size_16 = (self.ppuctrl & CTRL_SPRITE_SIZE_16) != 0;
         let sprite_height: u16 = if sprite_size_16 {
             SPRITE_HEIGHT_8X16
         } else {
             SPRITE_HEIGHT_8X8
         };
-
-        // Sprite pattern table base: $0000 or $1000 (PPUCTRL bit 3).
-        // In 8×16 mode this bit is ignored — the table is selected per
-        // sprite by bit 0 of the tile index (handled in the pixel loop).
         let sprite_table_8x8: u16 = if (self.ppuctrl & CTRL_SPRITE_PATTERN_1000) != 0 {
             0x1000
         } else {
             0x0000
         };
 
-        // Per-scanline selected-sprite slots (OAM index, Y, tile, attr, X).
-        // Allocated once on the stack; reused for each scanline.
         let mut selected: [(usize, u8, u8, u8, u8); MAX_SPRITES_PER_SCANLINE] =
             [(0, 0, 0, 0, 0); MAX_SPRITES_PER_SCANLINE];
-        let mut overflow_this_frame = false;
-        // Sprite 0 hit is set once per frame (first opaque overlap).
-        let mut sprite_zero_hit_set = false;
-
-        for scanline in 0..SCREEN_HEIGHT as u16 {
-            // ---- Sprite evaluation: find first 8 sprites in range. ----
-            //
-            // Hardware-accurate behaviour: evaluation halts when a sprite
-            // with Y = `$FF` is encountered. Sprites with Y = `$EF-$FE`
-            // are out of range but do NOT halt evaluation — only `$FF`
-            // does. See:
-            // https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
-            let mut count = 0usize;
-            for i in 0..SPRITE_COUNT {
-                let oam_idx = i * 4;
-                let y = self.oam[oam_idx];
-                if y == OAM_Y_HALT {
-                    // $FF halts sprite evaluation — no further sprites
-                    // are checked on this scanline.
-                    break;
-                }
-                if y >= OAM_Y_HIDDEN {
-                    // $EF-$FE: out of range, but evaluation continues.
-                    continue;
-                }
-                // Visible on scanlines (y+1)..=(y+height). With y < 0xEF
-                // there is no u8 wraparound to worry about.
-                let top = y as u16 + 1;
-                if scanline < top || scanline >= top + sprite_height {
-                    continue;
-                }
-                if count < MAX_SPRITES_PER_SCANLINE {
-                    selected[count] = (
-                        i,
-                        y,
-                        self.oam[oam_idx + 1],
-                        self.oam[oam_idx + 2],
-                        self.oam[oam_idx + 3],
-                    );
-                    count += 1;
-                } else {
-                    // 9th+ in-range sprite → overflow.
-                    overflow_this_frame = true;
-                }
+        let mut count = 0usize;
+        for i in 0..SPRITE_COUNT {
+            let oam_idx = i * 4;
+            let y = self.oam[oam_idx];
+            if y == OAM_Y_HALT {
+                break;
             }
-
-            // ---- Pixel rendering for this scanline. ----
-            let row_base = scanline as usize * SCREEN_WIDTH;
-            for px in 0..SCREEN_WIDTH as u16 {
-                // Left-column clip for sprites.
-                if px < 8 && !sprites_left_enabled {
-                    continue;
-                }
-
-                // Find the first non-transparent sprite (lowest OAM index
-                // = highest priority). It claims the pixel; no later
-                // sprite can override it.
-                for &(oam_i, y, tile, attr, sx) in selected.iter().take(count) {
-                    let sx = sx as u16;
-                    if px < sx || px >= sx + SPRITE_WIDTH {
-                        continue;
-                    }
-                    let tile_col = (px - sx) as u8;
-                    // Row within the sprite (0..height-1). scanline - (y+1).
-                    let tile_row = (scanline - (y as u16 + 1)) as u8;
-                    // Vertical flip mirrors the entire sprite height (8 or
-                    // 16), not just the 8-pixel tile half.
-                    let row = if (attr & ATTR_VFLIP) != 0 {
-                        ((sprite_height - 1) as u8) - tile_row
-                    } else {
-                        tile_row
-                    };
-                    let col = if (attr & ATTR_HFLIP) != 0 {
-                        7 - tile_col
-                    } else {
-                        tile_col
-                    };
-
-                    // Pattern address computation differs between 8×8 and
-                    // 8×16 modes.
-                    //
-                    // 8×8: table from PPUCTRL bit 3; tile index unchanged.
-                    //
-                    // 8×16: PPUCTRL bit 3 ignored; table from tile bit 0
-                    // (even → $0000, odd → $1000); tile base = tile & 0xFE;
-                    // rows 0-7 fetch tile_base, rows 8-15 fetch tile_base+1.
-                    // See: https://www.nesdev.org/wiki/PPU_OAM#8x16_sprites
-                    let (table, tile_base): (u16, u16) = if sprite_size_16 {
-                        let t = if (tile & 1) != 0 { 0x1000 } else { 0x0000 };
-                        (t, (tile & 0xFE) as u16)
-                    } else {
-                        (sprite_table_8x8, tile as u16)
-                    };
-                    // For 8×16, rows 8-15 come from the next tile
-                    // (tile_base + 1) at row offset (row - 8).
-                    let row_in_tile = if sprite_size_16 { row & 0x07 } else { row };
-                    let tile_for_row = if sprite_size_16 && row >= 8 {
-                        tile_base + 1
-                    } else {
-                        tile_base
-                    };
-
-                    let pattern_addr = table | (tile_for_row << 4) | (row_in_tile as u16);
-                    let plane0 = chr_read(pattern_addr);
-                    let plane1 = chr_read(pattern_addr | 0x08);
-                    let bit = 7 - col;
-                    let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
-
-                    if pattern == 0 {
-                        // Transparent — this sprite doesn't claim the pixel;
-                        // fall through to the next sprite.
-                        continue;
-                    }
-
-                    let col_idx = row_base + px as usize;
-                    let bg_opaque = self.bg_pattern[col_idx] != 0;
-
-                    // ---- Sprite 0 hit detection (M11) ----
-                    //
-                    // The hit triggers when sprite 0 (OAM index 0) has an
-                    // opaque pixel AND the background pixel at the same
-                    // position is opaque. The priority bit does NOT
-                    // affect hit detection — the hit triggers even if
-                    // sprite 0 is behind the background. The hit is not
-                    // triggered at x = 255 or in the clipped left 8
-                    // pixels (clipping is handled above for sprites and
-                    // in render_background for the background).
-                    //
-                    // See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
-                    if !sprite_zero_hit_set && oam_i == 0 && px < SPRITE_ZERO_HIT_MAX_X && bg_opaque
-                    {
-                        self.set_sprite_zero_hit(true);
-                        sprite_zero_hit_set = true;
-                    }
-
-                    // ---- Background priority ----
-                    //
-                    // If the sprite is "behind background" (attr bit 5)
-                    // and the background is opaque here, the sprite is
-                    // hidden — the pixel keeps its background value. No
-                    // lower-priority sprite may override. The sprite 0
-                    // hit (above) still triggered because both pixels
-                    // are opaque, regardless of priority.
-                    let behind_bg = (attr & ATTR_PRIORITY_BEHIND) != 0;
-                    if behind_bg && bg_opaque {
-                        break;
-                    }
-
-                    let pal = (attr & ATTR_PALETTE_MASK) as u16;
-                    let color_addr = SPRITE_PAL_BASE | (pal << 2) | (pattern as u16);
-                    let nes_index = self.read_palette(color_addr);
-                    self.framebuffer[col_idx] = self.color_to_argb(nes_index);
-                    break;
-                }
+            if y >= OAM_Y_HIDDEN {
+                continue;
+            }
+            let top = y as u16 + 1;
+            if scanline < top || scanline >= top + sprite_height {
+                continue;
+            }
+            if count < MAX_SPRITES_PER_SCANLINE {
+                selected[count] = (
+                    i,
+                    y,
+                    self.oam[oam_idx + 1],
+                    self.oam[oam_idx + 2],
+                    self.oam[oam_idx + 3],
+                );
+                count += 1;
+            } else {
+                *overflow_this_frame = true;
             }
         }
 
-        if overflow_this_frame {
-            self.set_sprite_overflow(true);
+        let row_base = scanline as usize * SCREEN_WIDTH;
+        for px in 0..SCREEN_WIDTH as u16 {
+            if px < 8 && !sprites_left_enabled {
+                continue;
+            }
+            for &(oam_i, y, tile, attr, sx) in selected.iter().take(count) {
+                let sx = sx as u16;
+                if px < sx || px >= sx + SPRITE_WIDTH {
+                    continue;
+                }
+                let tile_col = (px - sx) as u8;
+                let tile_row = (scanline - (y as u16 + 1)) as u8;
+                let row = if (attr & ATTR_VFLIP) != 0 {
+                    ((sprite_height - 1) as u8) - tile_row
+                } else {
+                    tile_row
+                };
+                let col = if (attr & ATTR_HFLIP) != 0 {
+                    7 - tile_col
+                } else {
+                    tile_col
+                };
+
+                let (table, tile_base): (u16, u16) = if sprite_size_16 {
+                    let t = if (tile & 1) != 0 { 0x1000 } else { 0x0000 };
+                    (t, (tile & 0xFE) as u16)
+                } else {
+                    (sprite_table_8x8, tile as u16)
+                };
+                let row_in_tile = if sprite_size_16 { row & 0x07 } else { row };
+                let tile_for_row = if sprite_size_16 && row >= 8 {
+                    tile_base + 1
+                } else {
+                    tile_base
+                };
+
+                let pattern_addr = table | (tile_for_row << 4) | (row_in_tile as u16);
+                let plane0 = chr_read(pattern_addr);
+                let plane1 = chr_read(pattern_addr | 0x08);
+                let bit = 7 - col;
+                let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
+
+                if pattern == 0 {
+                    continue;
+                }
+
+                let col_idx = row_base + px as usize;
+                let bg_opaque = self.bg_pattern[px as usize] != 0;
+
+                if !*sprite_zero_hit_set
+                    && oam_i == 0
+                    && px < SPRITE_ZERO_HIT_MAX_X
+                    && bg_opaque
+                {
+                    self.set_sprite_zero_hit(true);
+                    *sprite_zero_hit_set = true;
+                }
+
+                let behind_bg = (attr & ATTR_PRIORITY_BEHIND) != 0;
+                if behind_bg && bg_opaque {
+                    break;
+                }
+
+                let pal = (attr & ATTR_PALETTE_MASK) as u16;
+                let color_addr = SPRITE_PAL_BASE | (pal << 2) | (pattern as u16);
+                let nes_index = self.read_palette(color_addr);
+                self.framebuffer[col_idx] = self.color_to_argb(nes_index);
+                break;
+            }
         }
     }
 
-    /// Render a full frame: background first, then sprites composited on
-    /// top. This is the M9 entry point for producing a complete visible
-    /// frame; the video layer (M12) uploads the resulting framebuffer to
-    /// an SDL2 texture.
-    ///
-    /// See: https://www.nesdev.org/wiki/PPU_rendering
+    /// Render full frame: background then sprites. See: https://www.nesdev.org/wiki/PPU_rendering
     pub fn render_frame(&mut self, mut chr_read: impl FnMut(u16) -> u8) {
-        // Pass the closure by &mut reference to both passes; `&mut F`
-        // satisfies `FnMut` when `F: FnMut`. The first borrow is released
-        // when `render_background` returns, so the second is fine.
-        self.render_background(&mut chr_read);
-        self.render_sprites(&mut chr_read);
+        self.set_sprite_overflow(false);
+        self.set_sprite_zero_hit(false);
+        let mut overflow_this_frame = false;
+        let mut sprite_zero_hit_set = false;
+        for py in 0..SCREEN_HEIGHT as u16 {
+            self.render_background_scanline(py, &mut chr_read);
+            self.render_sprites_scanline(
+                py,
+                &mut chr_read,
+                &mut overflow_this_frame,
+                &mut sprite_zero_hit_set,
+            );
+        }
+        if overflow_this_frame {
+            self.set_sprite_overflow(true);
+        }
     }
 
     // =================================================================
     //  M25: Per-pixel (cycle-accurate) rendering
     // =================================================================
 
-    /// Render a single pixel at the current `(cycle, scanline)` position.
-    ///
-    /// Called once per PPU cycle during visible scanlines (0-239, cycles
-    /// 1-256) by [`Ppu::step_rendered`]. This is the cycle-accurate render
-    /// path: mid-scanline register writes (PPUADDR / PPUSCROLL) take effect
-    /// at the correct pixel because the render position is re-synced from
-    /// `v` whenever [`Ppu::render_v_dirty`] is set.
-    ///
-    /// `chr_read` supplies pattern-table bytes from CHR (cartridge-owned).
-    ///
-    /// See: https://www.nesdev.org/wiki/PPU_rendering#Pixel_pipeline
-    pub(super) fn render_one_pixel(&mut self, chr_read: &mut dyn FnMut(u16) -> u8) {
+    /// Render one pixel at current `(cycle, scanline)` (cycle-accurate path).
+    #[inline]
+    pub(super) fn render_one_pixel(&mut self, chr_read: &mut impl ChrReader) {
         // The output pixel X is derived from the PPU cycle (cycle 1 → px 0,
         // cycle 256 → px 255). This is inherently save-state-safe: the
         // position is recomputed from the architectural `cycle` field every
@@ -737,15 +658,15 @@ impl Ppu {
         let col = py * SCREEN_WIDTH + px;
 
         // ---- First pixel of a scanline: snapshot + sprite evaluation ----
-        if !self.scanline_render_initialized {
-            self.snapshot_scanline_render(px);
+        if !self.render.scanline_initialized {
+            self.snapshot_render_position(px);
             self.evaluate_scanline_sprites();
-            self.scanline_render_initialized = true;
+            self.render.scanline_initialized = true;
         }
 
         // ---- Re-sync on mid-scanline register writes ----
-        if self.render_v_dirty {
-            self.resync_render_position(px);
+        if self.render.v_dirty {
+            self.snapshot_render_position(px);
         }
 
         let bg_enabled = (self.ppumask & MASK_SHOW_BG) != 0;
@@ -759,23 +680,57 @@ impl Ppu {
         if !bg_enabled {
             // Background disabled → universal bg color, transparent.
             pixel_argb = self.universal_bg_argb();
-            self.bg_pattern[col] = 0;
-        } else if px < 8 && !bg_left_enabled {
-            // Left 8 pixels masked → universal bg color, transparent.
-            pixel_argb = self.universal_bg_argb();
-            self.bg_pattern[col] = 0;
+            self.bg_pattern[px] = 0;
+            self.render.pipeline_primed = false;
         } else {
-            // Fetch the background tile for this pixel from the render
-            // position (coarse X/Y, fine X/Y, nametable).
-            let (pattern, pal_select) = self.fetch_bg_pixel(px, chr_read);
-            self.bg_pattern[col] = pattern;
-            let color_addr = if pattern == 0 {
-                PAL_BASE // universal background
+            // ---- M-PPU-09: 2-pixel lookahead fetch pipeline ----
+            //
+            // Real hardware fetches tile data 2 cycles before the pixel is
+            // rendered. We model this with a 2-entry ring buffer: each
+            // pixel, we output the buffered result (fetched 2 cycles ago)
+            // and prefetch the pixel 2 positions ahead.
+            //
+            // The pipeline always runs when bg is enabled, even if the left
+            // 8 pixels are masked — on real hardware the PPU fetches
+            // continuously regardless of the left mask.
+
+            if !self.render.pipeline_primed {
+                // Prime: fetch the current and next pixel immediately.
+                // The first 2 pixels of a bg-enabled region have no delay
+                // (their data was not prefetched). This is acceptable
+                // because CHR bank switches at scanline start are rare.
+                let f0 = self.fetch_bg_pixel(px, chr_read);
+                let f1 = self.fetch_bg_pixel(px + 1, chr_read);
+                self.render.fetch_buffer[0] = f0;
+                self.render.fetch_buffer[1] = f1;
+                self.render.fetch_idx = 0;
+                self.render.pipeline_primed = true;
+            }
+
+            // Output the buffered result for the current pixel.
+            let idx = self.render.fetch_idx as usize;
+            let (pattern, pal_select) = self.render.fetch_buffer[idx];
+
+            // Prefetch the pixel 2 positions ahead.
+            let lookahead = self.fetch_bg_pixel(px + 2, chr_read);
+            self.render.fetch_buffer[idx] = lookahead;
+            self.render.fetch_idx ^= 1;
+
+            // Apply the left-column mask to the output only (the pipeline
+            // still ran, keeping it in sync for when the mask ends).
+            if px < 8 && !bg_left_enabled {
+                pixel_argb = self.universal_bg_argb();
+                self.bg_pattern[px] = 0;
             } else {
-                PAL_BASE | ((pal_select as u16) << 2) | (pattern as u16)
-            };
-            let nes_index = self.read_palette(color_addr);
-            pixel_argb = self.color_to_argb(nes_index);
+                self.bg_pattern[px] = pattern;
+                let color_addr = if pattern == 0 {
+                    PAL_BASE // universal background
+                } else {
+                    PAL_BASE | ((pal_select as u16) << 2) | (pattern as u16)
+                };
+                let nes_index = self.read_palette(color_addr);
+                pixel_argb = self.color_to_argb(nes_index);
+            }
         }
 
         // ---- Composite sprite pixel on top ----
@@ -794,50 +749,25 @@ impl Ppu {
         self.framebuffer[col] = pixel_argb;
     }
 
-    /// Snapshot the per-scanline render position from the current `v`
-    /// register. Called at the first pixel of each visible scanline. The
-    /// vertical components (coarse Y, fine Y, vertical nametable bit) are
-    /// fixed for the whole scanline; the horizontal components are stored
-    /// as a starting point plus the pixel X at which the snapshot was taken
-    /// — the per-pixel position is derived by advancing from that starting
-    /// point by `(px - render_resync_px)` pixels.
-    fn snapshot_scanline_render(&mut self, px: usize) {
-        self.render_coarse_y = (self.v >> 5) & 0x1F;
-        self.render_fine_y = (self.v >> 12) & 0x07;
-        self.render_nt_v = self.v & NT_V_BIT;
-        self.render_coarse_x_start = self.v & COARSE_X_MASK;
-        self.render_nt_h_start = self.v & NT_H_BIT;
-        self.render_fine_x_start = self.fine_x;
-        self.render_resync_px = px as u16;
-        self.render_v_dirty = false;
+    /// Snapshot the per-scanline render position from `v`. Called at the
+    /// first pixel of each visible scanline and after mid-scanline `v` writes.
+    fn snapshot_render_position(&mut self, px: usize) {
+        self.render.coarse_y = (self.v >> 5) & 0x1F;
+        self.render.fine_y = (self.v >> 12) & 0x07;
+        self.render.nt_v = self.v & NT_V_BIT;
+        self.render.coarse_x_start = self.v & COARSE_X_MASK;
+        self.render.nt_h_start = self.v & NT_H_BIT;
+        self.render.fine_x_start = self.fine_x;
+        self.render.resync_px = px as u16;
+        self.render.v_dirty = false;
     }
 
-    /// Re-sync the render position from `v` after a mid-scanline register
-    /// write (PPUADDR second write or PPUSCROLL first write set
-    /// [`Ppu::render_v_dirty`]). The vertical components are also re-synced
-    /// since a PPUADDR write can change them. The new horizontal starting
-    /// point is recorded along with the current pixel X so subsequent pixels
-    /// advance from this new origin.
-    fn resync_render_position(&mut self, px: usize) {
-        self.render_coarse_y = (self.v >> 5) & 0x1F;
-        self.render_fine_y = (self.v >> 12) & 0x07;
-        self.render_nt_v = self.v & NT_V_BIT;
-        self.render_coarse_x_start = self.v & COARSE_X_MASK;
-        self.render_nt_h_start = self.v & NT_H_BIT;
-        self.render_fine_x_start = self.fine_x;
-        self.render_resync_px = px as u16;
-        self.render_v_dirty = false;
-    }
-
-    /// Compute the effective horizontal render position (coarse X,
-    /// horizontal nametable bit, fine X) for output pixel `px` by advancing
-    /// from the last snapshot/re-sync starting point by
-    /// `(px - render_resync_px)` pixels.
-    fn effective_render_x(&self, px: usize) -> (u16, u16, u8) {
-        let mut coarse_x = self.render_coarse_x_start;
-        let mut nt_h = self.render_nt_h_start;
-        let fine_x_start = self.render_fine_x_start as u16;
-        let advance = px as u16 - self.render_resync_px;
+    /// Compute effective horizontal render position for pixel `px`.
+    #[inline] fn effective_render_x(&self, px: usize) -> (u16, u16, u8) {
+        let mut coarse_x = self.render.coarse_x_start;
+        let mut nt_h = self.render.nt_h_start;
+        let fine_x_start = self.render.fine_x_start as u16;
+        let advance = px as u16 - self.render.resync_px;
         // Advance fine X first; on wrap, advance coarse X with nametable
         // horizontal-bit wrap.
         let new_fine_x = (fine_x_start + advance) & 0x07;
@@ -852,18 +782,13 @@ impl Ppu {
         (coarse_x, nt_h, new_fine_x as u8)
     }
 
-    /// Fetch the background pixel (2-bit pattern + 2-bit palette select) at
-    /// output pixel `px`. Returns `(pattern, pal_select)`.
-    ///
-    /// Uses the per-scanline vertical snapshot (coarse Y, fine Y, vertical
-    /// nametable bit) and the per-pixel horizontal position derived from
-    /// the last snapshot/re-sync starting point.
-    fn fetch_bg_pixel(&self, px: usize, chr_read: &mut dyn FnMut(u16) -> u8) -> (u8, u8) {
+    /// Fetch bg pixel `(pattern, pal_select)` at output pixel `px`.
+    fn fetch_bg_pixel(&self, px: usize, chr_read: &mut impl ChrReader) -> (u8, u8) {
         let (coarse_x, nt_h, fine_x) = self.effective_render_x(px);
         // Effective nametable select (0..3) from the horizontal + vertical
         // nametable bits.
-        let nt = ((nt_h >> 10) | (self.render_nt_v >> 10)) & 0x03;
-        let coarse_y = self.render_coarse_y;
+        let nt = ((nt_h >> 10) | (self.render.nt_v >> 10)) & 0x03;
+        let coarse_y = self.render.coarse_y;
 
         // 1) Nametable fetch → tile index.
         let nt_addr = NT_BASE | (nt << 10) | (coarse_y << 5) | coarse_x;
@@ -875,9 +800,9 @@ impl Ppu {
         } else {
             0x0000
         };
-        let pattern_addr = bg_table | (tile_index << 4) | self.render_fine_y;
-        let plane0 = chr_read(pattern_addr);
-        let plane1 = chr_read(pattern_addr | 0x08);
+        let pattern_addr = bg_table | (tile_index << 4) | self.render.fine_y;
+        let plane0 = chr_read.read_chr(pattern_addr);
+        let plane1 = chr_read.read_chr(pattern_addr | 0x08);
         let bit = 7 - (fine_x as u16);
         let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
 
@@ -892,15 +817,10 @@ impl Ppu {
         (pattern, pal_select)
     }
 
-    /// Evaluate sprites for the current scanline: scan OAM and select the
-    /// first 8 sprites in range, recording sprite overflow if a 9th+ would
-    /// be in range. Mirrors the logic in [`Ppu::render_sprites`] but stores
-    /// the result in [`Ppu::scanline_sprites`] for per-pixel compositing.
-    ///
-    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
+    /// Evaluate sprites for current scanline (select first 8 in range). See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_overflow
     fn evaluate_scanline_sprites(&mut self) {
-        self.scanline_sprite_count = 0;
-        self.scanline_overflow = false;
+        self.render.sprite_count = 0;
+        self.render.overflow = false;
 
         let sprite_size_16 = (self.ppuctrl & CTRL_SPRITE_SIZE_16) != 0;
         let sprite_height: u16 = if sprite_size_16 {
@@ -923,41 +843,32 @@ impl Ppu {
             if scanline < top || scanline >= top + sprite_height {
                 continue;
             }
-            if self.scanline_sprite_count < MAX_SPRITES_PER_SCANLINE {
-                self.scanline_sprites[self.scanline_sprite_count] = (
+            if self.render.sprite_count < MAX_SPRITES_PER_SCANLINE {
+                self.render.sprites[self.render.sprite_count] = (
                     i,
                     y,
                     self.oam[oam_idx + 1],
                     self.oam[oam_idx + 2],
                     self.oam[oam_idx + 3],
                 );
-                self.scanline_sprite_count += 1;
+                self.render.sprite_count += 1;
             } else {
-                self.scanline_overflow = true;
+                self.render.overflow = true;
             }
         }
 
         // Latch the overflow flag into PPUSTATUS (set, never cleared mid-frame).
-        if self.scanline_overflow {
+        if self.render.overflow {
             self.set_sprite_overflow(true);
         }
     }
 
-    /// Fetch the sprite pixel at screen position `(px, py)` by compositing
-    /// the scanline's selected sprites. Returns `Some((pattern, pal_select))`
-    /// for the first opaque, priority-OK sprite at this pixel, or `None` if
-    /// no sprite claims it.
-    ///
-    /// Also handles sprite zero hit detection: when sprite 0 (OAM index 0)
-    /// has an opaque pixel AND the background pixel is opaque, the
-    /// sprite-0-hit flag is set (once per frame).
-    ///
-    /// See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
+    /// Fetch sprite pixel at `(px, py)`; handles sprite 0 hit detection. See: https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hit
     fn fetch_sprite_pixel(
         &mut self,
         px: usize,
         py: usize,
-        chr_read: &mut dyn FnMut(u16) -> u8,
+        chr_read: &mut impl ChrReader,
     ) -> Option<(u8, u8)> {
         let sprite_size_16 = (self.ppuctrl & CTRL_SPRITE_SIZE_16) != 0;
         let sprite_height: u16 = if sprite_size_16 {
@@ -971,11 +882,10 @@ impl Ppu {
             0x0000
         };
         let scanline = py as u16;
-        let col_idx = py * SCREEN_WIDTH + px;
-        let bg_opaque = self.bg_pattern[col_idx] != 0;
+        let bg_opaque = self.bg_pattern[px] != 0;
 
-        for idx in 0..self.scanline_sprite_count {
-            let (oam_i, y, tile, attr, sx) = self.scanline_sprites[idx];
+        for idx in 0..self.render.sprite_count {
+            let (oam_i, y, tile, attr, sx) = self.render.sprites[idx];
             let sx = sx as u16;
             if (px as u16) < sx || (px as u16) >= sx + SPRITE_WIDTH {
                 continue;
@@ -1007,8 +917,8 @@ impl Ppu {
             };
 
             let pattern_addr = table | (tile_for_row << 4) | (row_in_tile as u16);
-            let plane0 = chr_read(pattern_addr);
-            let plane1 = chr_read(pattern_addr | 0x08);
+            let plane0 = chr_read.read_chr(pattern_addr);
+            let plane1 = chr_read.read_chr(pattern_addr | 0x08);
             let bit = 7 - col;
             let pattern: u8 = ((plane0 >> bit) & 1) | (((plane1 >> bit) & 1) << 1);
 
@@ -1017,13 +927,13 @@ impl Ppu {
             }
 
             // Sprite 0 hit detection (triggers once per frame).
-            if !self.scanline_sprite_zero_hit
+            if !self.render.sprite_zero_hit
                 && oam_i == 0
                 && (px as u16) < SPRITE_ZERO_HIT_MAX_X
                 && bg_opaque
             {
                 self.set_sprite_zero_hit(true);
-                self.scanline_sprite_zero_hit = true;
+                self.render.sprite_zero_hit = true;
             }
 
             let behind_bg = (attr & ATTR_PRIORITY_BEHIND) != 0;
@@ -1069,12 +979,12 @@ mod tests {
     #[test]
     fn palette_index_0_is_grey() {
         // 0x00 = grey in the reference palette.
-        assert_eq!(NES_PALETTE[0x00], [0x84, 0x84, 0x84]);
+        assert_eq!(NES_PALETTE[0x00], [0x7C, 0x7C, 0x7C]);
     }
 
     #[test]
     fn palette_index_20_is_white() {
-        assert_eq!(NES_PALETTE[0x20], [0xFF, 0xFF, 0xFF]);
+        assert_eq!(NES_PALETTE[0x20], [0xF8, 0xF8, 0xF8]);
     }
 
     #[test]
@@ -1084,8 +994,8 @@ mod tests {
 
     #[test]
     fn nes_color_to_argb_packs_channels() {
-        // 0x21 = (0x9C, 0xDC, 0xFF) → ARGB 0xFF9CDCFF.
-        assert_eq!(nes_color_to_argb(0x21), 0xFF9C_DCFF);
+        // 0x21 = (0x3C, 0xBC, 0xFC) → ARGB 0xFF3CBCFC.
+        assert_eq!(nes_color_to_argb(0x21), 0xFF3C_BCFC);
     }
 
     #[test]

@@ -1,43 +1,6 @@
-//! Minimal PNG encoder for emulator screenshots.
+//! Minimal PNG encoder for screenshots (std-only, no external crates).
 //!
-//! Writes a 256x240 (or any width/height) ARGB framebuffer to a PNG file
-//! using **only the Rust standard library** — no external crates. The
-//! tech-stack document forbids adding new dependencies without explicit
-//! approval, so we implement the subset of PNG / zlib / deflate needed
-//! for a valid, decodable PNG by hand.
-//!
-//! # Format
-//!
-//! A PNG file is:
-//!
-//! 1. An 8-byte signature: `137 80 78 71 13 10 26 10`.
-//! 2. A series of chunks, each: `[length: u32 BE][type: 4 bytes][data:
-//!    `length` bytes][CRC32: u32 BE]` where the CRC covers `type + data`.
-//! 3. Required chunks: `IHDR` (image header), `IDAT` (pixel data, zlib
-//!    stream), `IEND` (end marker).
-//!
-//! We use color type **2 (truecolor RGB)** with bit depth **8** — 3 bytes
-//! per pixel, no alpha. The emulator framebuffer is ARGB `u32`; we drop the
-//! alpha (always 0xFF) and write R, G, B in that order.
-//!
-//! # Compression
-//!
-//! `IDAT` carries a zlib stream. We use zlib's **stored / uncompressed**
-//! deflate blocks (BTYPE=00): each block is `[BFINAL:1][BTYPE:2][pad to
-//! byte][LEN: u16 LE][NLEN: u16 LE][LEN bytes]`. This produces a valid
-//! zlib stream that any PNG decoder can read; the only cost is file size
-//! (~3x larger than a compressed PNG), which is fine for screenshots.
-//!
-//! The zlib wrapper is `[CMF:1][FLG:1][deflate blocks...][Adler-32: u32 BE]`
-//! where CMF=0x78 (deflate, window size 32KB) and FLG is chosen so
-//! `(CMF*256 + FLG) % 31 == 0` (the zlib spec requires this check value).
-//!
-//! Each pixel row in the raw deflate data is prefixed with a filter byte
-//! `0x00` (None) per the PNG spec.
-//!
-//! See: https://www.w3.org/TR/png/
-//! See: https://www.rfc-editor.org/rfc/rfc1950 (zlib)
-//! See: https://www.rfc-editor.org/rfc/rfc1951 (deflate)
+//! Uses stored/uncompressed deflate blocks; truecolor RGB, 8-bit depth.
 
 use std::fs::File;
 use std::io::{self, Write};

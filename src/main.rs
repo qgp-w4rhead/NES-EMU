@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use sdl2::controller::GameController;
 use sdl2::event::Event;
@@ -22,9 +23,10 @@ use sdl2::keyboard::Keycode;
 use nes_emu::app::{load_rom, save_battery_sram};
 use nes_emu::audio::AudioOutput;
 use nes_emu::audio_hotkeys::AudioHotkeys;
-use nes_emu::config::Config;
+use nes_emu::config::{Config, NES_BUTTON_NAMES};
 use nes_emu::debug::{handle_debugger_key, print_debug_overlay, CpuDebugger, DebugHotkeys};
 use nes_emu::input::InputMapper;
+use nes_emu::menu::Menu;
 use nes_emu::osd::game_name_from_path;
 use nes_emu::region_hotkeys::RegionHotkeys;
 use nes_emu::rom_manager::{RomManager, ROM_INFO_HOTKEY};
@@ -192,11 +194,48 @@ fn run() -> Result<(), String> {
     let mut mapper = InputMapper::from_config(&config);
 
     let mut debugger = CpuDebugger::new();
+    let mut overlay_shown = false;
     let mut debug_hotkeys = DebugHotkeys::default();
     let mut ui_hotkeys = UiHotkeys::default();
-    let mut save_state_hotkeys = SaveStateHotkeys::new(game_name_from_path(&current_rom_path));
+    ui_hotkeys.set_turbo_ratio(config.turbo_speed);
+    let mut save_state_hotkeys = SaveStateHotkeys::with_capacity(
+        game_name_from_path(&current_rom_path),
+        config.rewind_capacity,
+    );
     let mut audio_hotkeys = AudioHotkeys::new();
     let mut region_hotkeys = RegionHotkeys::new();
+
+    // F1 help overlay toggle.
+    let mut help_visible = false;
+
+    // In-emulator OSD menu (F12 to toggle).
+    let mut menu = Menu::new();
+    menu.set_slant_corruption(config.debug.slant_corruption);
+    menu.set_inaccurate_palette(config.debug.use_inaccurate_palette);
+    emulator
+        .bus_mut()
+        .ppu_mut()
+        .set_inaccurate_palette(config.debug.use_inaccurate_palette);
+    menu.set_nmi_retrigger(config.debug.nmi_retrigger);
+    emulator
+        .bus_mut()
+        .ppu_mut()
+        .set_nmi_retrigger(config.debug.nmi_retrigger);
+    menu.set_ring_buffer_trace_display(config.debug.ring_buffer_trace);
+    if config.debug.ring_buffer_trace {
+        debug_hotkeys.enable_ring_trace();
+    }
+
+    // Driver-independent frame pacer. `present_vsync()` (in `Video::new`)
+    // is requested but is not guaranteed by every GPU driver/compositor —
+    // if it silently fails to throttle, this loop would free-run far
+    // faster than real time, causing audio samples to be queued much
+    // faster than SDL2's audio thread can drain them (an ever-growing
+    // backlog that manifests as audio falling further and further behind
+    // video the longer the emulator runs unthrottled). Sleeping for the
+    // remainder of each frame's duration here guarantees real-time pacing
+    // regardless of whether vsync actually engaged.
+    let mut last_tick = Instant::now();
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -219,12 +258,186 @@ fn run() -> Result<(), String> {
                     keymod,
                     ..
                 } => {
+                    // F1: toggle help overlay.
+                    if k == Keycode::F1 {
+                        help_visible = !help_visible;
+                        continue;
+                    }
+                    // F12: toggle the in-emulator menu. When the menu is
+                    // open, all key events go to the menu — no joypad or
+                    // debug hotkey routing happens.
+                    if k == Keycode::F12 {
+                        if menu.is_open() {
+                            menu.close();
+                            // Apply pending key binding changes.
+                            let bindings = menu.take_pending_bindings();
+                            if !bindings.is_empty() {
+                                for (ctrl, btn, kc) in &bindings {
+                                    if ctrl == &0 {
+                                        config.keys.controller1.insert(
+                                            NES_BUTTON_NAMES[*btn as usize].to_string(),
+                                            kc.name(),
+                                        );
+                                    } else {
+                                        config.keys.controller2.insert(
+                                            NES_BUTTON_NAMES[*btn as usize].to_string(),
+                                            kc.name(),
+                                        );
+                                    }
+                                }
+                                mapper = InputMapper::from_config(&config);
+                                eprintln!("nes-emu: key bindings updated from menu");
+                            }
+                            // Apply debug flag changes.
+                            let want_slant = menu.slant_corruption();
+                            emulator
+                                .bus_mut()
+                                .ppu_mut()
+                                .set_slant_corruption(want_slant);
+                            config.debug.slant_corruption = want_slant;
+                            if want_slant {
+                                eprintln!("nes-emu: slant corruption injected");
+                            } else {
+                                eprintln!("nes-emu: slant corruption cleared");
+                            }
+                            let want_inacc_pal = menu.inaccurate_palette();
+                            emulator
+                                .bus_mut()
+                                .ppu_mut()
+                                .set_inaccurate_palette(want_inacc_pal);
+                            config.debug.use_inaccurate_palette = want_inacc_pal;
+                            if want_inacc_pal {
+                                eprintln!("nes-emu: inaccurate palette injected");
+                            } else {
+                                eprintln!("nes-emu: inaccurate palette cleared");
+                            }
+                            let want_nmi_retrigger = menu.nmi_retrigger();
+                            emulator
+                                .bus_mut()
+                                .ppu_mut()
+                                .set_nmi_retrigger(want_nmi_retrigger);
+                            config.debug.nmi_retrigger = want_nmi_retrigger;
+                            if want_nmi_retrigger {
+                                eprintln!("nes-emu: NMI retrigger bug injected");
+                            } else {
+                                eprintln!("nes-emu: NMI retrigger bug cleared");
+                            }
+                            // Apply pending rewind capacity change.
+                            if let Some(cap) = menu.take_pending_rewind_capacity() {
+                                save_state_hotkeys.set_rewind_capacity(cap);
+                                config.rewind_capacity = cap;
+                                eprintln!("nes-emu: rewind capacity set to {cap}");
+                            }
+                            // Apply pending turbo speed change.
+                            if let Some(idx) = menu.take_pending_turbo_index() {
+                                let speed = nes_emu::ui_hotkeys::TURBO_SPEEDS[idx];
+                                ui_hotkeys.set_turbo_ratio(speed);
+                                config.turbo_speed = speed;
+                                eprintln!("nes-emu: turbo speed set to {:.2}x", speed);
+                            }
+                            if let Some(want_rbt) = menu.take_pending_ring_buffer_trace() {
+                                config.debug.ring_buffer_trace = want_rbt;
+                                if want_rbt {
+                                    debug_hotkeys.enable_ring_trace();
+                                    eprintln!("nes-emu: ring buffer trace enabled (pauses dump to trace.log)");
+                                } else {
+                                    debug_hotkeys.disable_ring_trace();
+                                    eprintln!("nes-emu: ring buffer trace disabled");
+                                }
+                            }
+                        } else {
+                            menu.set_rewind_capacity_display(save_state_hotkeys.rewind_capacity());
+                            // Find current turbo index from config value.
+                            let turbo_idx = nes_emu::ui_hotkeys::TURBO_SPEEDS
+                                .iter()
+                                .position(|&s| s == config.turbo_speed)
+                                .unwrap_or(nes_emu::ui_hotkeys::DEFAULT_TURBO_SPEED_INDEX);
+                            menu.set_turbo_index_display(turbo_idx);
+                            menu.set_ring_buffer_trace_display(config.debug.ring_buffer_trace);
+                            menu.open();
+                        }
+                        continue;
+                    }
+                    if menu.is_open() {
+                        menu.handle_key(k);
+                        // If the menu was closed by handle_key (Escape or
+                        // "Close Menu" item), apply pending bindings — same
+                        // as the F12 close path above.
+                        if !menu.is_open() {
+                            let bindings = menu.take_pending_bindings();
+                            if !bindings.is_empty() {
+                                for (ctrl, btn, kc) in &bindings {
+                                    if ctrl == &0 {
+                                        config.keys.controller1.insert(
+                                            NES_BUTTON_NAMES[*btn as usize].to_string(),
+                                            kc.name(),
+                                        );
+                                    } else {
+                                        config.keys.controller2.insert(
+                                            NES_BUTTON_NAMES[*btn as usize].to_string(),
+                                            kc.name(),
+                                        );
+                                    }
+                                }
+                                mapper = InputMapper::from_config(&config);
+                                eprintln!("nes-emu: key bindings updated from menu");
+                            }
+                            let want_slant = menu.slant_corruption();
+                            emulator
+                                .bus_mut()
+                                .ppu_mut()
+                                .set_slant_corruption(want_slant);
+                            config.debug.slant_corruption = want_slant;
+                            let want_inacc_pal = menu.inaccurate_palette();
+                            emulator
+                                .bus_mut()
+                                .ppu_mut()
+                                .set_inaccurate_palette(want_inacc_pal);
+                            config.debug.use_inaccurate_palette = want_inacc_pal;
+                            let want_nmi_retrigger = menu.nmi_retrigger();
+                            emulator
+                                .bus_mut()
+                                .ppu_mut()
+                                .set_nmi_retrigger(want_nmi_retrigger);
+                            config.debug.nmi_retrigger = want_nmi_retrigger;
+                            if let Some(cap) = menu.take_pending_rewind_capacity() {
+                                save_state_hotkeys.set_rewind_capacity(cap);
+                                config.rewind_capacity = cap;
+                                eprintln!("nes-emu: rewind capacity set to {cap}");
+                            }
+                            if let Some(idx) = menu.take_pending_turbo_index() {
+                                let speed = nes_emu::ui_hotkeys::TURBO_SPEEDS[idx];
+                                ui_hotkeys.set_turbo_ratio(speed);
+                                config.turbo_speed = speed;
+                                eprintln!("nes-emu: turbo speed set to {:.2}x", speed);
+                            }
+                            if let Some(want_rbt) = menu.take_pending_ring_buffer_trace() {
+                                config.debug.ring_buffer_trace = want_rbt;
+                                if want_rbt {
+                                    debug_hotkeys.enable_ring_trace();
+                                    eprintln!("nes-emu: ring buffer trace enabled (pauses dump to trace.log)");
+                                } else {
+                                    debug_hotkeys.disable_ring_trace();
+                                    eprintln!("nes-emu: ring buffer trace disabled");
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Intercept UI/debugger/save-state/audio/region/ROM-info
                     // hotkeys (M27-M34) before joypad routing.
-                    let consumed = ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
+                    // save_state_hotkeys is checked before ui_hotkeys so
+                    // Space is consumed for rewind speed cycling when
+                    // rewinding, instead of falling through to turbo.
+                    // Also handle Shift key-down for seamless rewind→forward
+                    // switching while Backspace is held.
+                    if k == Keycode::LShift || k == Keycode::RShift {
+                        save_state_hotkeys.shift_pressed();
+                    }
+                    let consumed = save_state_hotkeys.handle_key(&mut emulator, k, keymod)
+                        || ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
                         || handle_debugger_key(&mut debugger, k)
-                        || debug_hotkeys.handle_key(emulator.bus(), k)
-                        || save_state_hotkeys.handle_key(&mut emulator, k, keymod)
+                        || debug_hotkeys.handle_key(emulator.bus_mut(), k)
                         || audio_hotkeys.handle_key(emulator.bus_mut().apu_mut(), k, keymod)
                         || region_hotkeys.handle_key(&mut emulator, k, keymod)
                         || (k == ROM_INFO_HOTKEY && {
@@ -238,7 +451,50 @@ fn run() -> Result<(), String> {
                 Event::KeyUp {
                     keycode: Some(k), ..
                 } => {
-                    mapper.handle_key(emulator.bus_mut().joypad_mut(), k, false);
+                    // Backspace release: stop rewinding and/or forwarding.
+                    // If paused at a branch diverge point, accept it
+                    // (switch to that branch). If paused at the beginning
+                    // of a branch, just stop rewinding — the user can
+                    // still Shift+Backspace to forward or press 'o' to
+                    // return to the parent timeline.
+                    if k == Keycode::Backspace {
+                        if save_state_hotkeys.is_paused_at_branch_point() {
+                            save_state_hotkeys.accept_branch();
+                            eprintln!("nes-emu: branch accepted on Backspace release");
+                        } else {
+                            if save_state_hotkeys.is_paused_at_branch() {
+                                // paused_at_start: clear it, don't accept
+                                save_state_hotkeys.stop_rewind();
+                            }
+                            if save_state_hotkeys.is_forwarding() {
+                                save_state_hotkeys.stop_forward();
+                                eprintln!(
+                                    "nes-emu: forward stopped ({} snapshots in forward buffer)",
+                                    save_state_hotkeys.rewind.len()
+                                );
+                            }
+                            if save_state_hotkeys.is_rewinding() {
+                                save_state_hotkeys.stop_rewind();
+                                eprintln!(
+                                    "nes-emu: rewind stopped ({} snapshots)",
+                                    save_state_hotkeys.rewind.len()
+                                );
+                            }
+                        }
+                    }
+                    // Shift release: if Backspace is still held, switch
+                    // from forwarding back to rewinding. If Backspace was
+                    // already released, stop forwarding.
+                    if k == Keycode::LShift || k == Keycode::RShift {
+                        save_state_hotkeys.shift_released();
+                    }
+                    // Space release: stop turbo.
+                    if k == Keycode::Space {
+                        ui_hotkeys.stop_turbo();
+                    }
+                    if !menu.is_open() {
+                        mapper.handle_key(emulator.bus_mut().joypad_mut(), k, false);
+                    }
                 }
                 Event::ControllerButtonDown { which, button, .. } => {
                     if let Some(&seq) = gamepad_index_map.get(&which) {
@@ -302,8 +558,10 @@ fn run() -> Result<(), String> {
                     current_rom_info = loaded.info;
                     let new_recent = rom_manager.record_loaded_rom(&dropped_path.to_string_lossy());
                     config.recent_roms = new_recent;
-                    save_state_hotkeys =
-                        SaveStateHotkeys::new(game_name_from_path(&current_rom_path));
+                    save_state_hotkeys = SaveStateHotkeys::with_capacity(
+                        game_name_from_path(&current_rom_path),
+                        config.rewind_capacity,
+                    );
                     debugger = CpuDebugger::new();
                     eprintln!("nes-emu: loaded ROM: {}", current_rom_path.display());
                 }
@@ -319,6 +577,45 @@ fn run() -> Result<(), String> {
         if debugger.is_paused() {
             if debugger.consume_step_request() {
                 emulator.step_instruction();
+                overlay_shown = false;
+            }
+        } else if save_state_hotkeys.is_paused_at_branch() {
+            // Paused at a branch point: do nothing, wait for user to
+            // press o (accept) or p (deny).
+        } else if save_state_hotkeys.is_rewinding() {
+            // Rewind: pop snapshots per vsync tick (speed-controlled)
+            // instead of stepping forward. If the buffer is empty,
+            // emulation pauses until the rewind key is released.
+            save_state_hotkeys.rewind_step(&mut emulator);
+        } else if save_state_hotkeys.is_forwarding() {
+            // Forward: pop from the forward buffer to advance through
+            // previously-rewound states. If empty, emulation pauses.
+            save_state_hotkeys.forward_step(&mut emulator);
+        } else if ui_hotkeys.turbo_held() {
+            // Turbo (Spacebar held): run `turbo_ratio`× frames per tick.
+            // Uses a fractional accumulator for sub-1× speeds.
+            let frames_this_tick = ui_hotkeys.turbo_frame_count();
+            for i in 0..frames_this_tick {
+                if debug_hotkeys.ring_trace_active() {
+                    emulator.step_frame_ring_traced(&mut debugger, &mut debug_hotkeys.ring_trace);
+                } else if debug_hotkeys.trace_enabled() {
+                    emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
+                } else {
+                    emulator.step_frame_debug(&mut debugger);
+                }
+                if i + 1 < frames_this_tick {
+                    let _ = emulator.take_audio_samples();
+                }
+                if debugger.is_paused() {
+                    if debug_hotkeys.ring_trace_active() {
+                        let n = debug_hotkeys.dump_ring_trace();
+                        eprintln!("nes-emu: ring trace dumped {n} lines to trace.log");
+                    }
+                    if let Some(bp) = debugger.last_hit() {
+                        eprintln!("nes-emu: breakpoint hit: {bp}");
+                    }
+                    break;
+                }
             }
         } else {
             let frames_this_tick = if ui_hotkeys.fast_forward() {
@@ -327,7 +624,9 @@ fn run() -> Result<(), String> {
                 1
             };
             for i in 0..frames_this_tick {
-                if debug_hotkeys.trace_enabled() {
+                if debug_hotkeys.ring_trace_active() {
+                    emulator.step_frame_ring_traced(&mut debugger, &mut debug_hotkeys.ring_trace);
+                } else if debug_hotkeys.trace_enabled() {
                     emulator.step_frame_traced(&mut debugger, &mut debug_hotkeys.trace_logger);
                 } else {
                     emulator.step_frame_debug(&mut debugger);
@@ -336,6 +635,10 @@ fn run() -> Result<(), String> {
                     let _ = emulator.take_audio_samples();
                 }
                 if debugger.is_paused() {
+                    if debug_hotkeys.ring_trace_active() {
+                        let n = debug_hotkeys.dump_ring_trace();
+                        eprintln!("nes-emu: ring trace dumped {n} lines to trace.log");
+                    }
                     if let Some(bp) = debugger.last_hit() {
                         eprintln!("nes-emu: breakpoint hit: {bp}");
                     }
@@ -349,9 +652,16 @@ fn run() -> Result<(), String> {
         // hook (OSD) or the info-overlay blit below, so the overlay is
         // drawn *before* the present (a double-present would halve the
         // frame rate since the renderer is vsync-locked).
+        // Rewind/forward timeline overlay — shown on screen while
+        // rewinding or forwarding (or fading out after release),
+        // regardless of OSD state. Advance the animation first.
+        save_state_hotkeys.tick_animation();
+        save_state_hotkeys.render_rewind_overlay(emulator.framebuffer_mut(), 256, 240);
         let osd_on = save_state_hotkeys.osd_enabled();
         let info_on = rom_manager.info_overlay_enabled();
-        if !osd_on && !info_on {
+        let menu_on = menu.is_open();
+        let help_on = help_visible;
+        if !osd_on && !info_on && !menu_on && !help_on {
             video.present(emulator.framebuffer())?;
         }
         let samples = emulator.take_audio_samples();
@@ -386,11 +696,98 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // While paused, render a console "overlay" — register snapshot +
-        // disassembly window — to stderr each frame (M27 debug overlay).
-        if debugger.is_paused() {
-            print_debug_overlay(&emulator, &debugger);
+        // In-emulator menu overlay — when open, blit the menu into the
+        // framebuffer and present. Runs last so it sits on top of all
+        // other overlays.
+        if menu_on {
+            menu.render(emulator.framebuffer_mut(), 256, 240, &config);
+            if !osd_on && !info_on {
+                video.present(emulator.framebuffer())?;
+            }
         }
+
+        // F1 help overlay — lists all F-key bindings on screen.
+        if help_on {
+            let help_lines: &[&str] = &[
+                "== NES-EMU HELP ==",
+                "F1  Help (this screen)",
+                "F2  Pause/Resume",
+                "F3  Breakpoint toggle",
+                "N   Single-step (when paused)",
+                "F4  PPU viewer",
+                "F5  Save state",
+                "F6  Memory viewer",
+                "F7  Load state",
+                "F8  Trace log toggle",
+                "T   PPU write log toggle",
+                "F12 Menu (Debug: Ring Buffer Trace)",
+                "F9  Screenshot",
+                "F10 OSD toggle",
+                "F11 Region cycle",
+                "Tab Fast-forward 4x",
+                "Spc Turbo (hold)",
+                "Bsp Rewind (hold)",
+                "S+Bsp Forward (hold)",
+                "Spc Rewind speed (while rewinding)",
+                "Ctl+R Reset",
+                "Alt+Enter Fullscreen",
+                "1-0 Save slot select",
+                "Alt+1-5 Audio channel",
+                "Alt+M Mute channel",
+                "Alt+Up/Dn Volume",
+                "PgUp/Dn Mem navigate",
+                "[/]  Mem region",
+                "ESC/Q Quit",
+            ];
+            save_state_hotkeys
+                .osd
+                .render_forced(emulator.framebuffer_mut(), 256, 240, help_lines);
+            if !osd_on && !info_on && !menu_on {
+                video.present(emulator.framebuffer())?;
+            }
+        }
+
+        // While paused, render a console "overlay" — register snapshot +
+        // disassembly window — to stderr once per pause session (M27 debug
+        // overlay). Reprinted after each single-step so the user sees the
+        // updated state.
+        if debugger.is_paused() {
+            if !overlay_shown {
+                if debug_hotkeys.ring_trace_active() {
+                    let n = debug_hotkeys.dump_ring_trace();
+                    eprintln!("nes-emu: ring trace dumped {n} lines to trace.log");
+                }
+                print_debug_overlay(&emulator, &debugger);
+                overlay_shown = true;
+            }
+        } else {
+            overlay_shown = false;
+        }
+
+        // Pace the loop to real time (see comment above `last_tick`).
+        // Skipped while fast-forwarding (intentionally faster than
+        // real-time) and while the debugger is paused (no frame ran).
+        //
+        // Windows `thread::sleep` has ~15.6 ms granularity by default, but
+        // an NTSC frame is 16.64 ms — the mismatch causes irregular frame
+        // spacing and periodic audio buffer underruns (audible pops every
+        // ~1 s). To get sub-millisecond pacing we sleep for the bulk of the
+        // wait, then spin-wait the final 2 ms using `Instant::elapsed()`.
+        if !ui_hotkeys.fast_forward() && !debugger.is_paused() {
+            let target = Duration::from_secs_f64(1.0 / emulator.region().frame_rate_hz() as f64);
+            let elapsed = last_tick.elapsed();
+            if elapsed < target {
+                let remaining = target - elapsed;
+                let spin_threshold = Duration::from_millis(2);
+                if remaining > spin_threshold {
+                    std::thread::sleep(remaining - spin_threshold);
+                }
+                while last_tick.elapsed() < target {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        last_tick = Instant::now();
     }
 
     // Battery-backed PRG-RAM persistence (M21): on exit, dump the
@@ -403,7 +800,8 @@ fn run() -> Result<(), String> {
         eprintln!("nes-emu: warning: could not save config: {e}");
     }
 
-    // M28: flush + close the trace log on exit so no lines are lost.
+    // M28: flush + close the trace log and PPU write log on exit.
+    debug_hotkeys.shutdown_ppu_write_log(emulator.bus_mut());
     debug_hotkeys.shutdown();
 
     // Keep `gamepads` alive until after the loop so the SDL2 controller

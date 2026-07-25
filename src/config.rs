@@ -1,65 +1,6 @@
-//! User configuration — key bindings, gamepad bindings, audio volume, and
-//! window scale, persisted as `config.toml` (TOML via the `toml` crate).
+//! User configuration — key bindings, gamepad bindings, audio volume, window scale.
 //!
-//! # File layout
-//!
-//! ```toml
-//! audio_volume = 1.0
-//! window_scale = 3
-//!
-//! [keys.controller1]
-//! A = "Z"
-//! B = "X"
-//! Select = "A"
-//! Start = "S"
-//! Up = "Up"
-//! Down = "Down"
-//! Left = "Left"
-//! Right = "Right"
-//!
-//! [keys.controller2]
-//! # empty by default — add bindings here for player 2
-//!
-//! [gamepad]
-//! A = "a"
-//! B = "b"
-//! Select = "back"
-//! Start = "start"
-//! Up = "dpup"
-//! Down = "dpdown"
-//! Left = "dpleft"
-//! Right = "dpright"
-//! ```
-//!
-//! Each binding maps an NES button name (`A`, `B`, `Select`, `Start`, `Up`,
-//! `Down`, `Left`, `Right`) to a host input name:
-//!
-//! - **Keyboard**: an SDL2 `Keycode` name (e.g. `"Z"`, `"Up"`, `"Return"`).
-//!   The names accepted are exactly those recognized by
-//!   [`sdl2::keyboard::Keycode::from_name`].
-//! - **Gamepad**: an SDL2 `GameControllerButton` mapping-string name
-//!   (e.g. `"a"`, `"b"`, `"back"`, `"start"`, `"dpup"`, `"dpdown"`,
-//!   `"dpleft"`, `"dpright"`, `"leftshoulder"`, `"rightshoulder"`). The
-//!   names accepted are exactly those recognized by
-//!   [`sdl2::controller::Button::from_string`]; the lookup is
-//!   case-insensitive, so `"A"` works the same as `"a"`, but the D-pad
-//!   names must use the SDL2 short forms (`"dpup"`, not `"DPadUp"`).
-//!
-//! Missing or empty-string entries are treated as **unbound** — pressing
-//! that host key/button has no effect. Missing whole sections fall back to
-//! empty maps (everything unbound), so a user can start from a minimal
-//! `config.toml` and add only the bindings they want to override.
-//!
-//! # Persistence
-//!
-//! On first run, if no `config.toml` is found at the configured path,
-//! [`Config::ensure_default_file`] writes the default bindings so the user
-//! has a template to edit. Custom bindings then persist across restarts by
-//! construction — the file is the source of truth.
-//!
-//! See: https://www.nesdev.org/wiki/Controller_port
-//! See: https://wiki.libsdl.org/SDL_Keycode (key names)
-//! See: https://wiki.libsdl.org/SDL_GameControllerButton (button names)
+//! Persisted as `config.toml`; missing entries are treated as unbound.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -73,18 +14,17 @@ use serde::{Deserialize, Serialize};
 pub const NES_BUTTON_NAMES: [&str; 8] =
     ["A", "B", "Select", "Start", "Up", "Down", "Left", "Right"];
 
-/// Default keyboard bindings for controller 1 — mirrors the layout used by
-/// common NES emulators (FCEUX / Nestopia): `Z`/`X` for the right-hand
-/// action buttons, arrow keys for the D-pad, and `A`/`S` for Select/Start.
+/// Default keyboard bindings for controller 1 — WASD for the D-pad,
+/// `K`/`L` for the right-hand action buttons, and `U`/`Y` for Select/Start.
 const DEFAULT_KB1: [(&str, &str); 8] = [
-    ("A", "Z"),
-    ("B", "X"),
-    ("Select", "A"),
-    ("Start", "S"),
-    ("Up", "Up"),
-    ("Down", "Down"),
-    ("Left", "Left"),
-    ("Right", "Right"),
+    ("A", "K"),
+    ("B", "L"),
+    ("Select", "U"),
+    ("Start", "Y"),
+    ("Up", "W"),
+    ("Down", "S"),
+    ("Left", "A"),
+    ("Right", "D"),
 ];
 
 /// Default gamepad bindings — Xbox-style layout where the face buttons map
@@ -227,6 +167,51 @@ impl ChannelVolumes {
     }
 }
 
+/// Debug / diagnostics settings, configured under `[debug]` in `config.toml`.
+///
+/// All flags default to `false` (accurate emulation). These are intended for
+/// testing and visual regression purposes — they intentionally introduce
+/// known bugs so their visual effects can be reproduced deterministically.
+///
+/// ```toml
+/// [debug]
+/// slant_corruption = false
+/// ring_buffer_trace = false
+/// use_inaccurate_palette = false
+/// nmi_retrigger = false
+/// ```
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DebugConfig {
+    /// Reproduce the fine-X scroll corruption bug (fixed). When `true`,
+    /// `increment_h_scroll` mutates the PPUSCROLL `fine_x` register during
+    /// rendering (incrementing it every 8 cycles and wrapping into coarse X)
+    /// instead of incrementing coarse X directly. This causes each scanline
+    /// to start with a progressively shifted fine X offset, producing the
+    /// characteristic 45-degree slant on all rendered pixels.
+    #[serde(default)]
+    pub slant_corruption: bool,
+    /// Enable ring buffer trace mode. When `true`, the emulator keeps the
+    /// last 10,000 CPU instructions in memory instead of writing every
+    /// instruction to `trace.log`. When the user pauses (F2), the buffer
+    /// is flushed to `trace.log`, giving a focused window around the
+    /// moment of interest rather than millions of lines from boot.
+    #[serde(default)]
+    pub ring_buffer_trace: bool,
+    /// Reproduce the inaccurate NES palette bug (fixed). When `true`,
+    /// the old incorrect RGB values are used for NTSC color conversion,
+    /// producing wrong colors such as yellow pipes in Mario Bros.
+    #[serde(default)]
+    pub use_inaccurate_palette: bool,
+    /// Reproduce the NMI retrigger bug (fixed). When `true`, every
+    /// PPUCTRL write with bit 7 set during VBlank triggers an NMI
+    /// (the old buggy behavior), instead of only the rising edge 0→1.
+    /// This causes spurious extra NMIs that waste VBlank time on
+    /// redundant OAM DMAs, forcing VRAM writes to spill into visible
+    /// scanlines where scroll increments corrupt the target addresses.
+    #[serde(default)]
+    pub nmi_retrigger: bool,
+}
+
 /// Top-level user configuration.
 ///
 /// All fields default to sensible values; a missing `config.toml` yields
@@ -271,6 +256,26 @@ pub struct Config {
     /// selection).
     #[serde(default)]
     pub recent_roms: Vec<String>,
+
+    /// Debug / diagnostics settings (under `[debug]` in `config.toml`).
+    /// Defaults to all-off so emulation is accurate unless explicitly
+    /// configured otherwise.
+    #[serde(default)]
+    pub debug: DebugConfig,
+
+    /// Rewind buffer capacity in snapshots (under `[rewind]` in
+    /// `config.toml`). Each snapshot is ~13–30 KB; with
+    /// `REWIND_INTERVAL = 2`, `capacity` snapshots cover
+    /// `capacity * 2 / 60` seconds of NTSC gameplay. Default is 300
+    /// (~10 s). Maximum is 60000 (~33 min). Clamped at load time.
+    #[serde(default = "default_rewind_capacity")]
+    pub rewind_capacity: usize,
+
+    /// Turbo speed multiplier for the Spacebar hold-to-accelerate
+    /// feature. Accepts `0.25`, `0.5`, `2.0`, `3.0`, or `4.0`.
+    /// Default is `2.0` (double speed).
+    #[serde(default = "default_turbo_speed")]
+    pub turbo_speed: f32,
 }
 
 fn default_region() -> String {
@@ -283,6 +288,14 @@ fn default_audio_volume() -> f32 {
 
 fn default_window_scale() -> u32 {
     3
+}
+
+fn default_rewind_capacity() -> usize {
+    crate::save_state::DEFAULT_REWIND_CAPACITY
+}
+
+fn default_turbo_speed() -> f32 {
+    crate::ui_hotkeys::TURBO_SPEEDS[crate::ui_hotkeys::DEFAULT_TURBO_SPEED_INDEX]
 }
 
 impl Default for Config {
@@ -306,6 +319,9 @@ impl Default for Config {
             audio_channels: ChannelVolumes::default(),
             region: default_region(),
             recent_roms: Vec::new(),
+            debug: DebugConfig::default(),
+            rewind_capacity: default_rewind_capacity(),
+            turbo_speed: default_turbo_speed(),
         }
     }
 }
@@ -453,16 +469,16 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.keycode_for(0, button::A),
-            Some(Keycode::Z),
-            "default A should be Z"
+            Some(Keycode::K),
+            "default A should be K"
         );
-        assert_eq!(c.keycode_for(0, button::B), Some(Keycode::X));
-        assert_eq!(c.keycode_for(0, button::SELECT), Some(Keycode::A));
-        assert_eq!(c.keycode_for(0, button::START), Some(Keycode::S));
-        assert_eq!(c.keycode_for(0, button::UP), Some(Keycode::Up));
-        assert_eq!(c.keycode_for(0, button::DOWN), Some(Keycode::Down));
-        assert_eq!(c.keycode_for(0, button::LEFT), Some(Keycode::Left));
-        assert_eq!(c.keycode_for(0, button::RIGHT), Some(Keycode::Right));
+        assert_eq!(c.keycode_for(0, button::B), Some(Keycode::L));
+        assert_eq!(c.keycode_for(0, button::SELECT), Some(Keycode::U));
+        assert_eq!(c.keycode_for(0, button::START), Some(Keycode::Y));
+        assert_eq!(c.keycode_for(0, button::UP), Some(Keycode::W));
+        assert_eq!(c.keycode_for(0, button::DOWN), Some(Keycode::S));
+        assert_eq!(c.keycode_for(0, button::LEFT), Some(Keycode::A));
+        assert_eq!(c.keycode_for(0, button::RIGHT), Some(Keycode::D));
     }
 
     #[test]
@@ -562,8 +578,8 @@ mod tests {
         let c = Config::default();
         let text = c.to_toml().expect("serialize");
         let parsed = Config::from_toml(&text).expect("parse");
-        assert_eq!(parsed.keycode_for(0, button::A), Some(Keycode::Z));
-        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::S));
+        assert_eq!(parsed.keycode_for(0, button::A), Some(Keycode::K));
+        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::Y));
         assert_eq!(parsed.gamepad_button_for(button::A), Some(Button::A));
         assert_eq!(parsed.gamepad_button_for(button::UP), Some(Button::DPadUp));
         assert_eq!(parsed.audio_volume, 1.0);
@@ -597,7 +613,7 @@ mod tests {
             Some(Button::LeftShoulder)
         );
         // Untouched bindings remain.
-        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::S));
+        assert_eq!(parsed.keycode_for(0, button::START), Some(Keycode::Y));
     }
 
     #[test]
@@ -643,7 +659,7 @@ A = "Return"
         // Make sure it really doesn't exist.
         let _ = std::fs::remove_file(&path);
         let c = Config::load_from_path(&path).expect("missing file is not an error");
-        assert_eq!(c.keycode_for(0, button::A), Some(Keycode::Z));
+        assert_eq!(c.keycode_for(0, button::A), Some(Keycode::K));
     }
 
     #[test]
@@ -662,7 +678,7 @@ A = "Return"
 
         let loaded = Config::load_from_path(&path).expect("load");
         assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::Return));
-        assert_eq!(loaded.keycode_for(0, button::B), Some(Keycode::X));
+        assert_eq!(loaded.keycode_for(0, button::B), Some(Keycode::L));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -686,7 +702,7 @@ A = "Return"
 
         // The written file parses back to defaults.
         let loaded = Config::load_from_path(&path).expect("load");
-        assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::Z));
+        assert_eq!(loaded.keycode_for(0, button::A), Some(Keycode::K));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -709,5 +725,33 @@ A = "Return"
         let parsed = Config::from_toml(&text).expect("parse");
         assert_eq!(parsed.keycode_for(1, button::A), Some(Keycode::U));
         assert_eq!(parsed.keycode_for(1, button::RIGHT), Some(Keycode::D));
+    }
+
+    #[test]
+    fn debug_config_defaults_to_off() {
+        let c = Config::default();
+        assert!(
+            !c.debug.slant_corruption,
+            "slant_corruption defaults to false"
+        );
+    }
+
+    #[test]
+    fn debug_slant_corruption_round_trips_through_toml() {
+        let mut c = Config::default();
+        c.debug.slant_corruption = true;
+        let text = c.to_toml().expect("serialize");
+        let parsed = Config::from_toml(&text).expect("parse");
+        assert!(parsed.debug.slant_corruption, "slant_corruption preserved");
+    }
+
+    #[test]
+    fn debug_slant_corruption_parsed_from_toml() {
+        let text = r#"
+[debug]
+slant_corruption = true
+"#;
+        let c = Config::from_toml(text).expect("parse");
+        assert!(c.debug.slant_corruption);
     }
 }

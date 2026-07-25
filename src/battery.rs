@@ -1,39 +1,6 @@
-//! Battery-backed PRG-RAM persistence.
-//!
-//! Some NES cartridges (notably MMC1 and MMC3 boards with the iNES header's
-//! battery flag set) include battery-backed PRG-RAM at `$6000-$7FFF` whose
-//! contents survive power-off. On real hardware a coin cell keeps the SRAM
-//! alive; on an emulator we persist the SRAM contents to a sidecar file
-//! next to the ROM so that a game's save data is preserved across sessions.
-//!
-//! # File layout
-//!
-//! The sidecar file is a raw binary dump of the cartridge's PRG-RAM — no
-//! header, no framing. Its length equals the mapper's PRG-RAM size (typically
-//! 8 KB for MMC1/MMC3). The file extension is `.nessram` and the file is
-//! placed next to the ROM with the same stem:
-//!
-//! ```text
-//!   /games/zelda.nes        → /games/zelda.nessram
-//!   /games/smb3.nes         → /games/smb3.nessram
-//! ```
-//!
-//! # Lifecycle
-//!
-//! 1. **Boot** — after loading the ROM, the main loop calls
-//!    [`load_for_rom`]. If a `.nessram` file exists next to the ROM, its
-//!    contents are read and handed to [`crate::cartridge::Cartridge::load_battery_sram`].
-//!    A missing file is not an error — the cartridge simply starts with
-//!    zeroed PRG-RAM.
-//! 2. **Run** — the game reads and writes PRG-RAM through the bus as usual.
-//! 3. **Exit** — the main loop calls [`save_for_rom`] with the current
-//!    PRG-RAM contents (obtained via
-//!    [`crate::cartridge::Cartridge::battery_sram`]). The contents are
-//!    written to the `.nessram` file, overwriting any previous save.
+//! Battery-backed PRG-RAM persistence — saves/loads `.nessram` sidecar files.
 //!
 //! See: https://www.nesdev.org/wiki/INES#Flags_6
-//! See: https://www.nesdev.org/wiki/MMC1#PRG-RAM
-//! See: https://www.nesdev.org/wiki/MMC3#PRG-RAM
 
 #![allow(dead_code)]
 

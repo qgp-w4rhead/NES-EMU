@@ -206,10 +206,12 @@ fn nmi_request_persists_until_taken() {
 fn h_scroll_increment_during_rendering() {
     let mut bus = Bus::new();
     bus.write(PPUMASK, MASK_SHOW_BG);
-    // After 8 cycles (dot 8), fine_x should have incremented from 0 to 1.
+    // After 8 cycles (dot 8), coarse X in v should have incremented from 0 to 1.
+    // fine_x (PPUSCROLL) must remain unchanged.
     step_ppu(&mut bus, 8);
     assert_eq!(bus.ppu().cycle(), 8);
-    assert_eq!(bus.ppu().fine_x(), 1);
+    assert_eq!(bus.ppu().vram_addr() & 0x1F, 1);
+    assert_eq!(bus.ppu().fine_x(), 0);
 }
 
 #[test]
@@ -225,15 +227,16 @@ fn h_scroll_increments_31_times_per_scanline() {
     let mut bus = Bus::new();
     bus.write(PPUMASK, MASK_SHOW_BG);
     // Advance through one full visible scanline (cycles 8, 16, ..., 248
-    // = 31 h-scroll increments; fine_x wraps 8 times → coarse X advances
-    // by 31 = full nametable width).
+    // = 31 h-scroll increments of coarse X in v). fine_x must remain at 0.
     step_ppu(&mut bus, CYCLES_PER_SCANLINE as u32);
-    // After one scanline: 31 h-scroll increments. fine_x wraps every 8
-    // increments: 31 / 8 = 3 wraps + 7 remainder → fine_x = 7. coarse X
-    // advanced by 3 (from wraps) + the 31 increments cross 3 nametable
-    // boundaries... actually the net effect on v is complex. Just check
-    // that fine_x ended at 7 (31 mod 8 = 7).
-    assert_eq!(bus.ppu().fine_x(), 7, "31 h-scroll increments → fine_x = 7");
+    // After 31 coarse-X increments from 0: 0 + 31 = 31 (no wrap).
+    // Then at cycle 257, copy_h_t_to_v resets coarse X from t (0).
+    // fine_x must not be modified during rendering.
+    assert_eq!(
+        bus.ppu().fine_x(),
+        0,
+        "fine_x must not be modified during rendering"
+    );
 }
 
 #[test]
@@ -258,10 +261,10 @@ fn h_t_to_v_copy_at_cycle_257() {
     bus.write(0x2005, 0x00); // PPUSCROLL second: coarse Y = 0, fine Y = 0
                              // Advance to cycle 257 of scanline 0.
     step_ppu(&mut bus, 257);
-    // v should now have t's coarse X (10) and nt bits (0b11).
+    // v should now have t's coarse X (10) and nt H bit (bit 10 only).
     let v = bus.ppu().vram_addr();
     assert_eq!(v & 0b0000_0000_0001_1111, 10, "coarse X copied from t");
-    assert_eq!((v >> 10) & 0b11, 0b11, "nt bits copied from t");
+    assert_eq!((v >> 10) & 0b01, 0b01, "nt H bit copied from t");
 }
 
 #[test]
@@ -275,11 +278,11 @@ fn v_t_to_v_copy_at_prerender_280_304() {
     bus.write(0x2005, 0x7D);
     // Advance to prerender scanline, cycle 304 (last V-copy cycle).
     advance_to(&mut bus, SCANLINE_PRERENDER, 304);
-    // v should now have t's coarse Y (15), fine Y (5), nt (0b10).
+    // v should now have t's coarse Y (15), fine Y (5), nt V bit (bit 11).
     let v = bus.ppu().vram_addr();
     assert_eq!((v >> 5) & 0b11111, 15, "coarse Y copied from t");
     assert_eq!((v >> 12) & 0x07, 5, "fine Y copied from t");
-    assert_eq!((v >> 10) & 0b11, 0b10, "nt bits copied from t");
+    assert_eq!((v >> 10) & 0b10, 0b10, "nt V bit copied from t");
 }
 
 // ---- PPUSTATUS read clears VBlank (M7 behaviour, re-verified) ---------

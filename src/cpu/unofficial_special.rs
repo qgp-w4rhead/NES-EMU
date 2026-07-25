@@ -187,12 +187,12 @@ impl Cpu {
     /// the full base + Y. PC has already advanced past the opcode byte;
     /// this fetches the zero-page operand byte and the two pointer bytes.
     ///
-    /// This exists separately from `am_indirect_y_rmw` (in
+    /// This exists separately from `am_indirect_y` (in
     /// [`super::addressing`]) because the unstable stores issue their own
     /// dummy read inside `ahx_store`/`shy_store` via
-    /// [`store_dummy_read_addr`]; reusing `am_indirect_y_rmw` would fire a
-    /// *second* dummy read at a different (page-wrap) address, double-
-    /// counting side-effects on read-sensitive devices.
+    /// [`store_dummy_read_addr`]; reusing `am_indirect_y` with `Dummy::Rmw`
+    /// would fire a *second* dummy read at a different (page-wrap) address,
+    /// double-counting side-effects on read-sensitive devices.
     pub(crate) fn am_indirect_y_base(&mut self, bus: &mut Bus) -> u16 {
         let zp = self.fetch_byte(bus);
         let lo = bus.read(zp as u16);

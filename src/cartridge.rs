@@ -1,14 +1,6 @@
-//! iNES cartridge loader.
-//!
-//! Parses the 16-byte iNES header, skips the optional 512-byte trainer, and
-//! loads PRG-ROM and CHR-ROM into owned buffers. The actual bank-switching
-//! behavior is delegated to a `Mapper` implementation selected by the mapper
-//! number extracted from the header.
+//! iNES cartridge loader — header parsing, PRG/CHR loading, mapper selection.
 //!
 //! See: https://www.nesdev.org/wiki/INES
-//!
-//! The cartridge API is wired into the memory bus at M3; until then some
-//! accessors are unused at runtime, so we silence dead-code warnings here.
 #![allow(dead_code)]
 
 use std::fmt;

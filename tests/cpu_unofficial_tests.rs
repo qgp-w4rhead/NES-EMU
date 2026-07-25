@@ -1091,8 +1091,8 @@ fn kil_ignores_pending_nmi_and_irq() {
     let pc_after_kil = cpu.pc;
 
     // Raise both NMI and IRQ, then step — neither should be serviced.
-    cpu.nmi_pending = true;
-    cpu.irq_pending = true;
+    cpu.set_nmi_pending(true);
+    cpu.set_irq_pending(true);
     let c = cpu.step(&mut bus);
     assert_eq!(c, 1, "halted step must return 1 cycle");
     assert_eq!(
@@ -1102,11 +1102,11 @@ fn kil_ignores_pending_nmi_and_irq() {
     assert!(cpu.is_halted(), "CPU must remain halted");
     // The pending flags are NOT cleared by a halted step (no service ran).
     assert!(
-        cpu.nmi_pending,
+        cpu.nmi_pending(),
         "NMI pending must not be cleared while halted"
     );
     assert!(
-        cpu.irq_pending,
+        cpu.irq_pending(),
         "IRQ pending must not be cleared while halted"
     );
 }
@@ -1143,7 +1143,7 @@ fn disasm_decodes_unofficial_mnemonics() {
 // ===========================================================================
 
 #[test]
-fn save_state_version_is_six() {
+fn save_state_version_is_eight() {
     use nes_emu::save_state::SAVE_STATE_VERSION;
-    assert_eq!(SAVE_STATE_VERSION, 6);
+    assert_eq!(SAVE_STATE_VERSION, 8);
 }

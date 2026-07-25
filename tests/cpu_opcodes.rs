@@ -506,6 +506,236 @@ fn sbc_signed_overflow() {
 }
 
 // ===========================================================================
+// Decimal mode behavior (M-CYC-07)
+//
+// The NES 2A03 physically removed the decimal-mode circuitry from the 6502.
+// SED/CLD still set/clear the D flag, but ADC/SBC always perform binary
+// arithmetic regardless of D. On a real 6502, the cases below would produce
+// decimal-corrected results; on the NES they must produce plain binary
+// results with flags set from the binary operation.
+// See: https://www.nesdev.org/wiki/6502#Decimal_mode_in_the_NES
+// ===========================================================================
+
+#[test]
+fn adc_decimal_flag_ignored_low_nibble_carry() {
+    // 0x09 + 0x01 = 0x0A in binary. On a 6502 with D set, the low nibble
+    // would carry: 0x09 + 0x01 = 0x10. On the NES, result is 0x0A.
+    let mut bus = bus_with_prog(&[0x69, 0x01]); // ADC #$01
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x09;
+    cpu.set_decimal(true);
+    cpu.set_carry(false);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0x0A);
+    assert!(!cpu.carry());
+    assert!(!cpu.zero());
+    assert!(!cpu.negative());
+    assert!(!cpu.overflow());
+    // D flag must remain set — ADC does not clear it.
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn adc_decimal_flag_ignored_high_nibble_carry() {
+    // 0x99 + 0x01 = 0x9A in binary. On a 6502 with D set, this would
+    // produce 0x00 with carry set. On the NES, result is 0x9A, no carry.
+    let mut bus = bus_with_prog(&[0x69, 0x01]); // ADC #$01
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x99;
+    cpu.set_decimal(true);
+    cpu.set_carry(false);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0x9A);
+    assert!(!cpu.carry());
+    assert!(cpu.negative()); // bit 7 set
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn adc_decimal_flag_ignored_both_nibbles_carry() {
+    // 0x49 + 0x49 = 0x92 in binary. On a 6502 with D set, both nibbles
+    // would carry: 0x49 + 0x49 = 0x98 (decimal 49+49=98). On the NES,
+    // result is 0x92.
+    let mut bus = bus_with_prog(&[0x69, 0x49]); // ADC #$49
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x49;
+    cpu.set_decimal(true);
+    cpu.set_carry(false);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0x92);
+    assert!(cpu.negative());
+    assert!(!cpu.carry());
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn adc_decimal_flag_ignored_with_carry_in() {
+    // 0x35 + 0x25 + carry = 0x5B in binary. On a 6502 with D set, this
+    // would produce 0x61 (35+25+1=61 decimal). On the NES, 0x5B.
+    let mut bus = bus_with_prog(&[0x69, 0x25]); // ADC #$25
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x35;
+    cpu.set_decimal(true);
+    cpu.set_carry(true);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0x5B);
+    assert!(!cpu.carry());
+    assert!(!cpu.zero());
+    assert!(!cpu.negative());
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn sbc_decimal_flag_ignored_low_nibble_borrow() {
+    // 0x10 - 0x01 = 0x0F in binary. On a 6502 with D set, the low nibble
+    // borrow would produce 0x09. On the NES, result is 0x0F.
+    let mut bus = bus_with_prog(&[0xE9, 0x01]); // SBC #$01
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x10;
+    cpu.set_decimal(true);
+    cpu.set_carry(true); // no borrow in
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0x0F);
+    assert!(cpu.carry()); // no borrow out
+    assert!(!cpu.negative());
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn sbc_decimal_flag_ignored_borrow_from_high() {
+    // 0x00 - 0x01 = 0xFF in binary. On a 6502 with D set, this would
+    // produce 0x99 with carry clear. On the NES, 0xFF with carry clear.
+    let mut bus = bus_with_prog(&[0xE9, 0x01]); // SBC #$01
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x00;
+    cpu.set_decimal(true);
+    cpu.set_carry(true); // no borrow in
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0xFF);
+    assert!(!cpu.carry()); // borrow occurred
+    assert!(cpu.negative());
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn sbc_decimal_flag_ignored_both_nibbles() {
+    // 0x50 - 0x25 = 0x2B in binary. On a 6502 with D set, this would
+    // produce 0x25 (decimal 50-25=25). On the NES, 0x2B.
+    let mut bus = bus_with_prog(&[0xE9, 0x25]); // SBC #$25
+    let mut cpu = cpu_at_pc0();
+    cpu.a = 0x50;
+    cpu.set_decimal(true);
+    cpu.set_carry(true);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.a, 0x2B);
+    assert!(cpu.carry());
+    assert!(!cpu.negative());
+    assert!(cpu.decimal());
+}
+
+#[test]
+fn adc_results_identical_with_and_without_decimal_flag() {
+    // Verify that D flag has zero effect on ADC by running the same
+    // computation with D=0 and D=1 and comparing all results.
+    let test_cases: &[(u8, u8, bool)] = &[
+        (0x09, 0x01, false),
+        (0x99, 0x01, false),
+        (0x49, 0x49, false),
+        (0x35, 0x25, true),
+        (0xFF, 0x01, false),
+        (0x80, 0x80, false),
+        (0x7F, 0x01, false),
+    ];
+    for &(a_val, m_val, carry_in) in test_cases {
+        // D=0
+        let mut bus0 = bus_with_prog(&[0x69, m_val]);
+        let mut cpu0 = cpu_at_pc0();
+        cpu0.a = a_val;
+        cpu0.set_decimal(false);
+        cpu0.set_carry(carry_in);
+        cpu0.step(&mut bus0);
+
+        // D=1
+        let mut bus1 = bus_with_prog(&[0x69, m_val]);
+        let mut cpu1 = cpu_at_pc0();
+        cpu1.a = a_val;
+        cpu1.set_decimal(true);
+        cpu1.set_carry(carry_in);
+        cpu1.step(&mut bus1);
+
+        assert_eq!(cpu0.a, cpu1.a, "ADC result differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.carry(), cpu1.carry(), "carry differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.zero(), cpu1.zero(), "zero differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.negative(), cpu1.negative(), "negative differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.overflow(), cpu1.overflow(), "overflow differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+    }
+}
+
+#[test]
+fn sbc_results_identical_with_and_without_decimal_flag() {
+    // Verify that D flag has zero effect on SBC by running the same
+    // computation with D=0 and D=1 and comparing all results.
+    let test_cases: &[(u8, u8, bool)] = &[
+        (0x10, 0x01, true),
+        (0x00, 0x01, true),
+        (0x50, 0x25, true),
+        (0x00, 0x01, false),
+        (0x80, 0x01, true),
+        (0x50, 0x60, true),
+        (0x99, 0x50, true),
+    ];
+    for &(a_val, m_val, carry_in) in test_cases {
+        // D=0
+        let mut bus0 = bus_with_prog(&[0xE9, m_val]);
+        let mut cpu0 = cpu_at_pc0();
+        cpu0.a = a_val;
+        cpu0.set_decimal(false);
+        cpu0.set_carry(carry_in);
+        cpu0.step(&mut bus0);
+
+        // D=1
+        let mut bus1 = bus_with_prog(&[0xE9, m_val]);
+        let mut cpu1 = cpu_at_pc0();
+        cpu1.a = a_val;
+        cpu1.set_decimal(true);
+        cpu1.set_carry(carry_in);
+        cpu1.step(&mut bus1);
+
+        assert_eq!(cpu0.a, cpu1.a, "SBC result differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.carry(), cpu1.carry(), "carry differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.zero(), cpu1.zero(), "zero differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.negative(), cpu1.negative(), "negative differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(cpu0.overflow(), cpu1.overflow(), "overflow differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+    }
+}
+
+#[test]
+fn sed_cld_set_and_clear_decimal_flag() {
+    // SED sets D, CLD clears D. Verify the flag bit is correctly
+    // manipulated and persists across other operations.
+    let mut bus = bus_with_prog(&[0xF8, 0xD8]); // SED ; CLD
+    let mut cpu = cpu_at_pc0();
+    assert!(!cpu.decimal());
+    cpu.step(&mut bus);
+    assert!(cpu.decimal());
+    cpu.step(&mut bus);
+    assert!(!cpu.decimal());
+}
+
+#[test]
+fn decimal_flag_survives_plp_and_php_roundtrip() {
+    // PHP pushes P (including D) to stack; PLP pulls it back.
+    // Verify D flag survives the round-trip.
+    let mut bus = bus_with_prog(&[0x08, 0x28]); // PHP ; PLP
+    let mut cpu = cpu_at_pc0();
+    cpu.set_decimal(true);
+    cpu.step(&mut bus); // PHP
+    cpu.set_decimal(false); // clear D in the register
+    cpu.step(&mut bus); // PLP — should restore D=1
+    assert!(cpu.decimal());
+}
+
+// ===========================================================================
 // CMP / CPX / CPY
 // ===========================================================================
 

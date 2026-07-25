@@ -1,35 +1,14 @@
-//! CPU memory bus — full address-space routing and mirroring.
-//!
-//! The NES CPU has a 16-bit address space (`$0000..=$FFFF`). The bus decodes
-//! the high bits of the address and routes each access to the appropriate
-//! device:
-//!
-//! | Range         | Device                                  |
-//! |---------------|-----------------------------------------|
-//! | `$0000-$07FF` | 2 KB internal RAM                       |
-//! | `$0800-$1FFF` | Mirror of `$0000-$07FF` (3 copies)      |
-//! | `$2000-$2007` | PPU registers                           |
-//! | `$2008-$3FFF` | Mirror of `$2000-$2007` (every 8 bytes) |
-//! | `$4000-$4017` | APU and I/O registers                   |
-//! | `$4018-$401F` | APU / I/O test mode (disabled, ignored) |
-//! | `$4020-$FFFF` | Cartridge space (PRG-RAM / PRG-ROM)     |
+//! CPU memory bus — address-space routing and mirroring.
 //!
 //! See: https://www.nesdev.org/wiki/CPU_memory_map
-//!
-//! The PPU (M7) and APU (M14/M16) are not yet implemented. Until they land,
-//! accesses to their register ranges are routed to small "open-bus" latch
-//! arrays — writes record the value, reads return it. This is genuine
-//! open-bus behavior (the last value written stays visible on the bus) and
-//! makes register *mirroring* unit-testable without the devices present.
-//! When the PPU/APU are introduced, the relevant `ppu_*` / `apu_*` helpers
-//! will be changed to delegate to those structs instead of the latches.
 
 #![allow(dead_code)]
 
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
-use crate::ppu::{Ppu, SCREEN_HEIGHT};
+use crate::ppu::{Ppu, ChrReader, SCREEN_HEIGHT};
+use crate::debug::PpuWriteLogger;
 
 /// Size of the CPU internal RAM in bytes (2 KB).
 pub const RAM_SIZE: usize = 0x0800;
@@ -55,54 +34,55 @@ pub const APU_IO_REG_COUNT: usize = 0x18;
 /// First address of cartridge space.
 const CART_BASE: u16 = 0x4020;
 
-/// PPU cycle at which the MMC3 IRQ counter is clocked (approximation of
-/// the A12 rising edge during rendering). On real hardware, A12 rises
-/// when the PPU begins fetching from the second pattern table ($1000+),
-/// which happens around PPU cycle 260 of each visible scanline (sprite
-/// pattern fetch phase). We clock once per scanline at this cycle when
-/// rendering is enabled.
-/// See: https://www.nesdev.org/wiki/MMC3#IRQ
+/// PPU cycle at which the MMC3 IRQ counter is clocked (A12 rising edge approx). See: https://www.nesdev.org/wiki/MMC3#IRQ
 const MMC3_IRQ_CLOCK_CYCLE: u16 = 260;
+
+impl ChrReader for Option<&mut Cartridge> {
+    #[inline]
+    fn read_chr(&mut self, addr: u16) -> u8 {
+        match self {
+            Some(c) => c.read_chr_latched(addr),
+            None => 0,
+        }
+    }
+}
 
 /// Last address of the APU / I/O test region (disabled on retail units).
 const APU_IO_TEST_END: u16 = 0x401F;
 
-/// The CPU memory bus.
-///
-/// Owns the 2 KB internal RAM, the PPU (with its VRAM / OAM / palette), and
-/// an optional loaded cartridge. The APU register window is still backed by
-/// an open-bus latch until the APU lands in M14/M16.
+/// The CPU memory bus — owns RAM, PPU, APU, joypad, and optional cartridge.
 pub struct Bus {
-    /// 2 KB internal CPU RAM (`$0000-$07FF`). Mirrors at `$0800-$1FFF` are
-    /// handled by masking in `read` / `write`.
+    /// 2 KB internal CPU RAM (`$0000-$07FF`).
     ram: [u8; RAM_SIZE],
 
-    /// The PPU (Picture Processing Unit). Routed for `$2000-$3FFF` (PPU
-    /// registers, 8-byte mirror) and `$4014` (OAMDMA, in the APU/IO window).
+    /// The PPU, routed for `$2000-$3FFF` and `$4014` (OAMDMA).
     ppu: Ppu,
 
-    /// Open-bus latch for the APU / I/O register window (`$4000-$4017`),
-    /// indexed by `addr - 0x4000`. Replaced by real APU routing in M14/M16.
+    /// Open-bus latch for APU/IO register window (`$4000-$4017`).
     apu_open_bus: [u8; APU_IO_REG_COUNT],
 
-    /// The APU (Audio Processing Unit). Pulse channels 1 & 2 landed in M14;
-    /// triangle, noise, DMC, and the frame counter follow in M15/M16.
-    /// See: https://www.nesdev.org/wiki/APU
+    /// The APU (Audio Processing Unit).
     apu: Apu,
 
-    /// The two NES standard controllers, polled via `$4016`/`$4017`.
-    /// Introduced in M13. See: https://www.nesdev.org/wiki/Controller_port
+    /// Two NES controllers, polled via `$4016`/`$4017`.
     joypad: Joypad,
 
-    /// Loaded cartridge, if any. When `None`, cartridge space reads return
-    /// open bus (`0x00`) and writes are ignored.
+    /// Loaded cartridge, if any.
     cartridge: Option<Cartridge>,
 
-    /// Pending OAM-DMA stall cycles (512 per DMA). Set when `$4014` is
-    /// written; consumed by the emulator main loop (M12) so the PPU
-    /// advances by the stall time while the CPU is paused.
-    /// See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
+    /// Pending OAM-DMA stall cycles (512 per DMA, 513 if aligned to odd
+    /// CPU cycle). See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
     dma_stall_cycles: u32,
+
+    /// Total CPU cycles elapsed since power-on. Used to determine even/odd
+    /// cycle alignment for OAM-DMA (an odd-cycle write to $4014 adds 1
+    /// extra stall cycle for alignment to the next even cycle).
+    cpu_cycle_count: u64,
+
+    /// Optional PPU register write logger (toggled via debug hotkey).
+    /// When `Some` and enabled, every PPU register write and OAM DMA is
+    /// logged with the PPU scanline/cycle for timing-race analysis.
+    ppu_write_logger: Option<PpuWriteLogger>,
 }
 
 impl Bus {
@@ -116,6 +96,8 @@ impl Bus {
             joypad: Joypad::new(),
             cartridge: None,
             dma_stall_cycles: 0,
+            cpu_cycle_count: 0,
+            ppu_write_logger: None,
         }
     }
 
@@ -186,11 +168,7 @@ impl Bus {
         &mut self.apu
     }
 
-    /// Advance the APU by `cpu_cycles` CPU cycles. The APU runs at half the
-    /// CPU clock, so the channel timers tick once every 2 CPU cycles. The
-    /// frame counter advances at the CPU clock rate. The DMC channel's DMA
-    /// fetches read from CPU memory (RAM + cartridge PRG space) via a
-    /// split-borrow closure.
+    /// Advance APU by `cpu_cycles` (DMC DMA reads from RAM/cartridge).
     pub fn step_apu(&mut self, cpu_cycles: u32) {
         let apu = &mut self.apu;
         let ram = &self.ram;
@@ -205,16 +183,12 @@ impl Bus {
         });
     }
 
-    /// Whether the APU has a pending IRQ (frame counter or DMC). The
-    /// emulator main loop polls this after each CPU step and raises
-    /// `Cpu::irq_pending` when it returns `true`.
+    /// Whether the APU has a pending IRQ (frame counter or DMC).
     pub fn apu_irq_pending(&self) -> bool {
         self.apu.irq_pending()
     }
 
-    /// Whether the loaded cartridge's mapper is asserting a CPU IRQ
-    /// (e.g. MMC3 IRQ counter). The emulator main loop polls this after
-    /// each CPU step and raises `Cpu::irq_pending` when it returns `true`.
+    /// Whether the cartridge mapper is asserting a CPU IRQ.
     pub fn cart_irq_pending(&self) -> bool {
         self.cartridge
             .as_ref()
@@ -222,21 +196,14 @@ impl Bus {
             .unwrap_or(false)
     }
 
-    /// Advance the cartridge mapper's CPU-clocked logic by `cpu_cycles`
-    /// CPU cycles. Used by mappers whose IRQ timer runs on the CPU clock
-    /// (e.g. FME-7's 16-bit down-counter, VRC6's IRQ timer). Called by the
-    /// emulator main loop once per CPU step with the number of cycles that
-    /// step consumed. Mappers without CPU-clocked logic ignore this.
+    /// Advance cartridge mapper's CPU-clocked logic by `cpu_cycles`.
     pub fn clock_cart_cpu(&mut self, cpu_cycles: u32) {
         if let Some(cart) = self.cartridge.as_mut() {
             cart.clock_cpu(cpu_cycles);
         }
     }
 
-    /// Current expansion-audio sample in `[-1.0, 1.0]` from the loaded
-    /// cartridge's audio chip (VRC6/VRC7/Sunsoft 5B/Namco 163). Returns
-    /// 0.0 when no cartridge is loaded or the cart has no expansion audio.
-    /// M35.
+    /// Current expansion-audio sample `[-1.0, 1.0]` from cartridge audio chip.
     pub fn expansion_audio_sample(&self) -> f32 {
         self.cartridge
             .as_ref()
@@ -244,16 +211,7 @@ impl Bus {
             .unwrap_or(0.0)
     }
 
-    /// Render the background layer into the PPU framebuffer.
-    ///
-    /// Delegates to [`Ppu::render_background`], supplying a CHR-read
-    /// closure that routes pattern-table fetches through the loaded
-    /// cartridge (CHR-ROM or CHR-RAM). With no cartridge loaded, CHR
-    /// reads return 0 (blank pattern table).
-    ///
-    /// This is the M8 entry point for producing a visible frame; the
-    /// video layer (M12) uploads the resulting framebuffer to an SDL2
-    /// texture.
+    /// Render background layer into PPU framebuffer (CHR via cartridge).
     pub fn render_background(&mut self) {
         let ppu = &mut self.ppu;
         let mut cart = self.cartridge.as_mut();
@@ -263,12 +221,7 @@ impl Bus {
         });
     }
 
-    /// Render the sprite layer on top of the existing framebuffer.
-    ///
-    /// Delegates to [`Ppu::render_sprites`], supplying a CHR-read closure
-    /// that routes pattern-table fetches through the loaded cartridge.
-    /// Must be called after [`Bus::render_background`] (or use
-    /// [`Bus::render_frame`]).
+    /// Render sprite layer on top of existing framebuffer (CHR via cartridge).
     pub fn render_sprites(&mut self) {
         let ppu = &mut self.ppu;
         let mut cart = self.cartridge.as_mut();
@@ -278,11 +231,7 @@ impl Bus {
         });
     }
 
-    /// Render a full frame: background first, then sprites.
-    ///
-    /// This is the M9 entry point for producing a complete visible frame;
-    /// the video layer (M12) uploads the resulting framebuffer to an SDL2
-    /// texture each frame.
+    /// Render full frame: background then sprites.
     pub fn render_frame(&mut self) {
         let ppu = &mut self.ppu;
         let mut cart = self.cartridge.as_mut();
@@ -292,77 +241,42 @@ impl Bus {
         });
     }
 
-    /// Advance the PPU by `cycles` PPU cycles, returning `true` if an NMI
-    /// was requested during any of those cycles.
-    ///
-    /// The main loop (M12) calls this 3× per `Cpu::step` (the PPU runs at
-    /// 3× the CPU clock). When this returns `true`, the caller should set
-    /// `Cpu::nmi_pending = true` (or call [`Ppu::take_nmi_request`]
-    /// directly).
-    ///
-    /// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
+    /// Advance PPU by `cycles` PPU cycles; returns `true` if NMI requested. See: https://www.nesdev.org/wiki/PPU_rendering#Timing
     pub fn step_ppu(&mut self, cycles: u32) -> bool {
         let mut nmi = false;
+        let prerender = self.ppu.region().scanline_prerender();
+        let rendering = self.ppu.is_rendering();
+        let mut cart = self.cartridge.as_mut();
         for _ in 0..cycles {
-            // M25: use the cycle-accurate per-pixel render path. The CHR
-            // closure routes pattern-table fetches through the cartridge;
-            // the PPU's own VRAM and palette are read directly inside the
-            // renderer. When no cartridge is loaded, CHR reads return 0
-            // (blank pattern table).
-            let mut cart = self.cartridge.as_mut();
-            let mut chr_read = |addr: u16| match cart.as_mut() {
-                Some(c) => c.read_chr_latched(addr),
-                None => 0,
-            };
-            if self.ppu.step_rendered(&mut chr_read) {
+            if self.ppu.step_rendered(&mut cart) {
                 nmi = true;
             }
-            // Clock mapper IRQ counter (MMC3 and similar) on the
-            // approximate PPU A12 rising edge. A12 only rises during
-            // active rendering (background or sprites enabled) on visible
-            // scanlines (0-239) and the prerender scanline (261 NTSC /
-            // 311 PAL/Dendy — M32 region-aware).
             let ppu_cycle = self.ppu.cycle();
             let scanline = self.ppu.scanline();
-            let rendering = self.ppu.is_rendering();
-            let prerender = self.ppu.region().scanline_prerender();
             if rendering
                 && ppu_cycle == MMC3_IRQ_CLOCK_CYCLE
                 && (scanline < SCREEN_HEIGHT as u16 || scanline == prerender)
             {
-                if let Some(cart) = self.cartridge.as_mut() {
-                    cart.clock_irq();
+                if let Some(c) = cart.as_mut() {
+                    c.clock_irq();
                 }
             }
-
-            // Reset the mapper's per-frame scanline counter at the start
-            // of the prerender scanline (beginning of a new frame). Used
-            // by MMC5 to keep its scanline IRQ comparison correct.
             if scanline == prerender && ppu_cycle == 1 {
-                if let Some(cart) = self.cartridge.as_mut() {
-                    cart.reset_scanline_counter();
+                if let Some(c) = cart.as_mut() {
+                    c.reset_scanline_counter();
                 }
             }
         }
         nmi
     }
 
-    /// Consume and return the PPU's pending NMI request flag. The main
-    /// loop (M12) polls this after stepping the PPU and raises
-    /// `Cpu::nmi_pending` when it returns `true`.
+    /// Consume and return pending PPU NMI request flag.
     pub fn take_nmi_request(&mut self) -> bool {
         self.ppu.take_nmi_request()
     }
 
-    /// Read a byte from the CPU address space.
-    ///
-    /// Takes `&mut self` because some reads have side effects: PPU
-    /// register reads clear flags / increment pointers, and mapper
-    /// reads may trigger bank-switch side effects.
-    ///
-    /// Routing follows the standard NES CPU memory map; see the module docs
-    /// and <https://www.nesdev.org/wiki/CPU_memory_map>.
-    pub fn read(&mut self, addr: u16) -> u8 {
+    /// Read a byte from CPU address space (side-effectful: PPU/mapper reads).
+    #[inline] pub fn read(&mut self, addr: u16) -> u8 {
         match addr {
             // $0000-$1FFF: 2 KB RAM (mirrored 3 times).
             0x0000..=0x1FFF => self.ram[(addr & RAM_MASK) as usize],
@@ -412,7 +326,7 @@ impl Bus {
     }
 
     /// Write a byte to the CPU address space.
-    pub fn write(&mut self, addr: u16, value: u8) {
+    #[inline] pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & RAM_MASK) as usize] = value,
 
@@ -494,6 +408,11 @@ impl Bus {
 
     /// Write to the PPU register file.
     fn ppu_write(&mut self, reg: u16, value: u8) {
+        if let Some(logger) = &mut self.ppu_write_logger {
+            if logger.is_enabled() {
+                logger.log_write(reg, value, self.ppu.scanline(), self.ppu.cycle(), self.ppu.vram_addr(), None);
+            }
+        }
         if reg & 0x07 == 7 {
             self.ppu_write_ppudata(value);
             return;
@@ -501,14 +420,7 @@ impl Bus {
         self.ppu.write_register(reg, value);
     }
 
-    /// Read PPUDATA ($2007) with the buffered-read semantics and CHR routing.
-    ///
-    /// - Palette reads (`$3F00-$3FFF`) return immediately (no buffer).
-    /// - All other reads return the stale buffer; the freshly-fetched value
-    ///   is stored into the buffer for the next read.
-    /// - After the access, `v` advances by 1 or 32 (PPUCTRL bit 2).
-    ///
-    /// See: https://www.nesdev.org/wiki/PPU_registers#PPUDATA
+    /// Read PPUDATA ($2007) with buffered-read semantics and CHR routing. See: https://www.nesdev.org/wiki/PPU_registers#PPUDATA
     fn ppu_read_ppudata(&mut self) -> u8 {
         let addr = self.ppu.vram_addr();
 
@@ -534,6 +446,8 @@ impl Bus {
             };
             self.ppu.set_ppudata_buffer(buffered_fill);
             self.ppu.advance_vram_addr();
+            // The value placed on the CPU bus becomes the new PPU open bus.
+            self.ppu.set_open_bus(val);
             return val;
         }
 
@@ -551,6 +465,8 @@ impl Bus {
         };
         self.ppu.set_ppudata_buffer(raw);
         self.ppu.advance_vram_addr();
+        // The buffered value placed on the CPU bus becomes the new PPU open bus.
+        self.ppu.set_open_bus(buffered);
         buffered
     }
 
@@ -582,6 +498,11 @@ impl Bus {
     ///
     /// See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
     fn oam_dma(&mut self, page: u8) {
+        if let Some(logger) = &mut self.ppu_write_logger {
+            if logger.is_enabled() {
+                logger.log_oam_dma(page, self.ppu.scanline(), self.ppu.cycle(), self.ppu.vram_addr(), None);
+            }
+        }
         let base = (page as u16) << 8;
         // Collect the source bytes first to avoid borrowing self.read while
         // mutating self.ppu.
@@ -592,32 +513,28 @@ impl Bus {
         self.ppu.oam_dma(&data);
         // Latch the DMA page on the APU/IO open bus for $4014 reads.
         self.apu_open_bus[0x14] = page;
-        // Record the CPU stall cycles for the emulator loop to consume.
-        self.dma_stall_cycles = self.dma_stall_cycles.saturating_add(512);
+        // Any CPU bus write updates the shared open bus latch. Since the
+        // PPU open bus is used for PPU register read bits, writing $4014
+        // (which is outside PPU register space) still updates the PPU open
+        // bus on real hardware.
+        // See: https://www.nesdev.org/wiki/PPU_registers#PPU_open_bus
+        self.ppu.set_open_bus(page);
+        // OAM-DMA stalls the CPU for 512 cycles. If the write to $4014
+        // occurs on an odd CPU cycle, an extra cycle is added for
+        // alignment to the next even cycle (513 total).
+        // See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
+        let stall = if self.cpu_cycle_count & 1 != 0 { 513 } else { 512 };
+        self.dma_stall_cycles = self.dma_stall_cycles.saturating_add(stall);
     }
 
-    /// Consume and return pending OAM-DMA stall cycles (set by a write to
-    /// `$4014`). The emulator main loop calls this after each `Cpu::step`
-    /// and advances the PPU by 3× the returned value to model the CPU
-    /// being stalled for the DMA transfer.
+    /// Consume and return pending OAM-DMA stall cycles.
     pub fn take_dma_stall_cycles(&mut self) -> u32 {
         let c = self.dma_stall_cycles;
         self.dma_stall_cycles = 0;
         c
     }
 
-    /// Side-effect-free read of the CPU address space, intended for the
-    /// debug tools (M27 disassembler / memory viewer). Unlike [`Bus::read`],
-    /// this never triggers device side-effects: PPUSTATUS does not clear
-    /// VBlank, OAMDATA does not advance OAMADDR, PPUDATA does not advance
-    /// the VRAM address or refill the buffer, and mapper read-side-effects
-    /// (e.g. MMC2 CHR-bank latching) do not fire.
-    ///
-    /// For RAM and cartridge PRG/PRG-RAM (the regions actually disassembled
-    /// in practice) the returned value matches [`Bus::read`]. For PPU / APU
-    /// / I/O register space the returned value is a best-effort snapshot
-    /// (open-bus latch or 0) — disassembling code from `$2000+` is
-    /// meaningless anyway, but the function must not crash or mutate state.
+    /// Side-effect-free read for debug tools (disassembler/memory viewer).
     pub fn peek(&self, addr: u16) -> u8 {
         match addr {
             // RAM + mirrors: pure read, no side-effects.
@@ -674,6 +591,35 @@ impl Bus {
         self.dma_stall_cycles
     }
 
+    /// Advance the total CPU cycle counter. Called by the emulator loop
+    /// after each instruction (and DMA stall) to keep the even/odd parity
+    /// tracking accurate for OAM-DMA alignment.
+    pub fn advance_cpu_cycles(&mut self, cycles: u32) {
+        self.cpu_cycle_count = self.cpu_cycle_count.wrapping_add(cycles as u64);
+    }
+
+    /// Current total CPU cycle count (for save state serialisation).
+    pub fn cpu_cycle_count(&self) -> u64 {
+        self.cpu_cycle_count
+    }
+
+    /// Set the total CPU cycle count (for save state restoration).
+    pub fn set_cpu_cycle_count(&mut self, count: u64) {
+        self.cpu_cycle_count = count;
+    }
+
+    /// Install a PPU write logger on the bus. When the logger is enabled,
+    /// every PPU register write and OAM DMA is logged with the PPU
+    /// scanline/cycle for timing-race analysis.
+    pub fn set_ppu_write_logger(&mut self, logger: PpuWriteLogger) {
+        self.ppu_write_logger = Some(logger);
+    }
+
+    /// Mutably borrow the PPU write logger, if installed.
+    pub fn ppu_write_logger_mut(&mut self) -> Option<&mut PpuWriteLogger> {
+        self.ppu_write_logger.as_mut()
+    }
+
     /// Read from the APU / I/O register file (open-bus latch until M14/M16).
     ///
     /// `offset` is `addr - 0x4000`, in `0..=0x17`.
@@ -717,25 +663,13 @@ impl Bus {
             .write_register((offset - 0x10) as u8, value);
     }
 
-    /// Read the `$4015` APU status register. Bits 0-4 come from the APU
-    /// (channel length/bytes-remaining status); bit 5 comes from the
-    /// open-bus latch (unused); bits 6,7 are the frame counter and DMC
-    /// IRQ flags from the APU. Reading `$4015` clears both IRQ flags
-    /// (side effect of `Apu::read_status`).
+    /// Read `$4015` APU status (channel bits + IRQ flags; clears IRQs).
     fn apu_status_read(&mut self) -> u8 {
         let status = self.apu.read_status();
         (status & 0xDF) | (self.apu_open_bus[0x15] & 0x20)
     }
 
-    /// Read a controller register (`$4016` for controller 1, `$4017` for
-    /// controller 2). Bit 0 is the next button bit from the joypad shift
-    /// register; bits 1-7 come from the open-bus latch (the last value
-    /// written to the register), matching the behavior of a retail NES
-    /// without expansion-port peripherals.
-    ///
-    /// `latch_offset` is the open-bus index (`0x16` or `0x17`).
-    ///
-    /// See: https://www.nesdev.org/wiki/Controller_port#Reading
+    /// Read controller register (`$4016`/`$4017`): bit 0 from joypad, bits 1-7 open-bus. See: https://www.nesdev.org/wiki/Controller_port#Reading
     fn joypad_read(&mut self, controller: usize, latch_offset: u16) -> u8 {
         let button_bit = self.joypad.read(controller) & 1;
         let open_bus = self.apu_open_bus[latch_offset as usize];
@@ -748,9 +682,7 @@ impl Bus {
         self.apu_open_bus[offset as usize] = value;
     }
 
-    /// Read from cartridge space (`$4020-$FFFF`). Uses `read_prg_mut`
-    /// so that mappers with read side-effects (e.g. FDS disk-data read
-    /// at `$4031` advancing the read pointer) fire correctly.
+    /// Read from cartridge space (`$4020-$FFFF`, via `read_prg_mut` for side-effects).
     fn cart_read(&mut self, addr: u16) -> u8 {
         match &mut self.cartridge {
             Some(cart) => cart.read_prg_mut(addr),
@@ -758,11 +690,7 @@ impl Bus {
         }
     }
 
-    /// Write to cartridge space (`$4020-$FFFF`).
-    ///
-    /// After the write, the PPU's nametable mirroring is re-synced from the
-    /// cartridge — mappers like MMC1 can change mirroring at runtime via
-    /// register writes, and the PPU must reflect the new mode immediately.
+    /// Write to cartridge space; re-syncs PPU mirroring from cartridge.
     fn cart_write(&mut self, addr: u16, value: u8) {
         if let Some(cart) = self.cartridge.as_mut() {
             cart.write_prg(addr, value);
@@ -1016,17 +944,69 @@ mod tests {
         assert_eq!(bus.read(0x0000), 0x00);
     }
 
-    // ---- Sanity: header parsing still wires Mirroring through the bus ---
+    // ---- M-BUS-06: OAMDMA open bus + alignment -------------------------
+
     #[test]
-    fn bus_exposes_cartridge_mirror_mode() {
-        // Confirms the bus surfaces cartridge metadata (used by PPU in M7+).
-        let cart = make_test_cartridge(0x00);
-        let bus = Bus::with_cartridge(cart);
-        let m = bus.cartridge().expect("cart present").header.mirroring;
-        assert_eq!(m, Mirroring::Horizontal);
-        // InesHeader fields are also reachable.
-        assert_eq!(bus.cartridge().unwrap().header.mapper_number, 0);
-        // Reference InesHeader to ensure the type is part of the public API.
-        let _: &InesHeader = &bus.cartridge().unwrap().header;
+    fn oam_dma_updates_ppu_open_bus() {
+        let mut bus = Bus::new();
+        // Write 0x12 to PPUCTRL to set the PPU open bus to 0x12.
+        bus.write(0x2000, 0x12);
+        assert_eq!(bus.read(0x2000), 0x12);
+        // Write to OAMDMA ($4014) with page 0x42.
+        bus.write(0x4014, 0x42);
+        // The PPU open bus should now be 0x42 (the DMA page value).
+        // Reading a write-only PPU register should return 0x42.
+        assert_eq!(bus.read(0x2000), 0x42);
+    }
+
+    #[test]
+    fn oam_dma_stall_512_on_even_cycle() {
+        let mut bus = Bus::new();
+        // cpu_cycle_count starts at 0 (even).
+        assert_eq!(bus.cpu_cycle_count() & 1, 0);
+        bus.write(0x4014, 0x00);
+        // Even cycle → 512 stall cycles.
+        assert_eq!(bus.take_dma_stall_cycles(), 512);
+    }
+
+    #[test]
+    fn oam_dma_stall_513_on_odd_cycle() {
+        let mut bus = Bus::new();
+        // Advance 3 cycles → odd parity.
+        bus.advance_cpu_cycles(3);
+        assert_eq!(bus.cpu_cycle_count() & 1, 1);
+        bus.write(0x4014, 0x00);
+        // Odd cycle → 513 stall cycles (512 + 1 alignment).
+        assert_eq!(bus.take_dma_stall_cycles(), 513);
+    }
+
+    #[test]
+    fn oam_dma_stall_alignment_alternates() {
+        let mut bus = Bus::new();
+        // First DMA: even (0 cycles) → 512
+        bus.write(0x4014, 0x00);
+        let s1 = bus.take_dma_stall_cycles();
+        assert_eq!(s1, 512);
+        // Advance by the stall cycles (even) → still even.
+        bus.advance_cpu_cycles(s1);
+        // Second DMA: still even → 512
+        bus.write(0x4014, 0x00);
+        let s2 = bus.take_dma_stall_cycles();
+        assert_eq!(s2, 512);
+        // Now advance by an odd amount.
+        bus.advance_cpu_cycles(3);
+        // Third DMA: odd → 513
+        bus.write(0x4014, 0x00);
+        let s3 = bus.take_dma_stall_cycles();
+        assert_eq!(s3, 513);
+    }
+
+    #[test]
+    fn cpu_cycle_count_round_trips() {
+        let mut bus = Bus::new();
+        bus.advance_cpu_cycles(12345);
+        assert_eq!(bus.cpu_cycle_count(), 12345);
+        bus.set_cpu_cycle_count(999);
+        assert_eq!(bus.cpu_cycle_count(), 999);
     }
 }

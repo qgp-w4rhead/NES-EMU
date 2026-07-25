@@ -704,8 +704,8 @@ fn sta_abs_x_dummy_read_increments_oamaddr() {
 fn nmi_takes_priority_over_irq() {
     let mut bus = bus_with_vectors(&[0xEA], 0x0300, PC0, 0x0400);
     let mut cpu = cpu_at_pc0();
-    cpu.nmi_pending = true;
-    cpu.irq_pending = true;
+    cpu.set_nmi_pending(true);
+    cpu.set_irq_pending(true);
     cpu.set_interrupt_disable(false);
 
     let cycles = cpu.step(&mut bus);
@@ -713,9 +713,9 @@ fn nmi_takes_priority_over_irq() {
     // NMI should be serviced: PC loaded from NMI vector ($0300).
     assert_eq!(cpu.pc, 0x0300, "NMI should take priority over IRQ");
     assert_eq!(cycles, 7);
-    assert!(!cpu.nmi_pending, "NMI flag should be cleared");
+    assert!(!cpu.nmi_pending(), "NMI flag should be cleared");
     // IRQ flag stays set (NMI doesn't clear it).
-    assert!(cpu.irq_pending, "IRQ flag should remain set");
+    assert!(cpu.irq_pending(), "IRQ flag should remain set");
     // I flag should be set by NMI service.
     assert!(cpu.interrupt_disable(), "I flag set by NMI service");
 }
@@ -725,14 +725,14 @@ fn nmi_takes_priority_over_irq() {
 fn irq_serviced_when_i_flag_clear() {
     let mut bus = bus_with_vectors(&[0xEA], 0x0000, PC0, 0x0400);
     let mut cpu = cpu_at_pc0();
-    cpu.irq_pending = true;
+    cpu.set_irq_pending(true);
     cpu.set_interrupt_disable(false);
 
     let cycles = cpu.step(&mut bus);
 
     assert_eq!(cpu.pc, 0x0400, "IRQ should be serviced");
     assert_eq!(cycles, 7);
-    assert!(!cpu.irq_pending);
+    assert!(!cpu.irq_pending());
 }
 
 /// IRQ is NOT serviced when I flag is set — the NOP executes instead.
@@ -740,7 +740,7 @@ fn irq_serviced_when_i_flag_clear() {
 fn irq_not_serviced_when_i_flag_set() {
     let mut bus = bus_with_vectors(&[0xEA], 0x0000, PC0, 0x0400);
     let mut cpu = cpu_at_pc0();
-    cpu.irq_pending = true;
+    cpu.set_irq_pending(true);
     cpu.set_interrupt_disable(true); // I flag set → IRQ masked
 
     let cycles = cpu.step(&mut bus);
@@ -748,7 +748,7 @@ fn irq_not_serviced_when_i_flag_set() {
     // NOP executes, IRQ not serviced.
     assert_eq!(cycles, 2, "NOP should execute, not IRQ");
     assert_eq!(cpu.pc, PC0 + 1, "PC should advance past NOP");
-    assert!(cpu.irq_pending, "IRQ flag should remain set");
+    assert!(cpu.irq_pending(), "IRQ flag should remain set");
 }
 
 /// NMI is serviced even when I flag is set (non-maskable).
@@ -756,7 +756,7 @@ fn irq_not_serviced_when_i_flag_set() {
 fn nmi_serviced_even_when_i_flag_set() {
     let mut bus = bus_with_vectors(&[0xEA], 0x0300, PC0, 0x0000);
     let mut cpu = cpu_at_pc0();
-    cpu.nmi_pending = true;
+    cpu.set_nmi_pending(true);
     cpu.set_interrupt_disable(true); // I flag set
 
     let cycles = cpu.step(&mut bus);
@@ -776,7 +776,7 @@ fn nmi_serviced_even_when_i_flag_set() {
 fn nmi_pending_before_brk_services_nmi_not_brk() {
     let mut bus = bus_with_vectors(&[0x00, 0x00], 0x0300, PC0, 0x0400);
     let mut cpu = cpu_at_pc0();
-    cpu.nmi_pending = true;
+    cpu.set_nmi_pending(true);
     let sp_before = cpu.sp;
 
     let cycles = cpu.step(&mut bus);
@@ -809,7 +809,7 @@ fn nmi_pending_before_brk_services_nmi_not_brk() {
 fn brk_without_nmi_uses_brk_vector_and_sets_b() {
     let mut bus = bus_with_vectors(&[0x00, 0x00], 0x0300, PC0, 0x0400);
     let mut cpu = cpu_at_pc0();
-    cpu.nmi_pending = false;
+    cpu.set_nmi_pending(false);
     let sp_before = cpu.sp;
 
     let cycles = cpu.step(&mut bus);
@@ -843,9 +843,9 @@ fn servicing_nmi_clears_nmi_pending_flag() {
     bus.write(0xFFFA, 0x00);
     bus.write(0xFFFB, 0x03);
     let mut cpu = cpu_at_pc0();
-    cpu.nmi_pending = true;
+    cpu.set_nmi_pending(true);
     let _ = cpu.step(&mut bus);
-    assert!(!cpu.nmi_pending);
+    assert!(!cpu.nmi_pending());
 }
 
 /// Servicing IRQ clears the irq_pending flag.
@@ -855,10 +855,10 @@ fn servicing_irq_clears_irq_pending_flag() {
     bus.write(0xFFFE, 0x00);
     bus.write(0xFFFF, 0x04);
     let mut cpu = cpu_at_pc0();
-    cpu.irq_pending = true;
+    cpu.set_irq_pending(true);
     cpu.set_interrupt_disable(false);
     let _ = cpu.step(&mut bus);
-    assert!(!cpu.irq_pending);
+    assert!(!cpu.irq_pending());
 }
 
 /// IRQ flag stays set when I flag is set (not serviced).
@@ -866,10 +866,10 @@ fn servicing_irq_clears_irq_pending_flag() {
 fn irq_flag_stays_set_when_masked() {
     let mut bus = bus_with_prog(&[0xEA]);
     let mut cpu = cpu_at_pc0();
-    cpu.irq_pending = true;
+    cpu.set_irq_pending(true);
     cpu.set_interrupt_disable(true);
     let _ = cpu.step(&mut bus);
-    assert!(cpu.irq_pending, "IRQ flag should stay set when masked");
+    assert!(cpu.irq_pending(), "IRQ flag should stay set when masked");
 }
 
 // ===========================================================================

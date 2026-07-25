@@ -366,8 +366,8 @@ fn fds_expansion_audio_silent_without_frequency() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn fds_save_state_version_is_six() {
-    assert_eq!(SAVE_STATE_VERSION, 6);
+fn fds_save_state_version_is_eight() {
+    assert_eq!(SAVE_STATE_VERSION, 8);
 }
 
 #[test]

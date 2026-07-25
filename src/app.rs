@@ -1,12 +1,4 @@
-//! Application-level helpers for the main loop (M34).
-//!
-//! This module factors the "load a ROM and build an `EmulatorState`"
-//! sequence out of `main.rs` so that the same code path serves the
-//! initial `--rom` load and drag-and-drop / recent-list reloads. It also
-//! builds the [`RomInfo`] snapshot used by the ROM-info OSD overlay.
-//!
-//! The module lives in the library (not `main.rs`) so that integration
-//! tests can exercise the load path without spawning SDL2.
+//! Application-level helpers — ROM loading and `EmulatorState` construction.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +61,12 @@ pub fn load_rom(rom_path: &Path, config: &Config) -> Result<LoadedRom, String> {
         .bus_mut()
         .apu_mut()
         .apply_channel_volumes(&config.audio_channels.as_array());
+
+    // Apply debug rendering settings from config.
+    if config.debug.slant_corruption {
+        eprintln!("nes-emu: debug slant_corruption enabled — rendering with fine-X scroll bug");
+        emulator.bus_mut().ppu_mut().set_slant_corruption(true);
+    }
 
     // Build the ROM-info snapshot for the OSD overlay.
     let header = emulator.bus().cartridge().map(|c| &c.header).cloned();

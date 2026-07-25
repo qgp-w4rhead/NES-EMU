@@ -1,19 +1,6 @@
 //! 6502 disassembler — static opcode table + instruction formatting.
 //!
-//! The disassembler is a static 256-entry opcode table mapping each
-//! opcode byte to its mnemonic, addressing mode, and byte length. All
-//! 151 official opcodes are covered; the 105 unofficial / undefined
-//! opcodes decode as `???` (1 byte) so the disassembler never panics on
-//! arbitrary byte streams.
-//!
-//! All reads go through [`crate::bus::Bus::peek`] (side-effect-free), so
-//! disassembling never perturbs emulator state — PPUSTATUS is not cleared,
-//! OAMDATA does not advance OAMADDR, PPUDATA does not advance the VRAM
-//! address, and mapper read-side-effects do not fire.
-//!
-//! See: https://www.nesdev.org/6502.txt — opcode table.
-//! See: https://www.nesdev.org/wiki/CPU_addressing_modes — operand
-//! formatting conventions.
+//! Uses side-effect-free `Bus::peek`; unofficial opcodes decode as `???`.
 
 use crate::bus::Bus;
 use crate::cpu::AddrMode;

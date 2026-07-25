@@ -1,37 +1,6 @@
-//! Picture Processing Unit (PPU) — register interface and memory.
-//!
-//! This module implements the PPU register file (`$2000-`$2007` + `$4014
-//! OAMDMA), internal VRAM (nametables), OAM (sprite RAM), and palette
-//! memory. The rendering pipeline (background/sprite pixel generation,
-//! scanline timing) is added in M8-M11; M7 covers only the register
-//! interface and memory access semantics.
-//!
-//! # PPU address space
-//!
-//! | Range           | Device                                     |
-//! |-----------------|--------------------------------------------|
-//! | `$0000-$0FFF`   | Pattern table 0 (CHR, via cartridge)       |
-//! | `$1000-$1FFF`   | Pattern table 1 (CHR, via cartridge)       |
-//! | `$2000-$2FFF`   | Nametables (4 × 1 KB, mirrored)            |
-//! | `$3000-$3EFF`   | Mirror of `$2000-$2EFF`                    |
-//! | `$3F00-$3FFF`   | Palette RAM (25 unique bytes, rest mirrored)|
+//! Picture Processing Unit (PPU) — registers, VRAM, OAM, palette, and rendering.
 //!
 //! See: https://www.nesdev.org/wiki/PPU_registers
-//! See: https://www.nesdev.org/wiki/PPU_memory_map
-//!
-//! # Register summary
-//!
-//! | Addr    | Name      | R/W | Notes                                         |
-//! |---------|-----------|-----|-----------------------------------------------|
-//! | `$2000` | PPUCTRL   | W   | NMI enable, increment, pattern tables, etc.  |
-//! | `$2001` | PPUMASK   | W   | Rendering enable, color emphasis.            |
-//! | `$2002` | PPUSTATUS | R   | VBlank / sprite 0 hit / overflow; clears VBlank on read. |
-//! | `$2003` | OAMADDR   | W   | OAM address pointer.                         |
-//! | `$2004` | OAMDATA   | RW  | Read/write OAM at OAMADDR; increments.       |
-//! | `$2005` | PPUSCROLL | W   | Two writes: X then Y (shared `w` latch).     |
-//! | `$2006` | PPUADDR   | W   | Two writes: hi then lo (shared `w` latch).   |
-//! | `$2007` | PPUDATA   | RW  | VRAM/palette access; buffered read; auto-increment. |
-//! | `$4014` | OAMDMA    | W   | 256-byte DMA from CPU page to OAM.           |
 
 #![allow(dead_code)]
 
@@ -40,6 +9,12 @@ pub mod render;
 use crate::mappers::Mirroring;
 use crate::region::Region;
 
+/// Trait for CHR pattern-table reads during rendering.
+/// Implemented by the bus to route reads through the cartridge.
+pub trait ChrReader {
+    fn read_chr(&mut self, addr: u16) -> u8;
+}
+
 /// Visible screen width in pixels.
 pub const SCREEN_WIDTH: usize = 256;
 /// Visible screen height in pixels (240 scanlines).
@@ -47,8 +22,10 @@ pub const SCREEN_HEIGHT: usize = 240;
 /// Total framebuffer pixel count.
 pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
 
-/// Size of nametable VRAM (4 KB — enough for 4-screen mirroring; H/V use 2 KB).
-const VRAM_SIZE: usize = 0x1000;
+/// VRAM size for 4-screen mirroring (4 KB).
+const VRAM_SIZE_4K: usize = 0x1000;
+/// VRAM size for horizontal/vertical/single-screen mirroring (2 KB).
+const VRAM_SIZE_2K: usize = 0x800;
 
 /// Size of OAM (64 sprites × 4 bytes = 256 bytes).
 const OAM_SIZE: usize = 256;
@@ -141,15 +118,19 @@ const NT_V_BIT: u16 = 0b0000_1000_0000_0000;
 /// state (the framebuffer is skipped during serialization — it is derived
 /// data, recomputed on the next render). Re-allocates it to the full
 /// `256×240` size so the render path can index into it without panicking.
-fn default_framebuffer() -> Vec<u32> {
-    vec![0u32; FRAMEBUFFER_SIZE]
+fn default_framebuffer() -> Box<[u32]> {
+    vec![0u32; FRAMEBUFFER_SIZE].into_boxed_slice()
+}
+
+/// Default VRAM for serde deserialization (2 KB — resized later if needed).
+fn default_vram() -> Box<[u8]> {
+    vec![0u8; VRAM_SIZE_2K].into_boxed_slice()
 }
 
 /// Default value for the `bg_pattern` field when deserializing a save
-/// state (skipped during serialization — derived data). Re-allocates it to
-/// the full `256×240` size so the sprite render path can index into it.
-fn default_bg_pattern() -> Vec<u8> {
-    vec![0u8; FRAMEBUFFER_SIZE]
+/// state (skipped during serialization — derived data).
+fn default_bg_pattern() -> [u8; SCREEN_WIDTH] {
+    [0u8; SCREEN_WIDTH]
 }
 
 /// The Picture Processing Unit.
@@ -168,35 +149,26 @@ pub struct Ppu {
     ppustatus: u8,
 
     // ---- VRAM address registers (used by PPUSCROLL / PPUADDR / PPUDATA) ----
-    /// Current VRAM address (15-bit, effectively 14-bit since bit 14 is
-    /// masked off by the address bus). Used by PPUDATA reads/writes.
+    /// Current VRAM address (14-bit effective). Used by PPUDATA.
     v: u16,
-    /// Temporary VRAM address (15-bit). Loaded by PPUSCROLL and PPUADDR
-    /// writes; copied to `v` on the second PPUADDR write and during
-    /// rendering (M8+).
+    /// Temporary VRAM address, loaded by PPUSCROLL/PPUADDR, copied to `v`.
     t: u16,
     /// Fine X scroll (3 bits), set by the first PPUSCROLL write.
     fine_x: u8,
-    /// Shared write latch for PPUSCROLL and PPUADDR (false = first write,
-    /// true = second write). Cleared by PPUSTATUS read and at VBlank start.
+    /// Shared write latch for PPUSCROLL/PPUADDR (false = first write).
     w: bool,
 
     // ---- PPUDATA buffered read ----
-    /// Buffered data for PPUDATA reads. The first read from a non-palette
-    /// address returns this stale value; the real data is loaded into the
-    /// buffer for the *next* read. Palette reads bypass the buffer.
+    /// Buffered data for PPUDATA reads (palette reads bypass buffer).
     ppudata_buffer: u8,
 
-    /// Open-bus latch: the last byte written to any PPU register. Reads of
-    /// write-only registers return this; PPUSTATUS returns its low 5 bits
-    /// alongside the status flags.
+    /// Open-bus latch: last byte written to any PPU register.
     open_bus: u8,
 
     // ---- memory ----
-    /// Nametable VRAM (4 KB). For horizontal/vertical mirroring only 2 KB
-    /// is meaningful; the mapping is computed by [`Ppu::map_nametable`].
-    #[serde(with = "crate::save_state::array_ser")]
-    vram: [u8; VRAM_SIZE],
+    /// Nametable VRAM (2 KB or 4 KB depending on mirroring).
+    #[serde(default = "default_vram")]
+    vram: Box<[u8]>,
     /// Object Attribute Memory — 64 sprites × 4 bytes.
     #[serde(with = "crate::save_state::array_ser")]
     oam: [u8; OAM_SIZE],
@@ -204,48 +176,27 @@ pub struct Ppu {
     palette: [u8; PALETTE_SIZE],
 
     // ---- framebuffer (M8: background rendering) ----
-    /// Output framebuffer: 256×240 ARGB pixels (0xAARRGGBB). Heap-allocated
-    /// (240 KB) so the `Ppu` struct stays small enough to construct on the
-    /// stack in tests. Written by the background (and, later, sprite)
-    /// rendering pipeline; the video layer (M12) uploads it to an SDL2
-    /// texture each frame. Allocated once at construction — no allocation
-    /// in the render path.
-    ///
-    /// Skipped during serialization: it is derived data, recomputed on the
-    /// next `render_frame` call after a state restore.
+    /// Output framebuffer (256×240 ARGB). Skipped during serialization.
     #[serde(skip, default = "default_framebuffer")]
-    framebuffer: Vec<u32>,
+    framebuffer: Box<[u32]>,
 
     // ---- background pattern buffer (M9: sprite priority) ----
-    /// Per-pixel background pattern value (0-3) from the most recent
-    /// background render. Used by [`Ppu::render_sprites`] to resolve
-    /// sprite priority: a "behind background" sprite only shows where
-    /// the background is transparent (pattern 0). Heap-allocated
-    /// (61 KB), filled by [`Ppu::render_background`].
-    ///
-    /// Skipped during serialization: it is derived data, recomputed on the
-    /// next `render_frame` call after a state restore.
+    /// Per-pixel bg pattern (0-3) for current scanline (sprite priority).
     #[serde(skip, default = "default_bg_pattern")]
-    bg_pattern: Vec<u8>,
+    bg_pattern: [u8; SCREEN_WIDTH],
 
     // ---- scanline / cycle timing (M10) ----
     /// Current scanline within the frame (0..=261; 261 = prerender).
     scanline: u16,
     /// Current PPU cycle within the scanline (0..=340).
     cycle: u16,
-    /// Set when VBlank begins and PPUCTRL bit 7 (NMI enable) is set.
-    /// The bus / emulator polls this via [`Ppu::take_nmi_request`] to
-    /// raise `Cpu::nmi_pending`. Latched (not auto-cleared) so a slow
-    /// consumer can't miss it — `take_nmi_request` clears it.
+    /// Latched NMI request (cleared by `take_nmi_request`).
     nmi_request: bool,
 
     // ---- configuration ----
     /// Nametable mirroring mode, set from the cartridge by the bus.
     mirroring: Mirroring,
-    /// TV system / region (M32). Controls scanline count, prerender
-    /// scanline, and palette selection (NTSC vs PAL). Defaults to NTSC.
-    /// Set via [`Ppu::set_region`] when the emulator resolves the region
-    /// from the iNES header hint or user config.
+    /// TV system / region (scanline count, prerender, palette).
     #[serde(default)]
     region: Region,
 
@@ -256,99 +207,18 @@ pub struct Ppu {
     // which the bus calls in place of [`Ppu::step`] so that CHR pattern
     // fetches can be routed through the cartridge.
     //
-    // All of the following fields are transient pipeline state — they are
-    // recomputed every scanline and are not part of the architectural PPU
-    // state. They are skipped during save-state serialization and default
-    // to zero on restore; the pipeline refills on the next visible scanline.
+    // All pipeline state is transient — recomputed every scanline and not
+    // part of the architectural PPU state. Skipped during save-state
+    // serialization; the pipeline refills on the next visible scanline.
     #[serde(skip)]
-    /// Latched nametable byte from the current background tile fetch.
-    fetch_nt: u8,
-    #[serde(skip)]
-    /// Latched attribute byte from the current background tile fetch.
-    fetch_at: u8,
-    #[serde(skip)]
-    /// Latched pattern-table plane-0 byte from the current tile fetch.
-    fetch_pt0: u8,
-    #[serde(skip)]
-    /// Latched pattern-table plane-1 byte from the current tile fetch.
-    fetch_pt1: u8,
-
-    #[serde(skip)]
-    /// Per-scanline vertical position snapshot (taken at the first pixel
-    /// cycle of each visible scanline from `v`): coarse Y (bits 5-9).
-    render_coarse_y: u16,
-    #[serde(skip)]
-    /// Per-scanline vertical position snapshot: fine Y (bits 12-14).
-    render_fine_y: u16,
-    #[serde(skip)]
-    /// Per-scanline vertical position snapshot: vertical nametable bit
-    /// (`NT_V_BIT` or 0).
-    render_nt_v: u16,
-
-    #[serde(skip)]
-    /// Horizontal render position snapshot — coarse X at the last
-    /// snapshot/re-sync point (scanline start or mid-scanline `v` write).
-    render_coarse_x_start: u16,
-    #[serde(skip)]
-    /// Horizontal render position snapshot — horizontal nametable bit
-    /// (`NT_H_BIT` or 0) at the last snapshot/re-sync point.
-    render_nt_h_start: u16,
-    #[serde(skip)]
-    /// Horizontal render position snapshot — fine X (0-7) at the last
-    /// snapshot/re-sync point. This is the per-pixel fine X offset within
-    /// the first tile of the snapshot.
-    render_fine_x_start: u8,
-    #[serde(skip)]
-    /// The pixel X (0-255) at which the last snapshot/re-sync happened.
-    /// The render position for pixel `px` is derived as
-    /// `snapshot + (px - render_resync_px)`.
-    render_resync_px: u16,
-    #[serde(skip)]
-    /// Whether the per-scanline render snapshot has been taken for the
-    /// current scanline. Reset at cycle 0; set at the first pixel output.
-    scanline_render_initialized: bool,
-
-    #[serde(skip)]
-    /// Set by [`Ppu::write_ppuaddr`] on the second write (which copies `t`
-    /// into `v`) and by [`Ppu::write_ppuscroll`] (which changes `t`/`fine_x`).
-    /// The per-pixel renderer checks this and re-syncs its horizontal output
-    /// position from `v` so that mid-scanline raster effects take effect at
-    /// the correct pixel.
-    render_v_dirty: bool,
-
-    #[serde(skip)]
-    /// Whether the per-pixel renderer produced any output during the current
-    /// frame. Reset at the prerender scanline; used by the emulator to decide
-    /// whether the framebuffer is already filled (cycle-accurate path) or
-    /// needs a fallback whole-frame render.
-    rendered_this_frame: bool,
-
-    #[serde(skip)]
-    /// Sprite evaluation result for the current scanline: up to 8 selected
-    /// sprites as `(oam_index, y, tile, attr, x)`.
-    scanline_sprites: [(usize, u8, u8, u8, u8); MAX_SPRITES_PER_SCANLINE],
-    #[serde(skip)]
-    /// Number of valid entries in [`Ppu::scanline_sprites`].
-    scanline_sprite_count: usize,
-    #[serde(skip)]
-    /// Whether sprite overflow was detected for the current scanline.
-    scanline_overflow: bool,
-    #[serde(skip)]
-    /// Whether sprite 0 hit has been set during the current frame (latched
-    /// to avoid re-triggering after the first hit).
-    scanline_sprite_zero_hit: bool,
+    render: crate::ppu::render::RenderPipeline,
 }
 
 /// Maximum number of sprites rendered on a single scanline (hardware limit).
 const MAX_SPRITES_PER_SCANLINE: usize = 8;
 
 impl Ppu {
-    /// Construct a PPU in power-on state: all registers zeroed, VRAM/OAM/
-    /// palette uninitialised (zeroed), horizontal mirroring by default.
-    ///
-    /// On real hardware VRAM and palette contents are random at power-on;
-    /// we zero them for determinism (the tech-stack mandates deterministic
-    /// emulation).
+    /// Construct a PPU in power-on state (zeroed, horizontal mirroring).
     pub fn new() -> Self {
         Self {
             ppuctrl: 0,
@@ -361,39 +231,51 @@ impl Ppu {
             w: false,
             ppudata_buffer: 0,
             open_bus: 0,
-            vram: [0u8; VRAM_SIZE],
+            vram: vec![0u8; VRAM_SIZE_2K].into_boxed_slice(),
             oam: [0u8; OAM_SIZE],
             palette: [0u8; PALETTE_SIZE],
-            framebuffer: vec![0u32; FRAMEBUFFER_SIZE],
-            bg_pattern: vec![0u8; FRAMEBUFFER_SIZE],
+            framebuffer: vec![0u32; FRAMEBUFFER_SIZE].into_boxed_slice(),
+            bg_pattern: [0u8; SCREEN_WIDTH],
             scanline: 0,
             cycle: 0,
             nmi_request: false,
             mirroring: Mirroring::Horizontal,
             region: Region::default(),
-            fetch_nt: 0,
-            fetch_at: 0,
-            fetch_pt0: 0,
-            fetch_pt1: 0,
-            render_coarse_y: 0,
-            render_fine_y: 0,
-            render_nt_v: 0,
-            render_coarse_x_start: 0,
-            render_nt_h_start: 0,
-            render_fine_x_start: 0,
-            render_resync_px: 0,
-            scanline_render_initialized: false,
-            render_v_dirty: false,
-            rendered_this_frame: false,
-            scanline_sprites: [(0, 0, 0, 0, 0); MAX_SPRITES_PER_SCANLINE],
-            scanline_sprite_count: 0,
-            scanline_overflow: false,
-            scanline_sprite_zero_hit: false,
+            render: crate::ppu::render::RenderPipeline::default(),
         }
     }
 
-    /// Set the nametable mirroring mode (from the cartridge, via the bus).
+    /// Enable/disable the fine-X scroll corruption bug (debug only).
+    pub fn set_slant_corruption(&mut self, enabled: bool) {
+        self.render.slant_corruption = enabled;
+    }
+
+    /// Enable/disable the inaccurate NES palette (debug only). When enabled,
+    /// the old incorrect RGB values are used, reproducing the yellow-pipes
+    /// color bug seen in Mario Bros.
+    pub fn set_inaccurate_palette(&mut self, enabled: bool) {
+        self.render.use_inaccurate_palette = enabled;
+    }
+
+    /// Enable/disable the NMI retrigger bug (debug only). When enabled,
+    /// every PPUCTRL write with bit 7 set during VBlank triggers an NMI
+    /// (the old buggy behavior), instead of only the rising edge 0→1.
+    pub fn set_nmi_retrigger(&mut self, enabled: bool) {
+        self.render.nmi_retrigger = enabled;
+    }
+
+    /// Set mirroring mode; resizes VRAM if needed (4 KB for four-screen).
     pub fn set_mirroring(&mut self, mirroring: Mirroring) {
+        let needed = match mirroring {
+            Mirroring::FourScreen => VRAM_SIZE_4K,
+            _ => VRAM_SIZE_2K,
+        };
+        if self.vram.len() != needed {
+            let mut new_vram = vec![0u8; needed];
+            let copy_len = self.vram.len().min(needed);
+            new_vram[..copy_len].copy_from_slice(&self.vram[..copy_len]);
+            self.vram = new_vram.into_boxed_slice();
+        }
         self.mirroring = mirroring;
     }
 
@@ -403,12 +285,7 @@ impl Ppu {
         self.region
     }
 
-    /// Set the TV system / region (M32). Updates the scanline count and
-    /// prerender scanline used by [`Ppu::step`]. The palette is selected
-    /// at render time via [`crate::ppu::render::nes_color_to_argb_for`].
-    /// If the new region has fewer scanlines than the current scanline
-    /// position (e.g. switching PAL→NTSC while past scanline 261), the
-    /// scanline is clamped into range to avoid a missed frame-boundary.
+    /// Set TV system / region (updates scanline count and prerender).
     pub fn set_region(&mut self, region: Region) {
         self.region = region;
         // Clamp scanline into the new region's range so the stepper
@@ -423,16 +300,7 @@ impl Ppu {
     //  Register reads / writes (called by Bus::ppu_read / ppu_write)
     // =================================================================
 
-    /// Read a PPU register by de-mirrored index (`0..=7` = `$2000..=$2007`).
-    ///
-    /// Write-only registers (PPUCTRL, PPUMASK, OAMADDR, PPUSCROLL, PPUADDR)
-    /// return the open-bus latch. PPUSTATUS returns the status flags with
-    /// open-bus low bits and has read side-effects (clears VBlank, resets
-    /// `w`). OAMDATA returns OAM at the current OAMADDR and increments it.
-    /// PPUDATA (index 7) is handled by the bus (it needs CHR routing) —
-    /// calling this method for index 7 returns the buffered value without
-    /// advancing the address; the bus should use [`Ppu::read_ppudata_step`]
-    /// instead.
+    /// Read PPU register by index (0..=7). Index 7 returns buffered value only.
     pub fn read_register(&mut self, reg: u16) -> u8 {
         match reg & 0x07 {
             0 | 1 | 3 | 5 | 6 => self.open_bus,
@@ -460,16 +328,26 @@ impl Ppu {
                 // during rendering.
                 //
                 // NMI-during-VBlank quirk: if the NMI-enable bit (bit 7)
-                // is set *while VBlank is active*, an NMI is generated
-                // immediately — not just at the VBlank-start edge. Games
-                // rely on this when they enable NMI inside the VBlank
-                // handler for the next frame.
+                // transitions from 0 to 1 while VBlank is active, an NMI is
+                // generated immediately. Re-writing bit 7=1 does NOT trigger
+                // another NMI — only the rising edge matters.
                 // See: https://www.nesdev.org/wiki/PPU_registers#PPUCTRL
+                let nmi_was_enabled = (self.ppuctrl & CTRL_NMI) != 0;
                 self.ppuctrl = value;
                 let nt = (value as u16) & 0b11;
                 self.t = (self.t & !NT_SELECT_MASK) | (nt << 10);
+                // NMI-during-VBlank quirk: an NMI is generated immediately
+                // only on the *rising edge* of the NMI-enable bit (bit 7
+                // transitioning from 0 to 1) while VBlank is active.
+                // Writing PPUCTRL with bit 7 already set does NOT re-trigger.
+                //
+                // Debug: when nmi_retrigger is enabled, reproduce the old
+                // buggy behavior where every write with bit 7 set during
+                // VBlank triggers an NMI.
                 if (value & CTRL_NMI) != 0 && self.in_vblank() {
-                    self.nmi_request = true;
+                    if self.render.nmi_retrigger || !nmi_was_enabled {
+                        self.nmi_request = true;
+                    }
                 }
             }
             1 => self.ppumask = value,
@@ -487,6 +365,7 @@ impl Ppu {
 
     /// Read PPUSTATUS: returns the status byte (bits 7-5 = flags, bits 4-0
     /// = open bus), then clears the VBlank flag and resets the `w` latch.
+    /// The combined byte is latched onto the open bus.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_registers#PPUSTATUS
     fn read_status(&mut self) -> u8 {
@@ -494,19 +373,23 @@ impl Ppu {
         // Reading PPUSTATUS clears VBlank and resets the write latch.
         self.ppustatus &= !STATUS_VBLANK;
         self.w = false;
+        // The combined byte placed on the CPU bus becomes the new open bus.
+        self.open_bus = result;
         result
     }
 
     // ---- OAMDATA ($2004) ---------------------------------------------
 
     /// Read OAMDATA: returns OAM at the current OAMADDR, then increments
-    /// OAMADDR. During rendering this would return garbage, but M7 has no
-    /// rendering yet.
+    /// OAMADDR. The read byte is latched onto the open bus. During
+    /// rendering this would return garbage, but M7 has no rendering yet.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_registers#OAMDATA
     fn read_oamdata(&mut self) -> u8 {
         let value = self.oam[self.oamaddr as usize];
         self.oamaddr = self.oamaddr.wrapping_add(1);
+        // The OAM byte placed on the CPU bus becomes the new open bus.
+        self.open_bus = value;
         value
     }
 
@@ -537,7 +420,7 @@ impl Ppu {
             // position's fine X offset. Mark the render position dirty so
             // the per-pixel renderer re-syncs from `fine_x` on the next
             // pixel (M25 cycle-accurate rendering).
-            self.render_v_dirty = true;
+            self.render.v_dirty = true;
         } else {
             // Second write: coarse Y → t[5:9], fine Y → t[12:14].
             // Preserve bits 15, 14-12 (fine Y is overwritten), 11-10
@@ -576,13 +459,15 @@ impl Ppu {
             self.t = (self.t & 0b1111_1111_0000_0000) | (value as u16);
             self.v = self.t;
             self.w = false;
-            // The second PPUADDR write copies `t` into `v`, which directly
-            // changes the rendering position. Mark the per-pixel render
-            // position dirty so the renderer re-syncs from `v` on the next
-            // pixel — this is how mid-scanline raster effects (e.g. status
-            // bar splits, horizontal scrolling changes) take effect at the
-            // correct pixel (M25 cycle-accurate rendering).
-            self.render_v_dirty = true;
+            // Do NOT set v_dirty here. On real hardware the PPU's fetch
+            // pipeline delays the effect of `v` changes by ~2 tiles, so
+            // PPUADDR writes during rendering don't immediately corrupt the
+            // current pixel.  Games that write PPUADDR for VRAM access
+            // during visible scanlines (e.g. Mario Bros nametable updates)
+            // rely on this delay — they restore the scroll via PPUSCROLL
+            // and the h-copy at cycle 257 restores `v` from `t`.  Setting
+            // v_dirty here would cause an immediate re-snapshot from the
+            // VRAM data address, corrupting the rest of the scanline.
         }
     }
 
@@ -632,9 +517,16 @@ impl Ppu {
         self.open_bus
     }
 
+    /// Set the open-bus latch. Used by the bus to update the PPU open bus
+    /// after PPUDATA reads and OAMDMA writes (which are handled outside the
+    /// PPU register read/write path).
+    pub fn set_open_bus(&mut self, value: u8) {
+        self.open_bus = value;
+    }
+
     /// Read a nametable byte at `addr` (in `$2000-$3EFF`). Handles the
     /// `$3000-$3EFF` mirror and nametable mirroring.
-    pub fn read_nametable(&self, addr: u16) -> u8 {
+    #[inline] pub fn read_nametable(&self, addr: u16) -> u8 {
         let idx = self.map_nametable(addr);
         self.vram[idx]
     }
@@ -648,7 +540,7 @@ impl Ppu {
     /// Read a palette byte at `addr` (in `$3F00-$3FFF`). Handles palette
     /// internal mirroring (`$3F10/$3F14/$3F18/$3F1C` mirror `$3F00/$3F04/
     /// `$3F08/$3F0C`; `$3F20-$3FFF` mirrors `$3F00-$3F1F`).
-    pub fn read_palette(&self, addr: u16) -> u8 {
+    #[inline] pub fn read_palette(&self, addr: u16) -> u8 {
         let idx = self.map_palette(addr);
         self.palette[idx]
     }
@@ -788,6 +680,7 @@ impl Ppu {
     ///
     /// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
     /// See: https://www.nesdev.org/wiki/PPU_scrolling
+    #[inline]
     pub fn step(&mut self) -> bool {
         let mut nmi = false;
 
@@ -829,7 +722,7 @@ impl Ppu {
                 self.set_sprite_zero_hit(false);
                 // Reset the per-pixel renderer's per-frame latch so sprite
                 // zero hit can trigger again on the next frame (M25).
-                self.scanline_sprite_zero_hit = false;
+                self.render.sprite_zero_hit = false;
             }
             _ => {}
         }
@@ -860,8 +753,12 @@ impl Ppu {
             if does_scroll_inc && self.cycle == VERT_SCROLL_INC_CYCLE {
                 self.increment_v_scroll();
             }
-            // Horizontal t→v copy at dot 257 — every scanline.
-            if self.cycle == H_COPY_CYCLE {
+            // Horizontal t→v copy at dot 257 — visible scanlines and
+            // prerender only (NOT during VBlank scanlines 240-260).
+            // During VBlank the game freely writes PPUADDR/PPUDATA to
+            // update nametables; an h-copy here would reset v's
+            // horizontal bits to t's values, corrupting the VRAM address.
+            if does_scroll_inc && self.cycle == H_COPY_CYCLE {
                 self.copy_h_t_to_v();
             }
             // Vertical t→v copy at prerender dots 280-304.
@@ -896,7 +793,8 @@ impl Ppu {
     /// raster effects take effect at the correct pixel.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_rendering#Timing
-    pub fn step_rendered(&mut self, chr_read: &mut dyn FnMut(u16) -> u8) -> bool {
+    #[inline]
+    pub fn step_rendered(&mut self, chr_read: &mut impl ChrReader) -> bool {
         // Run the architectural step (cycle advance, VBlank, scroll
         // increments) first. The per-pixel rendering happens after, at the
         // new (cycle, scanline) position.
@@ -905,7 +803,8 @@ impl Ppu {
         // Reset the per-scanline render initialization flag at cycle 0 so
         // the first pixel output of each scanline takes a fresh snapshot.
         if self.cycle == 0 {
-            self.scanline_render_initialized = false;
+            self.render.scanline_initialized = false;
+            self.render.pipeline_primed = false;
         }
 
         // Per-pixel rendering: one pixel per cycle on visible scanlines.
@@ -916,22 +815,51 @@ impl Ppu {
             && self.cycle <= SCREEN_WIDTH as u16
         {
             self.render_one_pixel(chr_read);
-            self.rendered_this_frame = true;
+            self.render.rendered_this_frame = true;
         }
 
         nmi
     }
 
-    /// Horizontal scroll increment: advance `fine_x`; on wrap, advance
-    /// coarse X (in `v`); on coarse-X wrap (past 31), toggle the
-    /// horizontal nametable bit.
+    /// Horizontal scroll increment: advance coarse X (in `v`); on
+    /// coarse-X wrap (past 31), toggle the horizontal nametable bit.
+    ///
+    /// On real hardware the fine X register (set by PPUSCROLL) is never
+    /// modified during rendering — only the coarse X in `v` advances,
+    /// once per tile fetch (every 8 cycles). The per-pixel renderer
+    /// applies the static `fine_x` offset via its own snapshot logic.
     ///
     /// See: https://www.nesdev.org/wiki/PPU_scrolling#Coarse_X_increment
     fn increment_h_scroll(&mut self) {
-        if self.fine_x < 7 {
-            self.fine_x += 1;
+        if self.render.slant_corruption {
+            // Reproduce the old buggy behavior: increment fine_x and wrap
+            // into coarse X. This corrupts the PPUSCROLL fine_x register,
+            // causing a 45-degree slant on all rendered pixels.
+            //
+            // The rendering pipeline snapshots fine_x into
+            // render_fine_x_start at the start of each scanline and uses
+            // that snapshot (not the live fine_x) for pixel positioning.
+            // So we must also corrupt the snapshot for the slant to be
+            // visible. Each increment shifts subsequent pixels by 1,
+            // creating the staircase effect.
+            if self.fine_x < 7 {
+                self.fine_x += 1;
+                self.render.fine_x_start = (self.render.fine_x_start + 1) & 0x07;
+            } else {
+                self.fine_x = 0;
+                self.render.fine_x_start = 0;
+                let coarse_x = self.v & COARSE_X_MASK;
+                if coarse_x == 31 {
+                    self.v &= !COARSE_X_MASK;
+                    self.v ^= NT_H_BIT;
+                    self.render.coarse_x_start = 0;
+                    self.render.nt_h_start ^= NT_H_BIT;
+                } else {
+                    self.v = (self.v & !COARSE_X_MASK) | (coarse_x + 1);
+                    self.render.coarse_x_start = (coarse_x + 1) & COARSE_X_MASK;
+                }
+            }
         } else {
-            self.fine_x = 0;
             let coarse_x = self.v & COARSE_X_MASK;
             if coarse_x == 31 {
                 // Wrap coarse X to 0 and toggle the horizontal nt bit.
@@ -974,9 +902,10 @@ impl Ppu {
     ///
     /// See: https://www.nesdev.org/wiki/PPU_scrolling#At_cycle_257
     fn copy_h_t_to_v(&mut self) {
-        // Copy t bits 0-4 (coarse X) and 10-11 (nt) into v.
-        let h_bits = self.t & (COARSE_X_MASK | NT_SELECT_MASK);
-        self.v = (self.v & !(COARSE_X_MASK | NT_SELECT_MASK)) | h_bits;
+        // Copy t bits 0-4 (coarse X) and bit 10 (nametable X) into v.
+        // Only the horizontal nametable bit is copied — NOT bit 11.
+        let h_bits = self.t & (COARSE_X_MASK | NT_H_BIT);
+        self.v = (self.v & !(COARSE_X_MASK | NT_H_BIT)) | h_bits;
     }
 
     /// Copy the vertical components of `t` (coarse Y, fine Y, nametable
@@ -984,9 +913,10 @@ impl Ppu {
     ///
     /// See: https://www.nesdev.org/wiki/PPU_scrolling#At_cycle_280_to_304
     fn copy_v_t_to_v(&mut self) {
-        // Copy t bits 5-9 (coarse Y), 10-11 (nt), 12-14 (fine Y) into v.
-        let v_bits = self.t & (COARSE_Y_MASK | NT_SELECT_MASK | FINE_Y_MASK);
-        self.v = (self.v & !(COARSE_Y_MASK | NT_SELECT_MASK | FINE_Y_MASK)) | v_bits;
+        // Copy t bits 5-9 (coarse Y), bit 11 (nametable Y), 12-14 (fine Y)
+        // into v. Only the vertical nametable bit is copied — NOT bit 10.
+        let v_bits = self.t & (COARSE_Y_MASK | NT_V_BIT | FINE_Y_MASK);
+        self.v = (self.v & !(COARSE_Y_MASK | NT_V_BIT | FINE_Y_MASK)) | v_bits;
     }
 
     // =================================================================
@@ -1000,7 +930,7 @@ impl Ppu {
     /// cartridge's mirroring mode.
     ///
     /// See: https://www.nesdev.org/wiki/Mirroring
-    fn map_nametable(&self, addr: u16) -> usize {
+    #[inline] fn map_nametable(&self, addr: u16) -> usize {
         // Collapse $3000-$3EFF onto $2000-$2EFF.
         let addr = addr & 0x2FFF;
         let local = (addr - 0x2000) as usize; // 0..0xFFF
@@ -1022,7 +952,7 @@ impl Ppu {
     /// `$3F00/$3F04/$3F08/$3F0C` (sprite color 0 mirrors background color 0).
     ///
     /// See: https://www.nesdev.org/wiki/PPU_palettes
-    fn map_palette(&self, addr: u16) -> usize {
+    #[inline] fn map_palette(&self, addr: u16) -> usize {
         let a = (addr & 0x1F) as u8;
         // $10, $14, $18, $1C mirror $00, $04, $08, $0C.
         if (a & 0x13) == 0x10 {
@@ -1082,8 +1012,8 @@ impl Ppu {
     pub fn palette(&self) -> &[u8; PALETTE_SIZE] {
         &self.palette
     }
-    /// Borrow the nametable VRAM array.
-    pub fn vram(&self) -> &[u8; VRAM_SIZE] {
+    /// Borrow the nametable VRAM slice.
+    pub fn vram(&self) -> &[u8] {
         &self.vram
     }
     /// Current mirroring mode.
@@ -1098,7 +1028,7 @@ impl Ppu {
     pub fn framebuffer_mut(&mut self) -> &mut [u32] {
         &mut self.framebuffer
     }
-    /// Borrow the per-pixel background pattern buffer (0-3 per pixel).
+    /// Borrow the per-scanline background pattern buffer (0-3 per pixel, 256 entries).
     pub fn bg_pattern(&self) -> &[u8] {
         &self.bg_pattern
     }
@@ -1107,12 +1037,12 @@ impl Ppu {
     /// to decide whether the framebuffer is already filled or needs a
     /// fallback whole-frame render.
     pub fn rendered_this_frame(&self) -> bool {
-        self.rendered_this_frame
+        self.render.rendered_this_frame
     }
     /// Reset the `rendered_this_frame` flag at the start of a new frame
     /// (called by [`crate::emulator::EmulatorState::step_frame`]).
     pub fn reset_rendered_flag(&mut self) {
-        self.rendered_this_frame = false;
+        self.render.rendered_this_frame = false;
     }
     /// Screen dimensions (width, height) in pixels.
     pub fn screen_size() -> (usize, usize) {
@@ -1549,7 +1479,7 @@ mod tests {
     // ---- M10: scroll increments during rendering ----------------------
 
     #[test]
-    fn h_scroll_increment_advances_fine_x() {
+    fn h_scroll_increment_advances_coarse_x() {
         let mut ppu = Ppu::new();
         // Enable rendering so step() performs scroll increments.
         ppu.write_register(1, MASK_SHOW_BG);
@@ -1558,16 +1488,17 @@ mod tests {
             ppu.step();
         }
         assert_eq!(ppu.cycle(), 8);
-        // fine_x should have advanced from 0 to 1.
-        assert_eq!(ppu.fine_x(), 1);
+        // coarse X in v should have advanced from 0 to 1.
+        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 1);
+        // fine_x (PPUSCROLL) must remain unchanged.
+        assert_eq!(ppu.fine_x(), 0);
     }
 
     #[test]
     fn h_scroll_increment_wraps_coarse_x_and_nt_bit() {
         let mut ppu = Ppu::new();
         ppu.write_register(1, MASK_SHOW_BG);
-        // Set fine_x = 7 so the next increment wraps to coarse X.
-        // Use PPUSCROLL first write: value 0x07 → coarse X = 0, fine X = 7.
+        // Set fine_x = 7 via PPUSCROLL (should remain unchanged).
         ppu.write_register(5, 0x07);
         ppu.write_register(5, 0x00);
         // Set v's coarse X = 31 via PPUADDR (so the wrap toggles nt bit 0).
@@ -1579,10 +1510,60 @@ mod tests {
         for _ in 0..8 {
             ppu.step();
         }
-        // fine_x wrapped 7 → 0, coarse X wrapped 31 → 0, nt bit 0 toggled.
-        assert_eq!(ppu.fine_x(), 0);
+        // coarse X wrapped 31 → 0, nt bit 0 toggled.
+        // fine_x must remain at its PPUSCROLL value (7).
+        assert_eq!(ppu.fine_x(), 7);
         assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 0);
         assert_eq!(ppu.vram_addr() & NT_H_BIT, NT_H_BIT, "nt H bit toggled");
+    }
+
+    #[test]
+    fn slant_corruption_mode_corrupts_fine_x() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        ppu.set_slant_corruption(true);
+        // Advance to cycle 8 (first h-scroll increment).
+        for _ in 0..8 {
+            ppu.step();
+        }
+        // In slant_corruption mode, fine_x is incremented (0 → 1) instead
+        // of coarse X. coarse X in v should remain 0.
+        assert_eq!(ppu.fine_x(), 1, "slant_corruption: fine_x incremented");
+        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 0, "coarse X unchanged");
+    }
+
+    #[test]
+    fn slant_corruption_mode_wraps_fine_x_into_coarse_x() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        ppu.set_slant_corruption(true);
+        // Set fine_x = 7 so the next increment wraps to coarse X.
+        ppu.write_register(5, 0x07);
+        ppu.write_register(5, 0x00);
+        // Advance to cycle 8 (first h-scroll increment).
+        for _ in 0..8 {
+            ppu.step();
+        }
+        // fine_x wrapped 7 → 0, coarse X advanced 0 → 1.
+        assert_eq!(ppu.fine_x(), 0, "slant_corruption: fine_x wrapped to 0");
+        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 1, "coarse X advanced");
+    }
+
+    #[test]
+    fn slant_corruption_corrupts_render_snapshot() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(1, MASK_SHOW_BG);
+        ppu.set_slant_corruption(true);
+        // Advance to cycle 8 (first h-scroll increment). The render
+        // snapshot render_fine_x_start must also be incremented so the
+        // slant is visible in pixel output.
+        for _ in 0..8 {
+            ppu.step();
+        }
+        assert_eq!(ppu.fine_x(), 1, "live fine_x incremented");
+        // render_fine_x_start should also be 1 (corrupted alongside fine_x)
+        // so effective_render_x produces shifted pixels.
+        assert_eq!(ppu.render.fine_x_start, 1, "render snapshot corrupted");
     }
 
     #[test]
@@ -1632,11 +1613,11 @@ mod tests {
             ppu.step();
         }
         assert_eq!(ppu.cycle(), 257);
-        // v should now have t's coarse X (10) and nt bits (0b11).
+        // v should now have t's coarse X (10) and nt H bit (bit 10 only).
         // (Note: h-scroll increments during cycles 8..248 will have
         // advanced v's coarse X, but the copy at 257 overwrites it.)
         assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 10);
-        assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b11 << 10);
+        assert_eq!(ppu.vram_addr() & NT_H_BIT, NT_H_BIT, "nt H bit copied");
     }
 
     #[test]
@@ -1653,10 +1634,10 @@ mod tests {
         for _ in 0..pre {
             ppu.step();
         }
-        // v should now have t's coarse Y (15), fine Y (5), nt (0b10).
+        // v should now have t's coarse Y (15), fine Y (5), nt V bit (bit 11).
         assert_eq!((ppu.vram_addr() & COARSE_Y_MASK) >> 5, 15);
         assert_eq!((ppu.vram_addr() & FINE_Y_MASK) >> 12, 5);
-        assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b10 << 10);
+        assert_eq!(ppu.vram_addr() & NT_V_BIT, NT_V_BIT, "nt V bit copied");
     }
 
     #[test]
@@ -1707,11 +1688,13 @@ mod tests {
         ppu.write_register(0, 0x80); // NMI enabled, not in VBlank → no request
         assert!(!ppu.take_nmi_request());
         ppu.set_vblank(true);
-        // Writing PPUCTRL again with bit 7 set while in VBlank → request.
+        // Writing PPUCTRL again with bit 7 already set while in VBlank →
+        // NO request (only the rising edge 0→1 triggers, not re-writing 1).
         ppu.write_register(0, 0x80);
-        assert!(ppu.take_nmi_request());
-        // A second write with bit 7 set while still in VBlank → another
-        // request (each qualifying write latches).
+        assert!(!ppu.take_nmi_request());
+        // Disable then re-enable during VBlank → rising edge triggers NMI.
+        ppu.write_register(0, 0x00);
+        assert!(!ppu.take_nmi_request());
         ppu.write_register(0, 0x80);
         assert!(ppu.take_nmi_request());
     }
@@ -1729,30 +1712,55 @@ mod tests {
         }
         assert_eq!(ppu.scanline(), SCANLINE_PRERENDER);
         assert_eq!(ppu.cycle(), 8);
-        // fine_x should have advanced (from 0 to 1, modulo prior frame
-        // drift — just check it's not stuck at 0).
-        assert_eq!(ppu.fine_x(), 1, "h-scroll increment fires on prerender");
+        // coarse X in v should have advanced (h-scroll increment fires
+        // on prerender). fine_x must remain unchanged.
+        assert_ne!(
+            ppu.vram_addr() & COARSE_X_MASK,
+            0,
+            "h-scroll increment fires on prerender"
+        );
+        assert_eq!(
+            ppu.fine_x(),
+            0,
+            "fine_x must not be modified during rendering"
+        );
     }
 
     #[test]
-    fn h_t_to_v_copy_fires_on_every_scanline_when_rendering() {
+    fn h_t_to_v_copy_does_not_fire_during_vblank() {
         let mut ppu = Ppu::new();
         ppu.write_register(1, MASK_SHOW_BG);
         // Set t's coarse X = 20, nt = 0b01.
         ppu.write_register(0, 0b0000_0001);
         ppu.write_register(5, 0xA0); // coarse X = 20, fine X = 0
         ppu.write_register(5, 0x00);
-        // Advance to post-render scanline 240, cycle 257 (a non-visible,
-        // non-prerender scanline). The H t→v copy should still fire.
-        let target: u32 = 240 * (CYCLES_PER_SCANLINE as u32) + 257;
+        // Advance to scanline 240, cycle 256 (just before cycle 257).
+        // During scanlines 0-239, the h-copy at cycle 257 copies t's
+        // coarse X (20) into v. No h-scroll increments fire on scanline
+        // 240 (does_scroll_inc is false for VBlank scanlines).
+        let target: u32 = 240 * (CYCLES_PER_SCANLINE as u32) + 256;
         for _ in 0..target {
             ppu.step();
         }
+        // v's coarse X should be 20 from scanline 239's h-copy.
+        assert_eq!(
+            ppu.vram_addr() & COARSE_X_MASK,
+            20,
+            "v should have t's coarse X from scanline 239's h-copy"
+        );
+        // Now change t's coarse X to 5 via PPUSCROLL first write.
+        ppu.write_register(5, 0x28); // coarse X = 5, fine X = 0
+                                     // Step one more cycle to cycle 257.
+        ppu.step();
         assert_eq!(ppu.scanline(), 240);
         assert_eq!(ppu.cycle(), 257);
-        // v should have t's coarse X (20) and nt (0b01).
-        assert_eq!(ppu.vram_addr() & COARSE_X_MASK, 20);
-        assert_eq!(ppu.vram_addr() & NT_SELECT_MASK, 0b01 << 10);
+        // The h-copy should NOT fire during VBlank, so v's coarse X
+        // should still be 20, NOT 5 (the new t value).
+        assert_eq!(
+            ppu.vram_addr() & COARSE_X_MASK,
+            20,
+            "coarse X must NOT be copied from t during VBlank (should stay 20, not 5)"
+        );
     }
 
     // ---- M11: PPUSTATUS flag behaviours -------------------------------
@@ -1835,5 +1843,42 @@ mod tests {
         assert!(ppu.sprite_overflow());
         ppu.set_sprite_overflow(false);
         assert!(!ppu.sprite_overflow());
+    }
+
+    // ---- M-BUS-05: open bus on register reads --------------------------
+
+    #[test]
+    fn status_read_updates_open_bus() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x1F); // open bus = 0x1F
+        ppu.set_vblank(true);
+        let _ = ppu.read_status(); // returns 0x80 | 0x1F = 0x9F
+        // After the read, open bus should be 0x9F. A subsequent
+        // write-only register read should return 0x9F.
+        assert_eq!(ppu.read_register(0), 0x9F);
+    }
+
+    #[test]
+    fn oamdata_read_updates_open_bus() {
+        let mut ppu = Ppu::new();
+        ppu.write_register(0, 0x00); // open bus = 0x00
+        // Write 0x42 to OAM[0], then reset OAMADDR to 0.
+        ppu.write_register(3, 0x00); // OAMADDR = 0
+        ppu.write_register(4, 0x42); // OAM[0] = 0x42, OAMADDR → 1
+        ppu.write_register(3, 0x00); // OAMADDR = 0
+        // Read OAMDATA returns 0x42 and should latch it onto open bus.
+        let r = ppu.read_register(4);
+        assert_eq!(r, 0x42);
+        // Now reading a write-only register should return 0x42 (open bus).
+        assert_eq!(ppu.read_register(0), 0x42);
+    }
+
+    #[test]
+    fn set_open_bus_method_works() {
+        let mut ppu = Ppu::new();
+        ppu.set_open_bus(0xAB);
+        assert_eq!(ppu.open_bus(), 0xAB);
+        // Verify it shows up on write-only register reads.
+        assert_eq!(ppu.read_register(0), 0xAB);
     }
 }

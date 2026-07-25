@@ -845,11 +845,9 @@ fn bg_pattern_buffer_populated_by_render_background() {
     bus.render_background();
 
     let bgp = bus.ppu().bg_pattern();
-    // Solid tile → pattern 3 everywhere.
-    for y in 0..SCREEN_HEIGHT {
-        for x in 0..SCREEN_WIDTH {
-            assert_eq!(bgp[y * SCREEN_WIDTH + x], 3, "bg pattern at ({},{})", x, y);
-        }
+    // Solid tile → pattern 3 everywhere (per-scanline buffer = last scanline).
+    for x in 0..SCREEN_WIDTH {
+        assert_eq!(bgp[x], 3, "bg pattern at x={}", x);
     }
 }
 
@@ -865,16 +863,8 @@ fn bg_pattern_zero_where_background_transparent() {
     bus.render_background();
 
     let bgp = bus.ppu().bg_pattern();
-    for y in 0..SCREEN_HEIGHT {
-        for x in 0..SCREEN_WIDTH {
-            assert_eq!(
-                bgp[y * SCREEN_WIDTH + x],
-                0,
-                "transparent bg at ({},{})",
-                x,
-                y
-            );
-        }
+    for x in 0..SCREEN_WIDTH {
+        assert_eq!(bgp[x], 0, "transparent bg at x={}", x);
     }
 }
 
@@ -894,10 +884,8 @@ fn bg_pattern_zero_when_background_disabled() {
     bus.render_background();
 
     let bgp = bus.ppu().bg_pattern();
-    for y in 0..SCREEN_HEIGHT {
-        for x in 0..SCREEN_WIDTH {
-            assert_eq!(bgp[y * SCREEN_WIDTH + x], 0, "bg disabled → pattern 0");
-        }
+    for x in 0..SCREEN_WIDTH {
+        assert_eq!(bgp[x], 0, "bg disabled → pattern 0");
     }
 }
 

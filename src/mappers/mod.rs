@@ -1,19 +1,6 @@
-//! Cartridge mapper abstraction.
-//!
-//! Each NES cartridge wires its PRG-ROM / CHR-ROM / PRG-RAM differently and
-//! may implement bank switching, IRQ timers, or extra audio. We model this
-//! with a `Mapper` trait — every board type is a struct implementing it.
-//!
-//! The trait is intentionally minimal: the memory bus asks the mapper how to
-//! route a CPU-side PRG address ($6000-$FFFF) and a PPU-side CHR address
-//! ($0000-$1FFF), and the mapper is responsible for any bank switching,
-//! mirroring, or register side effects.
+//! Cartridge mapper abstraction — `Mapper` trait for PRG/CHR routing and bank switching.
 //!
 //! See: https://www.nesdev.org/wiki/Mapper
-//!
-//! The mapper API is exercised by `cartridge` and the memory bus (M3); until
-//! the bus lands, individual methods may be unused at runtime, so we silence
-//! dead-code warnings at the module level.
 #![allow(dead_code)]
 
 pub mod axrom;
@@ -35,15 +22,7 @@ pub mod ym2149;
 
 use crate::cartridge::CartridgeError;
 
-/// Serialised snapshot of a mapper's full internal state, used by the save
-/// state system (M20). Each variant holds a complete mapper struct (PRG-ROM,
-/// CHR, bank registers, PRG-RAM, IRQ state, etc.). The variant discriminant
-/// records which mapper type produced the snapshot so that
-/// [`Mapper::restore_state`] can downcast correctly.
-///
-/// All variants derive `Serialize`/`Deserialize` via the per-mapper struct
-/// derives; the enum itself derives them too so the entire snapshot can be
-/// serialised with `bincode` as part of a `SaveState`.
+/// Serialised snapshot of a mapper's internal state for save state.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum MapperState {
@@ -76,9 +55,7 @@ pub enum MapperState {
 }
 
 impl MapperState {
-    /// Convert a [`MapperState`] snapshot back into a boxed `dyn Mapper`,
-    /// used by the save state system (M20) to reconstruct a cartridge from
-    /// a serialised snapshot.
+    /// Convert snapshot back into a boxed `dyn Mapper`.
     pub fn into_boxed_mapper(self) -> Box<dyn Mapper> {
         match self {
             MapperState::Nrom(m) => Box::new(m),
@@ -119,21 +96,12 @@ pub enum Mirroring {
 
 /// The mapper trait — every board type implements this.
 ///
-/// Addresses passed in are *cart-local*: PRG addresses are in the
-/// `$6000..=$FFFF` CPU range (already de-mirrored by the bus), and CHR
-/// addresses are in the `$0000..=$1FFF` PPU range.
+/// PRG addresses are `$6000..=$FFFF` (de-mirrored by bus); CHR are `$0000..=$1FFF`.
 pub trait Mapper: Send {
     /// Read a byte from the CPU-side PRG address space (`$6000..=$FFFF`).
     fn read_prg(&self, addr: u16) -> u8;
 
-    /// Read a byte from the CPU-side PRG address space with potential
-    /// side effects. Most mappers have read-only PRG (ROM/RAM) and
-    /// delegate to [`read_prg`]. Mappers with read side-effects (e.g.
-    /// FDS disk-data read at `$4031` advancing the read pointer, or
-    /// `$4030` clearing the timer IRQ flag) override this to mutate
-    /// internal state on read. The bus calls this from `cart_read`
-    /// so that read side-effects fire correctly. Default: delegate to
-    /// [`read_prg`] (no side effects).
+    /// Read PRG with side effects (FDS etc.); default delegates to `read_prg`.
     fn read_prg_mut(&mut self, addr: u16) -> u8 {
         self.read_prg(addr)
     }
@@ -146,11 +114,7 @@ pub trait Mapper: Send {
     /// Read a byte from the PPU-side CHR address space (`$0000..=$1FFF`).
     fn read_chr(&self, addr: u16) -> u8;
 
-    /// Read a byte from CHR with side effects (e.g. MMC2 bank latching).
-    /// The bus calls this from its CHR-read closure during rendering so
-    /// that PPU pattern-fetches at latch-trigger addresses update the
-    /// active CHR bank. Default delegates to `read_chr` (no side effect);
-    /// MMC2 overrides this to toggle its 4 KB CHR bank latches.
+    /// Read CHR with side effects (MMC2 latching); default delegates to `read_chr`.
     fn read_chr_latched(&mut self, addr: u16) -> u8 {
         self.read_chr(addr)
     }
@@ -168,92 +132,41 @@ pub trait Mapper: Send {
         false
     }
 
-    /// Whether the mapper is currently asserting a CPU IRQ. The emulator
-    /// main loop polls this after each CPU step and raises
-    /// `Cpu::irq_pending` when it returns `true`. Default is `false`
-    /// (mappers without IRQ sources need not override this).
+    /// Whether the mapper is asserting a CPU IRQ. Default: `false`.
     fn irq_pending(&self) -> bool {
         false
     }
 
-    /// Clock the mapper's IRQ counter by one step. Called by the bus when
-    /// the PPU A12 line rises during rendering (approximately once per
-    /// scanline). Used by MMC3 and similar mappers for raster-effect IRQs.
-    /// Default is a no-op.
+    /// Clock IRQ counter (MMC3 A12 rising edge). Default: no-op.
     fn clock_irq(&mut self) {}
 
-    /// Reset the mapper's per-frame scanline counter. Called by the bus at
-    /// the start of each frame (prerender scanline). Used by MMC5 to reset
-    /// its internal scanline counter so the IRQ comparison stays correct
-    /// across frames. Default is a no-op.
+    /// Reset per-frame scanline counter (MMC5). Default: no-op.
     fn reset_scanline_counter(&mut self) {}
 
-    /// Advance the mapper's CPU-clocked logic by `cpu_cycles` CPU cycles.
-    /// Used by mappers whose IRQ timer runs on the CPU clock (e.g. FME-7's
-    /// 16-bit down-counter). Called by the emulator main loop once per CPU
-    /// step with the number of cycles that step consumed. Default is a
-    /// no-op so non-CPU-clocked mappers need not override this.
+    /// Advance CPU-clocked logic (FME-7 IRQ etc.). Default: no-op.
     fn clock_cpu(&mut self, _cpu_cycles: u32) {}
 
-    /// Current expansion-audio sample in `[-1.0, 1.0]`, mixed into the
-    /// APU output stream by the emulator main loop (M35). Mappers without
-    /// expansion audio (the vast majority) return `0.0`. Mappers with
-    /// expansion audio (VRC6, VRC7, Sunsoft 5B, Namco 163) override this
-    /// and return their mixed channel output. The sample is queried once
-    /// per output sample (~44.1 kHz) *after* `clock_cpu` has advanced the
-    /// channel state for the elapsed CPU cycles.
-    ///
-    /// See: https://www.nesdev.org/wiki/APU#Expansion_audio
+    /// Expansion-audio sample `[-1.0, 1.0]` (VRC6/VRC7/etc.). Default: 0.0. See: https://www.nesdev.org/wiki/APU#Expansion_audio
     fn expansion_audio_sample(&self) -> f32 {
         0.0
     }
 
-    /// Return the current contents of battery-backed PRG-RAM (`$6000-$7FFF`),
-    /// or `None` if this cartridge has no battery-backed SRAM.
-    ///
-    /// Used by the battery-SRAM persistence layer (M21) to dump PRG-RAM to a
-    /// `.nessram` file on exit. Only mappers that both *have* PRG-RAM and
-    /// *are* battery-backed (per the iNES header's battery flag) should
-    /// return `Some`. The default implementation returns `None`.
-    ///
-    /// See: https://www.nesdev.org/wiki/INES#Flags_6
+    /// Return battery-backed PRG-RAM contents, or `None`. See: https://www.nesdev.org/wiki/INES#Flags_6
     fn battery_sram(&self) -> Option<Vec<u8>> {
         None
     }
 
-    /// Load battery-backed PRG-RAM contents from a previously-saved
-    /// `.nessram` file. Called on boot when a `.nessram` file exists
-    /// alongside the ROM.
-    ///
-    /// Implementations should copy `data` into their PRG-RAM buffer, handling
-    /// length mismatches gracefully (truncating or zero-padding to the
-    /// mapper's PRG-RAM size). The default implementation is a no-op
-    /// (non-battery mappers ignore the call).
-    ///
-    /// See: https://www.nesdev.org/wiki/INES#Flags_6
+    /// Load battery-backed PRG-RAM from `.nessram` file. Default: no-op.
     fn load_battery_sram(&mut self, _data: &[u8]) {}
 
-    /// Capture the mapper's full internal state as a [`MapperState`]
-    /// snapshot. Used by the save state system (M20) to serialise the
-    /// cartridge. Every mapper must implement this.
+    /// Capture mapper state as a `MapperState` snapshot.
     fn save_state(&self) -> MapperState;
 
-    /// Restore the mapper's full internal state from a [`MapperState`]
-    /// snapshot. Used by the save state system (M20) to deserialise the
-    /// cartridge. Every mapper must implement this.
-    ///
-    /// Implementations should match the `MapperState` variant to `self`'s
-    /// type and copy/clone the snapshot's fields into `self`. A variant
-    /// mismatch is a programming error (the save state was produced by a
-    /// different mapper type) and should panic.
+    /// Restore mapper state from a `MapperState` snapshot (panics on mismatch).
     fn restore_state(&mut self, state: MapperState);
 }
 
 /// Construct the appropriate mapper for an iNES mapper number.
-///
-/// Returns `CartridgeError::UnsupportedMapper` for any mapper not yet
-/// implemented. Only NROM (mapper 0) is supported at M2; later milestones
-/// add MMC1, MMC3, UxROM, etc.
 pub fn from_ines(
     mapper_number: u16,
     prg_rom: Vec<u8>,

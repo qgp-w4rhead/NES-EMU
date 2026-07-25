@@ -14,8 +14,9 @@
 //! | `Alt+Enter`    | Toggle fullscreen (desktop mode, integer-scaled).      |
 //! | `Tab`          | Toggle fast-forward (run 4 frames per vsync tick).     |
 //!
-//! F1/F2/F3 (debugger) and F4/F6/F8 (viewers) are handled by the M27/M28
-//! dispatchers and are *not* routed through this module.
+//! F1 (help overlay) is handled in `src/main.rs` directly. F2/F3 (debugger)
+//! and F4/F6/F8 (viewers) are handled by the M27/M28 dispatchers and are
+//! *not* routed through this module.
 //!
 //! See: https://www.nesdev.org/wiki/CPU_interrupts#RESET (soft reset)
 //! See: https://wiki.libsdl.org/SDL2/SDL_SetWindowFullscreen (fullscreen)
@@ -34,6 +35,13 @@ use crate::video::Video;
 /// tick) while making the game visibly faster.
 pub const FAST_FORWARD_FRAMES: u32 = 4;
 
+/// Available turbo speed multipliers selectable from the F12 menu.
+/// Spacebar uses the currently selected value while held.
+pub const TURBO_SPEEDS: [f32; 5] = [0.25, 0.5, 2.0, 3.0, 4.0];
+
+/// Default turbo speed index into [`TURBO_SPEEDS`] (2.0× = index 2).
+pub const DEFAULT_TURBO_SPEED_INDEX: usize = 2;
+
 /// Default directory for screenshot files (the current working directory).
 pub const DEFAULT_SCREENSHOT_DIR: &str = ".";
 
@@ -43,6 +51,15 @@ pub struct UiHotkeys {
     /// Fast-forward flag — when `true`, the main loop runs
     /// [`FAST_FORWARD_FRAMES`] frames per vsync tick instead of one.
     fast_forward: bool,
+    /// Turbo (Spacebar) hold flag — when `true`, the main loop runs at
+    /// `turbo_ratio`× speed instead of 1×.
+    turbo_held: bool,
+    /// Current turbo speed multiplier (e.g. 2.0 = double speed).
+    turbo_ratio: f32,
+    /// Fractional frame accumulator for sub-1× turbo speeds. Each tick
+    /// adds `turbo_ratio`; `floor(acc)` frames are stepped, then
+    /// subtracted. For ≥1× ratios this always steps at least 1 frame.
+    turbo_accumulator: f32,
     /// Monotonic screenshot counter so successive screenshots get unique
     /// filenames even within the same millisecond.
     screenshot_counter: u64,
@@ -61,6 +78,9 @@ impl UiHotkeys {
     pub fn new(screenshot_dir: PathBuf) -> Self {
         Self {
             fast_forward: false,
+            turbo_held: false,
+            turbo_ratio: TURBO_SPEEDS[DEFAULT_TURBO_SPEED_INDEX],
+            turbo_accumulator: 0.0,
             screenshot_counter: 0,
             screenshot_dir,
         }
@@ -69,6 +89,37 @@ impl UiHotkeys {
     /// Is fast-forward currently active?
     pub fn fast_forward(&self) -> bool {
         self.fast_forward
+    }
+
+    /// Is the turbo key (Spacebar) currently held?
+    pub fn turbo_held(&self) -> bool {
+        self.turbo_held
+    }
+
+    /// Stop turbo (called on Spacebar key-up).
+    pub fn stop_turbo(&mut self) {
+        self.turbo_held = false;
+        self.turbo_accumulator = 0.0;
+    }
+
+    /// Current turbo speed multiplier.
+    pub fn turbo_ratio(&self) -> f32 {
+        self.turbo_ratio
+    }
+
+    /// Set the turbo speed multiplier.
+    pub fn set_turbo_ratio(&mut self, ratio: f32) {
+        self.turbo_ratio = ratio;
+    }
+
+    /// Return how many emulator frames to step this vsync tick while
+    /// turbo is held. Uses a fractional accumulator so sub-1× speeds
+    /// (e.g. 0.25×, 0.5×) skip frames correctly.
+    pub fn turbo_frame_count(&mut self) -> u32 {
+        self.turbo_accumulator += self.turbo_ratio;
+        let frames = self.turbo_accumulator.floor() as u32;
+        self.turbo_accumulator -= frames as f32;
+        frames.max(0)
     }
 
     /// Handle a key-down event. Returns `true` if the key was consumed by
@@ -127,6 +178,18 @@ impl UiHotkeys {
                 self.fast_forward = !self.fast_forward;
                 let state = if self.fast_forward { "ON" } else { "OFF" };
                 eprintln!("nes-emu: fast-forward {state}");
+                true
+            }
+            // Space: hold for turbo speed. While held, the main loop
+            // runs at `turbo_ratio`× speed (default 2×, configurable
+            // via the F12 menu). Space is reserved unconditionally —
+            // do not bind NES buttons to it in `config.toml`.
+            Keycode::Space => {
+                if !self.turbo_held {
+                    self.turbo_held = true;
+                    self.turbo_accumulator = 0.0;
+                    eprintln!("nes-emu: turbo ON ({:.2}×)", self.turbo_ratio);
+                }
                 true
             }
             _ => false,
