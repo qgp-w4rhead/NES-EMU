@@ -84,6 +84,22 @@ pub struct Menu {
     pending_rewind_capacity: Option<usize>,
     /// Live display value of rewind capacity (set when menu opens).
     rewind_capacity_display: usize,
+    /// Live display value of rewind branching (set when menu opens).
+    branching_display: bool,
+    /// Pending rewind branching change (applied on menu close).
+    pending_branching: Option<bool>,
+    /// Live display value of timeline enabled (set when menu opens).
+    timeline_display: bool,
+    /// Pending timeline enabled change (applied on menu close).
+    pending_timeline: Option<bool>,
+    /// Live display value of countdown delay in ms (set when menu opens).
+    countdown_delay_display: u32,
+    /// Pending countdown delay change in ms (applied on menu close).
+    pending_countdown_delay: Option<u32>,
+    /// Live display value of countdown start number (set when menu opens).
+    countdown_start_display: u32,
+    /// Pending countdown start number change (applied on menu close).
+    pending_countdown_start: Option<u32>,
     /// Pending turbo speed index (applied on menu close).
     pending_turbo_index: Option<usize>,
     /// Live display value of turbo speed index (set when menu opens).
@@ -108,6 +124,14 @@ impl Default for Menu {
             pending_ring_buffer_trace: None,
             pending_rewind_capacity: None,
             rewind_capacity_display: crate::save_state::DEFAULT_REWIND_CAPACITY,
+            branching_display: true,
+            pending_branching: None,
+            timeline_display: true,
+            pending_timeline: None,
+            countdown_delay_display: 500,
+            pending_countdown_delay: None,
+            countdown_start_display: 3,
+            pending_countdown_start: None,
             pending_turbo_index: None,
             turbo_index_display: crate::ui_hotkeys::DEFAULT_TURBO_SPEED_INDEX,
             pending_bindings: Vec::new(),
@@ -206,6 +230,56 @@ impl Menu {
         self.rewind_capacity_display = cap;
     }
 
+    /// Set the current rewind branching display value (called from
+    /// `main.rs` when the menu opens, so the menu shows the live value).
+    pub fn set_branching_display(&mut self, enabled: bool) {
+        self.branching_display = enabled;
+    }
+
+    /// Set the current timeline enabled display value (called from
+    /// `main.rs` when the menu opens, so the menu shows the live value).
+    pub fn set_timeline_display(&mut self, enabled: bool) {
+        self.timeline_display = enabled;
+    }
+
+    /// Set the current countdown delay display value in ms (called from
+    /// `main.rs` when the menu opens, so the menu shows the live value).
+    pub fn set_countdown_delay_display(&mut self, ms: u32) {
+        self.countdown_delay_display = ms;
+    }
+
+    /// Set the current countdown start number display value (called from
+    /// `main.rs` when the menu opens, so the menu shows the live value).
+    pub fn set_countdown_start_display(&mut self, n: u32) {
+        self.countdown_start_display = n;
+    }
+
+    /// Pending timeline enabled change accumulated while the menu was
+    /// open. Returns `Some(enabled)` if the user changed it, `None`
+    /// otherwise.
+    pub fn take_pending_timeline(&mut self) -> Option<bool> {
+        self.pending_timeline.take()
+    }
+
+    /// Pending countdown delay change accumulated while the menu was
+    /// open. Returns `Some(ms)` if the user changed it, `None` otherwise.
+    pub fn take_pending_countdown_delay(&mut self) -> Option<u32> {
+        self.pending_countdown_delay.take()
+    }
+
+    /// Pending countdown start number change accumulated while the menu
+    /// was open. Returns `Some(n)` if the user changed it, `None` otherwise.
+    pub fn take_pending_countdown_start(&mut self) -> Option<u32> {
+        self.pending_countdown_start.take()
+    }
+
+    /// Pending rewind branching change accumulated while the menu was
+    /// open. Returns `Some(enabled)` if the user changed it, `None`
+    /// otherwise.
+    pub fn take_pending_branching(&mut self) -> Option<bool> {
+        self.pending_branching.take()
+    }
+
     /// Pending turbo speed index change accumulated while the menu was
     /// open. Returns `Some(index)` if the user changed it, `None`
     /// otherwise. The caller should apply it to `UiHotkeys` and `Config`.
@@ -223,9 +297,9 @@ impl Menu {
     fn page_item_count(&self) -> usize {
         match self.page {
             MenuPage::Main => 6,   // Debug, Rewind, Turbo, Ctrl1, Ctrl2, Close
-            MenuPage::Debug => 5,  // slant_corruption, inaccurate_palette, nmi_retrigger, ring_buffer_trace, Back
-            MenuPage::Rewind => 2, // capacity, Back
-            MenuPage::Turbo => 2,  // speed, Back
+            MenuPage::Debug => 5, // slant_corruption, inaccurate_palette, nmi_retrigger, ring_buffer_trace, Back
+            MenuPage::Rewind => 6, // capacity, branching, timeline, countdown delay, countdown start, Back
+            MenuPage::Turbo => 2, // speed, Back
             MenuPage::Controller1 | MenuPage::Controller2 => 9, // 8 buttons + Back
         }
     }
@@ -316,6 +390,56 @@ impl Menu {
                 };
                 self.pending_rewind_capacity = Some(new_cap);
             }
+            Keycode::Left if self.page == MenuPage::Rewind && self.selection == 1 => {
+                self.pending_branching = Some(!self.effective_branching());
+            }
+            Keycode::Right if self.page == MenuPage::Rewind && self.selection == 1 => {
+                self.pending_branching = Some(!self.effective_branching());
+            }
+            Keycode::Left if self.page == MenuPage::Rewind && self.selection == 2 => {
+                self.pending_timeline = Some(!self.effective_timeline());
+            }
+            Keycode::Right if self.page == MenuPage::Rewind && self.selection == 2 => {
+                self.pending_timeline = Some(!self.effective_timeline());
+            }
+            Keycode::Left if self.page == MenuPage::Rewind && self.selection == 3 => {
+                let cd = self.effective_countdown_delay();
+                let new_cd = if cd == 0 {
+                    crate::save_state_hotkeys::MAX_COUNTDOWN_DELAY_MS
+                } else {
+                    cd.saturating_sub(100)
+                };
+                self.pending_countdown_delay = Some(new_cd);
+            }
+            Keycode::Right if self.page == MenuPage::Rewind && self.selection == 3 => {
+                let cd = self.effective_countdown_delay();
+                let max = crate::save_state_hotkeys::MAX_COUNTDOWN_DELAY_MS;
+                let new_cd = if cd >= max {
+                    0
+                } else {
+                    (cd + 100).min(max)
+                };
+                self.pending_countdown_delay = Some(new_cd);
+            }
+            Keycode::Left if self.page == MenuPage::Rewind && self.selection == 4 => {
+                let n = self.effective_countdown_start();
+                let new_n = if n <= 1 {
+                    crate::save_state_hotkeys::MAX_COUNTDOWN_START_NUMBER
+                } else {
+                    n - 1
+                };
+                self.pending_countdown_start = Some(new_n);
+            }
+            Keycode::Right if self.page == MenuPage::Rewind && self.selection == 4 => {
+                let n = self.effective_countdown_start();
+                let max = crate::save_state_hotkeys::MAX_COUNTDOWN_START_NUMBER;
+                let new_n = if n >= max {
+                    1
+                } else {
+                    n + 1
+                };
+                self.pending_countdown_start = Some(new_n);
+            }
             Keycode::Left if self.page == MenuPage::Turbo && self.selection == 0 => {
                 let idx = self.effective_turbo_index();
                 let new_idx = if idx == 0 {
@@ -391,6 +515,19 @@ impl Menu {
                     // Left/Right adjusts the value; Enter is a no-op here.
                 }
                 1 => {
+                    // Left/Right toggles; Enter also toggles.
+                    self.pending_branching = Some(!self.effective_branching());
+                }
+                2 => {
+                    self.pending_timeline = Some(!self.effective_timeline());
+                }
+                3 => {
+                    // Left/Right adjusts the countdown delay; Enter is a no-op.
+                }
+                4 => {
+                    // Left/Right adjusts the countdown start number; Enter is a no-op.
+                }
+                5 => {
                     self.page = MenuPage::Main;
                     self.selection = 0;
                 }
@@ -449,6 +586,32 @@ impl Menu {
             .unwrap_or(self.ring_buffer_trace)
     }
 
+    /// Return the effective rewind branching: the pending value if
+    /// the user has toggled it, otherwise the display value.
+    fn effective_branching(&self) -> bool {
+        self.pending_branching.unwrap_or(self.branching_display)
+    }
+
+    /// Return the effective timeline enabled: the pending value if
+    /// the user has toggled it, otherwise the display value.
+    fn effective_timeline(&self) -> bool {
+        self.pending_timeline.unwrap_or(self.timeline_display)
+    }
+
+    /// Return the effective countdown delay in ms: the pending value if
+    /// the user has adjusted it, otherwise the display value.
+    fn effective_countdown_delay(&self) -> u32 {
+        self.pending_countdown_delay
+            .unwrap_or(self.countdown_delay_display)
+    }
+
+    /// Return the effective countdown start number: the pending value if
+    /// the user has adjusted it, otherwise the display value.
+    fn effective_countdown_start(&self) -> u32 {
+        self.pending_countdown_start
+            .unwrap_or(self.countdown_start_display)
+    }
+
     /// Build the lines to display for the current page state.
     fn build_lines(&self, config: &Config) -> Vec<String> {
         let mut lines = Vec::new();
@@ -471,7 +634,11 @@ impl Menu {
                 lines.push(self.fmt_item(1, &format!("Inaccurate Palette: {pal}")));
                 let nmi = if self.nmi_retrigger { "ON" } else { "OFF" };
                 lines.push(self.fmt_item(2, &format!("NMI Retrigger: {nmi}")));
-                let rbt = if self.effective_ring_buffer_trace() { "ON" } else { "OFF" };
+                let rbt = if self.effective_ring_buffer_trace() {
+                    "ON"
+                } else {
+                    "OFF"
+                };
                 lines.push(self.fmt_item(3, &format!("Ring Buffer Trace: {rbt}")));
                 lines.push(self.fmt_item(4, "Back"));
             }
@@ -480,7 +647,28 @@ impl Menu {
                 let cap = self.effective_rewind_capacity();
                 let secs = cap * crate::save_state_hotkeys::REWIND_INTERVAL as usize / 60;
                 lines.push(self.fmt_item(0, &format!("Capacity: {cap} (~{secs}s) < >")));
-                lines.push(self.fmt_item(1, "Back"));
+                let br = if self.effective_branching() {
+                    "ON"
+                } else {
+                    "OFF"
+                };
+                lines.push(self.fmt_item(1, &format!("Branching: {br} < >")));
+                let tl = if self.effective_timeline() {
+                    "ON"
+                } else {
+                    "OFF"
+                };
+                lines.push(self.fmt_item(2, &format!("Timeline: {tl} < >")));
+                let cd = self.effective_countdown_delay();
+                let cd_str = if cd == 0 {
+                    "OFF".to_string()
+                } else {
+                    format!("{}ms", cd)
+                };
+                lines.push(self.fmt_item(3, &format!("Countdown Delay: {cd_str} < >")));
+                let cs = self.effective_countdown_start();
+                lines.push(self.fmt_item(4, &format!("Countdown Start: {cs} < >")));
+                lines.push(self.fmt_item(5, "Back"));
             }
             MenuPage::Turbo => {
                 lines.push("== TURBO SPEED ==".to_string());
@@ -583,7 +771,7 @@ impl Menu {
             let is_selected = match self.page {
                 MenuPage::Main => i >= 1 && i <= 6 && (i - 1) == self.selection,
                 MenuPage::Debug => i >= 1 && i <= 4 && (i - 1) == self.selection,
-                MenuPage::Rewind => i >= 1 && i <= 2 && (i - 1) == self.selection,
+                MenuPage::Rewind => i >= 1 && i <= 3 && (i - 1) == self.selection,
                 MenuPage::Turbo => i >= 1 && i <= 2 && (i - 1) == self.selection,
                 MenuPage::Controller1 | MenuPage::Controller2 => {
                     i >= 1 && i <= 9 && (i - 1) == self.selection

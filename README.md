@@ -126,8 +126,8 @@ Bindings are configurable via `config.toml`.
 | `Shift+Backspace`    | Hold to forward through rewind buffer. |
 | `N`                  | Single-step CPU (when paused via F2). |
 | `T`                  | Toggle PPU write logger. |
-| `O`                  | Accept branch point (when paused during rewind). |
-| `P`                  | Deny branch point (continue past branch). |
+| `O`                  | Accept branch point (when paused during rewind, branching on). |
+| `P`                  | Deny branch point (continue past branch, branching on). |
 | `0`–`9`              | Select save-state slot. |
 | `PageUp`/`PageDown`  | Memory viewer page navigation. |
 | `[` / `]`            | Switch memory viewer region (CPU ↔ PPU). |
@@ -136,6 +136,23 @@ Bindings are configurable via `config.toml`.
 | `Alt+Up`/`Alt+Down`  | Volume up/down on selected APU channel. |
 | `Alt+0`              | Reset all APU channels (unmute, volume 1.0). |
 | `Escape` / `Q`       | Quit emulator. |
+
+### Rewind / Forward
+
+Hold `Backspace` to rewind through recent frames. Hold `Shift+Backspace` to
+fast-forward back through rewound frames. Press `Space` while rewinding to
+cycle the speed (1× → 2× → 4× → 8×).
+
+**Timeline branching** can be toggled on or off via the F12 menu under
+**Rewind Settings → Branching**, or via `rewind_branching` in `config.toml`:
+
+- **Branching ON** (default): Releasing `Backspace` after rewinding creates
+  an alternate timeline branch. Rewinding past a branch divergence point
+  pauses emulation — press `O` to accept (switch to that branch) or `P` to
+  deny (continue past it).
+- **Branching OFF**: Rewind/forward operates as a simple linear buffer with
+  no branching. No branch points are created or paused at — just pure
+  rewind/forward like a standard emulator.
 
 ### Drag-and-drop
 

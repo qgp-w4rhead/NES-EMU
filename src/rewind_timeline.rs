@@ -17,14 +17,16 @@ pub const TIMELINE_BRANCH: u32 = 0xFFCC_8833;
 pub const TIMELINE_BRANCH_FORWARD: u32 = 0xFFEE_BB88;
 /// Branch diverge marker colour (bright yellow).
 pub const TIMELINE_BRANCH_MARKER: u32 = 0xFFFF_DD00;
+/// Selected branch highlight colour (bright cyan border).
+pub const TIMELINE_BRANCH_SELECTED: u32 = 0xFF00_FFFF;
 
 /// Bar layout constants (in NES framebuffer pixels).
 pub const BAR_X: u32 = 4;
-pub const BAR_Y: u32 = 228;
+pub const BAR_Y: u32 = 224;
 pub const BAR_W: u32 = 248;
 pub const BAR_H: u32 = 6;
 pub const BORDER_THICKNESS: u32 = 1;
-pub const TEXT_Y: u32 = 218;
+pub const TEXT_Y: u32 = 232;
 
 /// Maximum opacity value (fully visible). Fade ramps 0..=MAX_OPACITY.
 pub const MAX_OPACITY: u8 = 4;
@@ -67,6 +69,19 @@ pub struct TimelineConfig {
     /// the branch starts, and depth is the nesting level (0 = child of
     /// root, 1 = grandchild, etc.).
     pub branches: Vec<(usize, usize, usize, u32)>,
+    /// Index of the currently active branch, or `None` if on root.
+    /// When `Some`, the position marker is drawn on the active
+    /// branch's bar instead of the main (root) bar.
+    pub active_branch: Option<usize>,
+    /// Rewind buffer length of the active timeline (root or branch).
+    /// Used for the position marker on the active bar.
+    pub active_filled: usize,
+    /// Forward buffer length of the active timeline.
+    pub active_forward_filled: usize,
+    /// Index of the currently selected branch at a branch point,
+    /// or `None` if not paused at a branch point. The selected
+    /// branch bar is drawn with a bright highlight colour.
+    pub selected_branch: Option<usize>,
 }
 
 impl Default for TimelineConfig {
@@ -81,6 +96,10 @@ impl Default for TimelineConfig {
             speed: 1,
             forward_filled: 0,
             branches: Vec::new(),
+            active_branch: None,
+            active_filled: 0,
+            active_forward_filled: 0,
+            selected_branch: None,
         }
     }
 }
@@ -138,8 +157,9 @@ pub fn render_timeline(fb: &mut [u32], width: u32, height: u32, cfg: &TimelineCo
     };
 
     // Draw a black background strip behind the bar + text area.
-    let bg_top = TEXT_Y.saturating_sub(1);
-    let bg_bottom = BAR_Y + BAR_H + BORDER_THICKNESS;
+    // Bar is on top, text is below the bar.
+    let bg_top = BAR_Y.saturating_sub(BORDER_THICKNESS);
+    let bg_bottom = TEXT_Y + GLYPH_H;
     fill_rect_blended(
         fb,
         width,
@@ -264,16 +284,19 @@ pub fn render_timeline(fb: &mut [u32], width: u32, height: u32, cfg: &TimelineCo
         draw_vertical_line_blended(fb, width, height, tick_x, BAR_Y, BAR_H, border_color, op);
     }
 
-    // Draw the position marker (after tick marks so it's on top).
-    // In Rewind mode: marker at the right edge of the filled portion.
-    // In Forward mode: marker at the right edge of the filled portion
+    // Draw the position marker on the active timeline.
+    // When on root (active_branch is None): marker on the main bar.
+    // When on a branch: marker on the active branch's bar.
+    // In Rewind mode: marker at the right edge of the rewind fill.
+    // In Forward mode: marker at the right edge of the rewind fill
     //   (moves right as snapshots are pushed back into the rewind buffer).
-    // In Buffer mode: marker at the far right (most recent frame).
+    // In Buffer mode: marker at the far right of the bar.
     let marker_x = match cfg.mode {
         TimelineMode::Rewind | TimelineMode::Forward => BAR_X + filled_w,
         TimelineMode::Buffer => BAR_X + BAR_W,
     };
     let marker_x = marker_x.min(BAR_X + BAR_W);
+    // Default: marker on the main (root) bar.
     draw_vertical_line_blended(fb, width, height, marker_x, BAR_Y, BAR_H, marker_color, op);
 
     // Draw alternate timeline branches as small bars above the main bar.
@@ -281,9 +304,9 @@ pub fn render_timeline(fb: &mut [u32], width: u32, height: u32, cfg: &TimelineCo
     // to x on the parent timeline) and extending right by its rewind_len.
     // Forward buffer portion is shown in a lighter colour after the rewind
     // fill. Depth determines vertical offset (deeper = higher above bar).
-    let branch_h: u32 = 3;
+    let branch_h: u32 = 5;
     let branch_gap: u32 = 1;
-    for &(diverge_pos, rewind_len, forward_len, depth) in &cfg.branches {
+    for (branch_idx, &(diverge_pos, rewind_len, forward_len, depth)) in cfg.branches.iter().enumerate() {
         if cfg.capacity == 0 {
             continue;
         }
@@ -353,6 +376,13 @@ pub fn render_timeline(fb: &mut [u32], width: u32, height: u32, cfg: &TimelineCo
         // Draw border around branch bar.
         let total_w = rew_w + fwd_w;
         if total_w > 0 {
+            // Use bright cyan border for the selected branch, normal
+            // gray border for others.
+            let border_col = if cfg.selected_branch == Some(branch_idx) {
+                blend(TIMELINE_BRANCH_SELECTED, 0, op)
+            } else {
+                blend(TIMELINE_BORDER, 0, op)
+            };
             draw_rect_outline_blended(
                 fb,
                 width,
@@ -361,7 +391,33 @@ pub fn render_timeline(fb: &mut [u32], width: u32, height: u32, cfg: &TimelineCo
                 by,
                 total_w,
                 branch_h,
-                blend(TIMELINE_BORDER, 0, op),
+                border_col,
+                op,
+            );
+        }
+
+        // If this is the active branch, draw the position marker
+        // on its bar instead of the main bar.
+        if cfg.active_branch == Some(branch_idx) {
+            let active_rew_w = if cfg.capacity == 0 {
+                0u32
+            } else {
+                ((BAR_W as usize * cfg.active_filled / cfg.capacity) as u32)
+                    .min(BAR_W)
+            };
+            let active_marker_x = match cfg.mode {
+                TimelineMode::Rewind | TimelineMode::Forward => div_x + active_rew_w,
+                TimelineMode::Buffer => div_x + total_w,
+            };
+            let active_marker_x = active_marker_x.min(BAR_X + BAR_W);
+            draw_vertical_line_blended(
+                fb,
+                width,
+                height,
+                active_marker_x,
+                by,
+                branch_h,
+                marker_color,
                 op,
             );
         }
@@ -530,6 +586,10 @@ mod tests {
             speed: 1,
             forward_filled: 0,
             branches: Vec::new(),
+            active_branch: None,
+            active_filled: 0,
+            active_forward_filled: 0,
+            selected_branch: None,
         }
     }
 

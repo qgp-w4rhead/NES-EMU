@@ -253,7 +253,10 @@ fn nmi_takes_priority_over_irq_in_step() {
     cpu.step(&mut bus);
     assert_eq!(cpu.pc, 0x1111, "NMI vector should be loaded");
     assert!(!cpu.nmi_pending(), "NMI flag cleared");
-    assert!(cpu.irq_pending(), "IRQ flag still pending after NMI serviced");
+    assert!(
+        cpu.irq_pending(),
+        "IRQ flag still pending after NMI serviced"
+    );
 }
 
 // ===========================================================================

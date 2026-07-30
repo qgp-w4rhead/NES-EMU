@@ -411,6 +411,10 @@ fn config_with_empty_keys_yields_all_unbound() {
         rewind_capacity: nes_emu::save_state::DEFAULT_REWIND_CAPACITY,
         turbo_speed: nes_emu::ui_hotkeys::TURBO_SPEEDS
             [nes_emu::ui_hotkeys::DEFAULT_TURBO_SPEED_INDEX],
+        rewind_branching: true,
+        timeline_enabled: true,
+        countdown_delay_ms: 500,
+        countdown_start_number: 3,
     };
     for b in 0..8u8 {
         assert_eq!(c.keycode_for(0, b), None);

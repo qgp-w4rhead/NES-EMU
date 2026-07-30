@@ -6,9 +6,9 @@
 
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
-use crate::joypad::Joypad;
-use crate::ppu::{Ppu, ChrReader, SCREEN_HEIGHT};
 use crate::debug::PpuWriteLogger;
+use crate::joypad::Joypad;
+use crate::ppu::{ChrReader, Ppu, SCREEN_HEIGHT};
 
 /// Size of the CPU internal RAM in bytes (2 KB).
 pub const RAM_SIZE: usize = 0x0800;
@@ -276,7 +276,8 @@ impl Bus {
     }
 
     /// Read a byte from CPU address space (side-effectful: PPU/mapper reads).
-    #[inline] pub fn read(&mut self, addr: u16) -> u8 {
+    #[inline]
+    pub fn read(&mut self, addr: u16) -> u8 {
         match addr {
             // $0000-$1FFF: 2 KB RAM (mirrored 3 times).
             0x0000..=0x1FFF => self.ram[(addr & RAM_MASK) as usize],
@@ -326,7 +327,8 @@ impl Bus {
     }
 
     /// Write a byte to the CPU address space.
-    #[inline] pub fn write(&mut self, addr: u16, value: u8) {
+    #[inline]
+    pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & RAM_MASK) as usize] = value,
 
@@ -410,7 +412,14 @@ impl Bus {
     fn ppu_write(&mut self, reg: u16, value: u8) {
         if let Some(logger) = &mut self.ppu_write_logger {
             if logger.is_enabled() {
-                logger.log_write(reg, value, self.ppu.scanline(), self.ppu.cycle(), self.ppu.vram_addr(), None);
+                logger.log_write(
+                    reg,
+                    value,
+                    self.ppu.scanline(),
+                    self.ppu.cycle(),
+                    self.ppu.vram_addr(),
+                    None,
+                );
             }
         }
         if reg & 0x07 == 7 {
@@ -500,7 +509,13 @@ impl Bus {
     fn oam_dma(&mut self, page: u8) {
         if let Some(logger) = &mut self.ppu_write_logger {
             if logger.is_enabled() {
-                logger.log_oam_dma(page, self.ppu.scanline(), self.ppu.cycle(), self.ppu.vram_addr(), None);
+                logger.log_oam_dma(
+                    page,
+                    self.ppu.scanline(),
+                    self.ppu.cycle(),
+                    self.ppu.vram_addr(),
+                    None,
+                );
             }
         }
         let base = (page as u16) << 8;
@@ -523,7 +538,11 @@ impl Bus {
         // occurs on an odd CPU cycle, an extra cycle is added for
         // alignment to the next even cycle (513 total).
         // See: https://www.nesdev.org/wiki/PPU_registers#OAMDMA
-        let stall = if self.cpu_cycle_count & 1 != 0 { 513 } else { 512 };
+        let stall = if self.cpu_cycle_count & 1 != 0 {
+            513
+        } else {
+            512
+        };
         self.dma_stall_cycles = self.dma_stall_cycles.saturating_add(stall);
     }
 

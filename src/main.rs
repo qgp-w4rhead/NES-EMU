@@ -202,6 +202,10 @@ fn run() -> Result<(), String> {
         game_name_from_path(&current_rom_path),
         config.rewind_capacity,
     );
+    save_state_hotkeys.set_branching_enabled(config.rewind_branching);
+    save_state_hotkeys.set_timeline_enabled(config.timeline_enabled);
+    save_state_hotkeys.set_countdown_delay_ms(config.countdown_delay_ms);
+    save_state_hotkeys.set_countdown_start_number(config.countdown_start_number);
     let mut audio_hotkeys = AudioHotkeys::new();
     let mut region_hotkeys = RegionHotkeys::new();
 
@@ -328,6 +332,36 @@ fn run() -> Result<(), String> {
                                 config.rewind_capacity = cap;
                                 eprintln!("nes-emu: rewind capacity set to {cap}");
                             }
+                            // Apply pending rewind branching change.
+                            if let Some(enabled) = menu.take_pending_branching() {
+                                save_state_hotkeys.set_branching_enabled(enabled);
+                                config.rewind_branching = enabled;
+                                eprintln!(
+                                    "nes-emu: rewind branching {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                );
+                            }
+                            // Apply pending timeline enabled change.
+                            if let Some(enabled) = menu.take_pending_timeline() {
+                                save_state_hotkeys.set_timeline_enabled(enabled);
+                                config.timeline_enabled = enabled;
+                                eprintln!(
+                                    "nes-emu: timeline {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                );
+                            }
+                            // Apply pending countdown delay change.
+                            if let Some(ms) = menu.take_pending_countdown_delay() {
+                                save_state_hotkeys.set_countdown_delay_ms(ms);
+                                config.countdown_delay_ms = ms;
+                                eprintln!("nes-emu: countdown delay set to {ms}ms");
+                            }
+                            // Apply pending countdown start number change.
+                            if let Some(n) = menu.take_pending_countdown_start() {
+                                save_state_hotkeys.set_countdown_start_number(n);
+                                config.countdown_start_number = n;
+                                eprintln!("nes-emu: countdown start set to {n}");
+                            }
                             // Apply pending turbo speed change.
                             if let Some(idx) = menu.take_pending_turbo_index() {
                                 let speed = nes_emu::ui_hotkeys::TURBO_SPEEDS[idx];
@@ -347,6 +381,10 @@ fn run() -> Result<(), String> {
                             }
                         } else {
                             menu.set_rewind_capacity_display(save_state_hotkeys.rewind_capacity());
+                            menu.set_branching_display(save_state_hotkeys.branching_enabled());
+                            menu.set_timeline_display(save_state_hotkeys.timeline_enabled());
+                            menu.set_countdown_delay_display(save_state_hotkeys.countdown_delay_ms());
+                            menu.set_countdown_start_display(save_state_hotkeys.countdown_start_number());
                             // Find current turbo index from config value.
                             let turbo_idx = nes_emu::ui_hotkeys::TURBO_SPEEDS
                                 .iter()
@@ -405,6 +443,32 @@ fn run() -> Result<(), String> {
                                 config.rewind_capacity = cap;
                                 eprintln!("nes-emu: rewind capacity set to {cap}");
                             }
+                            if let Some(enabled) = menu.take_pending_branching() {
+                                save_state_hotkeys.set_branching_enabled(enabled);
+                                config.rewind_branching = enabled;
+                                eprintln!(
+                                    "nes-emu: rewind branching {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                );
+                            }
+                            if let Some(enabled) = menu.take_pending_timeline() {
+                                save_state_hotkeys.set_timeline_enabled(enabled);
+                                config.timeline_enabled = enabled;
+                                eprintln!(
+                                    "nes-emu: timeline {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                );
+                            }
+                            if let Some(ms) = menu.take_pending_countdown_delay() {
+                                save_state_hotkeys.set_countdown_delay_ms(ms);
+                                config.countdown_delay_ms = ms;
+                                eprintln!("nes-emu: countdown delay set to {ms}ms");
+                            }
+                            if let Some(n) = menu.take_pending_countdown_start() {
+                                save_state_hotkeys.set_countdown_start_number(n);
+                                config.countdown_start_number = n;
+                                eprintln!("nes-emu: countdown start set to {n}");
+                            }
                             if let Some(idx) = menu.take_pending_turbo_index() {
                                 let speed = nes_emu::ui_hotkeys::TURBO_SPEEDS[idx];
                                 ui_hotkeys.set_turbo_ratio(speed);
@@ -434,6 +498,11 @@ fn run() -> Result<(), String> {
                     if k == Keycode::LShift || k == Keycode::RShift {
                         save_state_hotkeys.shift_pressed();
                     }
+                    // Tab skips the 3-2-1 countdown when active.
+                    if k == Keycode::Tab && save_state_hotkeys.is_countdown_active() {
+                        save_state_hotkeys.skip_countdown();
+                        continue;
+                    }
                     let consumed = save_state_hotkeys.handle_key(&mut emulator, k, keymod)
                         || ui_hotkeys.handle_key(&mut emulator, &mut video, k, keymod)
                         || handle_debugger_key(&mut debugger, k)
@@ -452,32 +521,40 @@ fn run() -> Result<(), String> {
                     keycode: Some(k), ..
                 } => {
                     // Backspace release: stop rewinding and/or forwarding.
-                    // If paused at a branch diverge point, accept it
-                    // (switch to that branch). If paused at the beginning
-                    // of a branch, just stop rewinding — the user can
-                    // still Shift+Backspace to forward or press 'o' to
-                    // return to the parent timeline.
+                    // If paused at a branch diverge point, keep the pause
+                    // state so the user can use Up/Down to select a branch
+                    // and O to accept it. If paused at the beginning of a
+                    // branch, stop rewinding but keep the pause state so
+                    // the user can press O to return to the parent.
                     if k == Keycode::Backspace {
                         if save_state_hotkeys.is_paused_at_branch_point() {
-                            save_state_hotkeys.accept_branch();
-                            eprintln!("nes-emu: branch accepted on Backspace release");
+                            // Don't auto-accept — let user select with
+                            // Up/Down and press O to accept.
+                            save_state_hotkeys.stop_rewind_keep_paused();
+                        } else if save_state_hotkeys.is_paused_at_start() {
+                            // Paused at beginning of branch: stop rewinding
+                            // but keep paused_at_start so user can press O
+                            // to return to the parent timeline.
+                            save_state_hotkeys.stop_rewind_keep_paused();
+                        } else if save_state_hotkeys.is_paused_at_return() {
+                            // Paused at return point on parent: stop
+                            // rewinding/forwarding but keep paused_at_return
+                            // so user can continue scrubbing or press O
+                            // to resume normal play.
+                            save_state_hotkeys.stop_rewind_keep_paused();
                         } else {
-                            if save_state_hotkeys.is_paused_at_branch() {
-                                // paused_at_start: clear it, don't accept
-                                save_state_hotkeys.stop_rewind();
-                            }
                             if save_state_hotkeys.is_forwarding() {
                                 save_state_hotkeys.stop_forward();
                                 eprintln!(
                                     "nes-emu: forward stopped ({} snapshots in forward buffer)",
-                                    save_state_hotkeys.rewind.len()
+                                    save_state_hotkeys.active_forward_len()
                                 );
                             }
                             if save_state_hotkeys.is_rewinding() {
                                 save_state_hotkeys.stop_rewind();
                                 eprintln!(
                                     "nes-emu: rewind stopped ({} snapshots)",
-                                    save_state_hotkeys.rewind.len()
+                                    save_state_hotkeys.active_rewind_len()
                                 );
                             }
                         }
@@ -562,6 +639,10 @@ fn run() -> Result<(), String> {
                         game_name_from_path(&current_rom_path),
                         config.rewind_capacity,
                     );
+                    save_state_hotkeys.set_branching_enabled(config.rewind_branching);
+                    save_state_hotkeys.set_timeline_enabled(config.timeline_enabled);
+                    save_state_hotkeys.set_countdown_delay_ms(config.countdown_delay_ms);
+                    save_state_hotkeys.set_countdown_start_number(config.countdown_start_number);
                     debugger = CpuDebugger::new();
                     eprintln!("nes-emu: loaded ROM: {}", current_rom_path.display());
                 }
@@ -582,6 +663,10 @@ fn run() -> Result<(), String> {
         } else if save_state_hotkeys.is_paused_at_branch() {
             // Paused at a branch point: do nothing, wait for user to
             // press o (accept) or p (deny).
+        } else if save_state_hotkeys.is_countdown_active() {
+            // 3-2-1 countdown active: pause emulation, advance the
+            // countdown state machine. Tab skips the countdown.
+            save_state_hotkeys.tick_countdown();
         } else if save_state_hotkeys.is_rewinding() {
             // Rewind: pop snapshots per vsync tick (speed-controlled)
             // instead of stepping forward. If the buffer is empty,
@@ -657,6 +742,8 @@ fn run() -> Result<(), String> {
         // regardless of OSD state. Advance the animation first.
         save_state_hotkeys.tick_animation();
         save_state_hotkeys.render_rewind_overlay(emulator.framebuffer_mut(), 256, 240);
+        // 3-2-1 countdown overlay — drawn on top of the timeline.
+        save_state_hotkeys.render_countdown(emulator.framebuffer_mut(), 256, 240);
         let osd_on = save_state_hotkeys.osd_enabled();
         let info_on = rom_manager.info_overlay_enabled();
         let menu_on = menu.is_open();
@@ -724,7 +811,7 @@ fn run() -> Result<(), String> {
                 "F9  Screenshot",
                 "F10 OSD toggle",
                 "F11 Region cycle",
-                "Tab Fast-forward 4x",
+                "Tab Fast-forward 4x / Skip countdown",
                 "Spc Turbo (hold)",
                 "Bsp Rewind (hold)",
                 "S+Bsp Forward (hold)",

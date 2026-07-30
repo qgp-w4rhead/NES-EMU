@@ -2,11 +2,17 @@ audio_volume = 1.0
 window_scale = 3
 region = "auto"
 recent_roms = [
+    '.\tests\real_roms\MarioBros.NES',
+    'C:\Users\W4RHEAD\Documents\PROJECTS\TOKENCRAPPING\NES-EMU\tests\real_roms\Zelda.NES',
     'C:\Users\W4RHEAD\Documents\Downloads\MarioBros.NES',
     'C:\Users\W4RHEAD\Documents\Downloads\Mega-Man.NES',
 ]
 rewind_capacity = 3000
 turbo_speed = 4.0
+rewind_branching = true
+timeline_enabled = true
+countdown_delay_ms = 500
+countdown_start_number = 2
 
 [keys.controller1]
 A = "L"

@@ -201,9 +201,7 @@ impl UiHotkeys {
             .map(|d| d.as_millis())
             .unwrap_or(0);
 
-        let path = self
-            .screenshot_dir
-            .join(format!("screenshot-{now_ms}.png"));
+        let path = self.screenshot_dir.join(format!("screenshot-{now_ms}.png"));
 
         let fb = emulator.framebuffer();
         match screenshot::encode_to_path(
@@ -227,5 +225,4 @@ mod tests {
         let u = UiHotkeys::default();
         assert!(!u.fast_forward());
     }
-
 }

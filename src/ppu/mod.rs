@@ -526,7 +526,8 @@ impl Ppu {
 
     /// Read a nametable byte at `addr` (in `$2000-$3EFF`). Handles the
     /// `$3000-$3EFF` mirror and nametable mirroring.
-    #[inline] pub fn read_nametable(&self, addr: u16) -> u8 {
+    #[inline]
+    pub fn read_nametable(&self, addr: u16) -> u8 {
         let idx = self.map_nametable(addr);
         self.vram[idx]
     }
@@ -540,7 +541,8 @@ impl Ppu {
     /// Read a palette byte at `addr` (in `$3F00-$3FFF`). Handles palette
     /// internal mirroring (`$3F10/$3F14/$3F18/$3F1C` mirror `$3F00/$3F04/
     /// `$3F08/$3F0C`; `$3F20-$3FFF` mirrors `$3F00-$3F1F`).
-    #[inline] pub fn read_palette(&self, addr: u16) -> u8 {
+    #[inline]
+    pub fn read_palette(&self, addr: u16) -> u8 {
         let idx = self.map_palette(addr);
         self.palette[idx]
     }
@@ -930,7 +932,8 @@ impl Ppu {
     /// cartridge's mirroring mode.
     ///
     /// See: https://www.nesdev.org/wiki/Mirroring
-    #[inline] fn map_nametable(&self, addr: u16) -> usize {
+    #[inline]
+    fn map_nametable(&self, addr: u16) -> usize {
         // Collapse $3000-$3EFF onto $2000-$2EFF.
         let addr = addr & 0x2FFF;
         let local = (addr - 0x2000) as usize; // 0..0xFFF
@@ -952,7 +955,8 @@ impl Ppu {
     /// `$3F00/$3F04/$3F08/$3F0C` (sprite color 0 mirrors background color 0).
     ///
     /// See: https://www.nesdev.org/wiki/PPU_palettes
-    #[inline] fn map_palette(&self, addr: u16) -> usize {
+    #[inline]
+    fn map_palette(&self, addr: u16) -> usize {
         let a = (addr & 0x1F) as u8;
         // $10, $14, $18, $1C mirror $00, $04, $08, $0C.
         if (a & 0x13) == 0x10 {
@@ -1853,8 +1857,8 @@ mod tests {
         ppu.write_register(0, 0x1F); // open bus = 0x1F
         ppu.set_vblank(true);
         let _ = ppu.read_status(); // returns 0x80 | 0x1F = 0x9F
-        // After the read, open bus should be 0x9F. A subsequent
-        // write-only register read should return 0x9F.
+                                   // After the read, open bus should be 0x9F. A subsequent
+                                   // write-only register read should return 0x9F.
         assert_eq!(ppu.read_register(0), 0x9F);
     }
 
@@ -1862,11 +1866,11 @@ mod tests {
     fn oamdata_read_updates_open_bus() {
         let mut ppu = Ppu::new();
         ppu.write_register(0, 0x00); // open bus = 0x00
-        // Write 0x42 to OAM[0], then reset OAMADDR to 0.
+                                     // Write 0x42 to OAM[0], then reset OAMADDR to 0.
         ppu.write_register(3, 0x00); // OAMADDR = 0
         ppu.write_register(4, 0x42); // OAM[0] = 0x42, OAMADDR → 1
         ppu.write_register(3, 0x00); // OAMADDR = 0
-        // Read OAMDATA returns 0x42 and should latch it onto open bus.
+                                     // Read OAMDATA returns 0x42 and should latch it onto open bus.
         let r = ppu.read_register(4);
         assert_eq!(r, 0x42);
         // Now reading a write-only register should return 0x42 (open bus).

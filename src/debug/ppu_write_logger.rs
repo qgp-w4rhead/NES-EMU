@@ -100,10 +100,7 @@ impl PpuWriteLogger {
         }
         let file = File::create(path.as_ref())?;
         let mut writer = BufWriter::new(file);
-        writeln!(
-            writer,
-            "# ppu write log — reg value scanline cycle [pc]"
-        )?;
+        writeln!(writer, "# ppu write log — reg value scanline cycle [pc]")?;
         self.path = path.as_ref().to_path_buf();
         self.writer = Some(writer);
         self.enabled = true;

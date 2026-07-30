@@ -276,6 +276,34 @@ pub struct Config {
     /// Default is `2.0` (double speed).
     #[serde(default = "default_turbo_speed")]
     pub turbo_speed: f32,
+
+    /// Whether rewind/forward creates alternate timeline branches.
+    /// When `true` (default), releasing Backspace after rewinding
+    /// creates a branch point; rewinding past a branch point pauses
+    /// and lets the user accept (O) or deny (P) the branch. When
+    /// `false`, rewind/forward is a simple linear buffer with no
+    /// branching.
+    #[serde(default = "default_rewind_branching")]
+    pub rewind_branching: bool,
+
+    /// Whether the timeline rewind feature is enabled at all. When
+    /// `true` (default), Backspace rewinds, Shift+Backspace forwards,
+    /// and a 3-2-1 countdown plays before resuming after rewind/forward
+    /// release. When `false`, Backspace/Shift+Backspace do nothing and
+    /// no rewind buffer is maintained.
+    #[serde(default = "default_timeline_enabled")]
+    pub timeline_enabled: bool,
+
+    /// Countdown delay in milliseconds before the 3-2-1 resume timer
+    /// starts after rewind/forward release. Range 0–3000 ms.
+    /// Default is 500 (0.5 seconds). 0 disables the delay entirely.
+    #[serde(default = "default_countdown_delay_ms")]
+    pub countdown_delay_ms: u32,
+
+    /// The number the countdown starts from (e.g. 3 for 3-2-1).
+    /// Range 1–10. Default is 3.
+    #[serde(default = "default_countdown_start_number")]
+    pub countdown_start_number: u32,
 }
 
 fn default_region() -> String {
@@ -296,6 +324,22 @@ fn default_rewind_capacity() -> usize {
 
 fn default_turbo_speed() -> f32 {
     crate::ui_hotkeys::TURBO_SPEEDS[crate::ui_hotkeys::DEFAULT_TURBO_SPEED_INDEX]
+}
+
+fn default_rewind_branching() -> bool {
+    true
+}
+
+fn default_timeline_enabled() -> bool {
+    true
+}
+
+fn default_countdown_delay_ms() -> u32 {
+    500
+}
+
+fn default_countdown_start_number() -> u32 {
+    3
 }
 
 impl Default for Config {
@@ -322,6 +366,10 @@ impl Default for Config {
             debug: DebugConfig::default(),
             rewind_capacity: default_rewind_capacity(),
             turbo_speed: default_turbo_speed(),
+            rewind_branching: default_rewind_branching(),
+            timeline_enabled: default_timeline_enabled(),
+            countdown_delay_ms: default_countdown_delay_ms(),
+            countdown_start_number: default_countdown_start_number(),
         }
     }
 }

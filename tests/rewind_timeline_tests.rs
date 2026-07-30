@@ -5,7 +5,7 @@
 //! that the position marker moves as expected during rewind, and
 //! that the SaveStateHotkeys overlay integration works end-to-end.
 
-use nes_emu::osd::OSD_FG_ARGB;
+use nes_emu::osd::{GLYPH_H, OSD_FG_ARGB};
 use nes_emu::rewind_timeline::{
     render_timeline, TimelineConfig, TimelineMode, BAR_H, BAR_W, BAR_X, BAR_Y, BORDER_THICKNESS,
     MAX_OPACITY, TEXT_Y, TIMELINE_BG, TIMELINE_BORDER, TIMELINE_BRANCH, TIMELINE_BRANCH_MARKER,
@@ -26,6 +26,10 @@ fn cfg(filled: usize, capacity: usize, mode: TimelineMode) -> TimelineConfig {
         speed: 1,
         forward_filled: 0,
         branches: Vec::new(),
+        active_branch: None,
+        active_filled: 0,
+        active_forward_filled: 0,
+        selected_branch: None,
     }
 }
 
@@ -147,7 +151,7 @@ fn border_drawn_around_bar() {
 }
 
 #[test]
-fn text_rendered_above_bar() {
+fn text_rendered_below_bar() {
     let mut fb = vec![0u32; (W * H) as usize];
     render_timeline(&mut fb, W, H, &cfg(100, 300, TimelineMode::Buffer));
     // Check for white text pixels in the text area (y=TEXT_Y to TEXT_Y+8).
@@ -171,11 +175,13 @@ fn background_strip_behind_bar_and_text() {
     let mut fb = vec![0x12345678u32; (W * H) as usize];
     render_timeline(&mut fb, W, H, &cfg(100, 300, TimelineMode::Buffer));
     // The background strip should overwrite original pixels.
-    let bg_top = TEXT_Y.saturating_sub(1);
+    // Bar is on top, text is below — strip covers from bar top border
+    // to text bottom.
+    let bg_top = BAR_Y.saturating_sub(BORDER_THICKNESS);
     // Check a pixel in the text area that should be background (not text).
     // The 'R' glyph row 0 is 0x7C — bit 1 (x=1) is 0 → BG pixel.
     // But to be safe, just check that some pixel in the bg strip is black.
-    let has_bg = (bg_top..BAR_Y + BAR_H + BORDER_THICKNESS)
+    let has_bg = (bg_top..TEXT_Y + GLYPH_H)
         .any(|y| (0..W).any(|x| fb[(y * W + x) as usize] == TIMELINE_BG));
     assert!(has_bg, "expected black background strip");
 }
@@ -384,6 +390,10 @@ fn forward_buffer_shown_on_timeline() {
         speed: 1,
         forward_filled: 80,
         branches: Vec::new(),
+        active_branch: None,
+        active_filled: 0,
+        active_forward_filled: 0,
+        selected_branch: None,
     };
     render_timeline(&mut fb, W, H, &c);
     // Rewind fill: 100/300 of bar width = green.
@@ -414,6 +424,10 @@ fn forward_buffer_zero_is_noop() {
         speed: 1,
         forward_filled: 0,
         branches: Vec::new(),
+        active_branch: None,
+        active_filled: 0,
+        active_forward_filled: 0,
+        selected_branch: None,
     };
     render_timeline(&mut fb, W, H, &c);
     let filled_w = (BAR_W as usize * 100 / 300) as u32;
@@ -440,24 +454,74 @@ fn branch_bars_rendered_above_main_bar() {
         speed: 1,
         forward_filled: 0,
         branches: vec![(100, 50, 20, 0), (200, 30, 0, 1)],
+        active_branch: None,
+        active_filled: 0,
+        active_forward_filled: 0,
+        selected_branch: None,
     };
     render_timeline(&mut fb, W, H, &c);
-    // Branch 0: diverge at 100, depth 0 → y = BAR_Y - 4
-    let bp0_y = BAR_Y - 4;
+    // Branch bar layout: branch_h=5, branch_gap=1, offset=(5+1)*(depth+1).
+    // Branch 0: diverge at 100, depth 0 → offset=6, by=BAR_Y-6
+    let bp0_by = BAR_Y - 6;
     let bp0_x = BAR_X + (BAR_W as usize * 100 / 300) as u32;
     let rew0_w = (BAR_W as usize * 50 / 300) as u32;
-    // Check for orange pixels in the branch bar.
-    let has_branch0 = (bp0_y..bp0_y + 3)
-        .any(|y| (bp0_x..bp0_x + rew0_w).any(|x| fb[(y * W + x) as usize] == TIMELINE_BRANCH));
+    // Check for orange pixels inside the branch bar (avoid border edges).
+    let has_branch0 = (bp0_by + 1..bp0_by + 4)
+        .any(|y| (bp0_x + 1..bp0_x + rew0_w - 1).any(|x| fb[(y * W + x) as usize] == TIMELINE_BRANCH));
     assert!(has_branch0, "expected branch 0 bar with orange fill");
-    // Branch 1: diverge at 200, depth 1 → y = BAR_Y - 8
-    let bp1_y = BAR_Y - 8;
+    // Branch 1: diverge at 200, depth 1 → offset=12, by=BAR_Y-12
+    let bp1_by = BAR_Y - 12;
     let bp1_x = BAR_X + (BAR_W as usize * 200 / 300) as u32;
     let rew1_w = (BAR_W as usize * 30 / 300) as u32;
-    let has_branch1 = (bp1_y..bp1_y + 3)
-        .any(|y| (bp1_x..bp1_x + rew1_w).any(|x| fb[(y * W + x) as usize] == TIMELINE_BRANCH));
+    let has_branch1 = (bp1_by + 1..bp1_by + 4)
+        .any(|y| (bp1_x + 1..bp1_x + rew1_w - 1).any(|x| fb[(y * W + x) as usize] == TIMELINE_BRANCH));
     assert!(has_branch1, "expected branch 1 bar with orange fill");
     // Check diverge marker (yellow) at branch 0 position.
-    let has_marker = (bp0_y..BAR_Y).any(|y| fb[(y * W + bp0_x) as usize] == TIMELINE_BRANCH_MARKER);
+    let has_marker = (bp0_by..BAR_Y).any(|y| fb[(y * W + bp0_x) as usize] == TIMELINE_BRANCH_MARKER);
     assert!(has_marker, "expected yellow diverge marker at branch 0");
+}
+
+#[test]
+fn overlapping_branches_stack_vertically() {
+    let mut fb = vec![0u32; (W * H) as usize];
+    // Two sibling branches at depth 0 that overlap in time:
+    // Branch 0: diverge at 100, extends to 100+50+20=170, stack_row 0
+    // Branch 1: diverge at 120, extends to 120+60+0=180 (overlaps with branch 0), stack_row 1
+    // The stacking algorithm in branch_render_info assigns branch 1 to
+    // stack_row 1 so it renders above branch 0.
+    let c = TimelineConfig {
+        filled: 150,
+        capacity: 300,
+        mode: TimelineMode::Rewind,
+        rewind_interval: 2,
+        opacity: MAX_OPACITY,
+        anim_frame: 0,
+        speed: 1,
+        forward_filled: 0,
+        branches: vec![(100, 50, 20, 0), (120, 60, 0, 1)],
+        active_branch: None,
+        active_filled: 0,
+        active_forward_filled: 0,
+        selected_branch: None,
+    };
+    render_timeline(&mut fb, W, H, &c);
+    // Branch bar layout: branch_h=5, branch_gap=1, offset=(5+1)*(stack_row+1).
+    // Branch 0: stack_row 0 → by = BAR_Y - 6
+    // Branch 1: stack_row 1 → by = BAR_Y - 12
+    let bp0_by = BAR_Y - 6;
+    let bp0_x = BAR_X + (BAR_W as usize * 100 / 300) as u32;
+    let rew0_w = (BAR_W as usize * 50 / 300) as u32;
+    let has_branch0 = (bp0_by + 1..bp0_by + 4)
+        .any(|y| (bp0_x + 1..bp0_x + rew0_w - 1).any(|x| fb[(y * W + x) as usize] == TIMELINE_BRANCH));
+    assert!(has_branch0, "expected branch 0 bar at stack row 0");
+
+    let bp1_by = BAR_Y - 12;
+    let bp1_x = BAR_X + (BAR_W as usize * 120 / 300) as u32;
+    let rew1_w = (BAR_W as usize * 60 / 300) as u32;
+    let has_branch1 = (bp1_by + 1..bp1_by + 4)
+        .any(|y| (bp1_x + 1..bp1_x + rew1_w - 1).any(|x| fb[(y * W + x) as usize] == TIMELINE_BRANCH));
+    assert!(has_branch1, "expected branch 1 bar at stack row 1 (stacked above branch 0)");
+
+    // Verify the two branches are on different Y levels (no overlap).
+    assert_ne!(bp0_by, bp1_by, "overlapping branches must be on different Y levels");
 }

@@ -19,7 +19,9 @@
 use sdl2::keyboard::Keycode;
 
 use crate::bus::Bus;
-use crate::debug::{CpuDebugger, MemoryViewer, PpuViewer, PpuWriteLogger, RingTraceLogger, TraceLogger};
+use crate::debug::{
+    CpuDebugger, MemoryViewer, PpuViewer, PpuWriteLogger, RingTraceLogger, TraceLogger,
+};
 
 /// Default trace log file path (under ./logs/).
 pub const DEFAULT_TRACE_LOG_PATH: &str = "logs/trace.log";
@@ -157,7 +159,10 @@ impl DebugHotkeys {
                         Ok(()) => {
                             bus.set_ppu_write_logger(logger);
                             self.ppu_write_log_active = true;
-                            eprintln!("nes-emu: PPU write logging started → {}", self.ppu_write_log_path);
+                            eprintln!(
+                                "nes-emu: PPU write logging started → {}",
+                                self.ppu_write_log_path
+                            );
                         }
                         Err(e) => eprintln!("nes-emu: could not start PPU write log: {e}"),
                     }

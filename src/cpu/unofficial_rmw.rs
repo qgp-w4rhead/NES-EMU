@@ -27,58 +27,226 @@ impl Cpu {
     pub fn execute_unofficial_rmw(&mut self, bus: &mut Bus, opcode: u8) -> u8 {
         match opcode {
             // ---- DCP (DEC then CMP) ------------------------------------
-            0xC7 => { let op = self.op_zp(bus); self.dcp(bus, op); 5 }
-            0xD7 => { let op = self.op_zp_x(bus); self.dcp(bus, op); 6 }
-            0xCF => { let op = self.op_abs(bus); self.dcp(bus, op); 6 }
-            0xDF => { let op = self.op_abs_x(bus); self.dcp(bus, op); 7 }
-            0xDB => { let op = self.op_abs_y(bus); self.dcp(bus, op); 7 }
-            0xC3 => { let op = self.op_ind_x(bus); self.dcp(bus, op); 8 }
-            0xD3 => { let op = self.op_ind_y(bus); self.dcp(bus, op); 8 }
+            0xC7 => {
+                let op = self.op_zp(bus);
+                self.dcp(bus, op);
+                5
+            }
+            0xD7 => {
+                let op = self.op_zp_x(bus);
+                self.dcp(bus, op);
+                6
+            }
+            0xCF => {
+                let op = self.op_abs(bus);
+                self.dcp(bus, op);
+                6
+            }
+            0xDF => {
+                let op = self.op_abs_x(bus);
+                self.dcp(bus, op);
+                7
+            }
+            0xDB => {
+                let op = self.op_abs_y(bus);
+                self.dcp(bus, op);
+                7
+            }
+            0xC3 => {
+                let op = self.op_ind_x(bus);
+                self.dcp(bus, op);
+                8
+            }
+            0xD3 => {
+                let op = self.op_ind_y(bus);
+                self.dcp(bus, op);
+                8
+            }
 
             // ---- ISC (INC then SBC) ------------------------------------
-            0xE7 => { let op = self.op_zp(bus); self.isc(bus, op); 5 }
-            0xF7 => { let op = self.op_zp_x(bus); self.isc(bus, op); 6 }
-            0xEF => { let op = self.op_abs(bus); self.isc(bus, op); 6 }
-            0xFF => { let op = self.op_abs_x(bus); self.isc(bus, op); 7 }
-            0xFB => { let op = self.op_abs_y(bus); self.isc(bus, op); 7 }
-            0xE3 => { let op = self.op_ind_x(bus); self.isc(bus, op); 8 }
-            0xF3 => { let op = self.op_ind_y(bus); self.isc(bus, op); 8 }
+            0xE7 => {
+                let op = self.op_zp(bus);
+                self.isc(bus, op);
+                5
+            }
+            0xF7 => {
+                let op = self.op_zp_x(bus);
+                self.isc(bus, op);
+                6
+            }
+            0xEF => {
+                let op = self.op_abs(bus);
+                self.isc(bus, op);
+                6
+            }
+            0xFF => {
+                let op = self.op_abs_x(bus);
+                self.isc(bus, op);
+                7
+            }
+            0xFB => {
+                let op = self.op_abs_y(bus);
+                self.isc(bus, op);
+                7
+            }
+            0xE3 => {
+                let op = self.op_ind_x(bus);
+                self.isc(bus, op);
+                8
+            }
+            0xF3 => {
+                let op = self.op_ind_y(bus);
+                self.isc(bus, op);
+                8
+            }
 
             // ---- SLO (ASL then ORA) ------------------------------------
-            0x07 => { let op = self.op_zp(bus); self.slo(bus, op); 5 }
-            0x17 => { let op = self.op_zp_x(bus); self.slo(bus, op); 6 }
-            0x0F => { let op = self.op_abs(bus); self.slo(bus, op); 6 }
-            0x1F => { let op = self.op_abs_x(bus); self.slo(bus, op); 7 }
-            0x1B => { let op = self.op_abs_y(bus); self.slo(bus, op); 7 }
-            0x03 => { let op = self.op_ind_x(bus); self.slo(bus, op); 8 }
-            0x13 => { let op = self.op_ind_y(bus); self.slo(bus, op); 8 }
+            0x07 => {
+                let op = self.op_zp(bus);
+                self.slo(bus, op);
+                5
+            }
+            0x17 => {
+                let op = self.op_zp_x(bus);
+                self.slo(bus, op);
+                6
+            }
+            0x0F => {
+                let op = self.op_abs(bus);
+                self.slo(bus, op);
+                6
+            }
+            0x1F => {
+                let op = self.op_abs_x(bus);
+                self.slo(bus, op);
+                7
+            }
+            0x1B => {
+                let op = self.op_abs_y(bus);
+                self.slo(bus, op);
+                7
+            }
+            0x03 => {
+                let op = self.op_ind_x(bus);
+                self.slo(bus, op);
+                8
+            }
+            0x13 => {
+                let op = self.op_ind_y(bus);
+                self.slo(bus, op);
+                8
+            }
 
             // ---- RLA (ROL then AND) ------------------------------------
-            0x27 => { let op = self.op_zp(bus); self.rla(bus, op); 5 }
-            0x37 => { let op = self.op_zp_x(bus); self.rla(bus, op); 6 }
-            0x2F => { let op = self.op_abs(bus); self.rla(bus, op); 6 }
-            0x3F => { let op = self.op_abs_x(bus); self.rla(bus, op); 7 }
-            0x3B => { let op = self.op_abs_y(bus); self.rla(bus, op); 7 }
-            0x23 => { let op = self.op_ind_x(bus); self.rla(bus, op); 8 }
-            0x33 => { let op = self.op_ind_y(bus); self.rla(bus, op); 8 }
+            0x27 => {
+                let op = self.op_zp(bus);
+                self.rla(bus, op);
+                5
+            }
+            0x37 => {
+                let op = self.op_zp_x(bus);
+                self.rla(bus, op);
+                6
+            }
+            0x2F => {
+                let op = self.op_abs(bus);
+                self.rla(bus, op);
+                6
+            }
+            0x3F => {
+                let op = self.op_abs_x(bus);
+                self.rla(bus, op);
+                7
+            }
+            0x3B => {
+                let op = self.op_abs_y(bus);
+                self.rla(bus, op);
+                7
+            }
+            0x23 => {
+                let op = self.op_ind_x(bus);
+                self.rla(bus, op);
+                8
+            }
+            0x33 => {
+                let op = self.op_ind_y(bus);
+                self.rla(bus, op);
+                8
+            }
 
             // ---- SRE (LSR then EOR) ------------------------------------
-            0x47 => { let op = self.op_zp(bus); self.sre(bus, op); 5 }
-            0x57 => { let op = self.op_zp_x(bus); self.sre(bus, op); 6 }
-            0x4F => { let op = self.op_abs(bus); self.sre(bus, op); 6 }
-            0x5F => { let op = self.op_abs_x(bus); self.sre(bus, op); 7 }
-            0x5B => { let op = self.op_abs_y(bus); self.sre(bus, op); 7 }
-            0x43 => { let op = self.op_ind_x(bus); self.sre(bus, op); 8 }
-            0x53 => { let op = self.op_ind_y(bus); self.sre(bus, op); 8 }
+            0x47 => {
+                let op = self.op_zp(bus);
+                self.sre(bus, op);
+                5
+            }
+            0x57 => {
+                let op = self.op_zp_x(bus);
+                self.sre(bus, op);
+                6
+            }
+            0x4F => {
+                let op = self.op_abs(bus);
+                self.sre(bus, op);
+                6
+            }
+            0x5F => {
+                let op = self.op_abs_x(bus);
+                self.sre(bus, op);
+                7
+            }
+            0x5B => {
+                let op = self.op_abs_y(bus);
+                self.sre(bus, op);
+                7
+            }
+            0x43 => {
+                let op = self.op_ind_x(bus);
+                self.sre(bus, op);
+                8
+            }
+            0x53 => {
+                let op = self.op_ind_y(bus);
+                self.sre(bus, op);
+                8
+            }
 
             // ---- RRA (ROR then ADC) ------------------------------------
-            0x67 => { let op = self.op_zp(bus); self.rra(bus, op); 5 }
-            0x77 => { let op = self.op_zp_x(bus); self.rra(bus, op); 6 }
-            0x6F => { let op = self.op_abs(bus); self.rra(bus, op); 6 }
-            0x7F => { let op = self.op_abs_x(bus); self.rra(bus, op); 7 }
-            0x7B => { let op = self.op_abs_y(bus); self.rra(bus, op); 7 }
-            0x63 => { let op = self.op_ind_x(bus); self.rra(bus, op); 8 }
-            0x73 => { let op = self.op_ind_y(bus); self.rra(bus, op); 8 }
+            0x67 => {
+                let op = self.op_zp(bus);
+                self.rra(bus, op);
+                5
+            }
+            0x77 => {
+                let op = self.op_zp_x(bus);
+                self.rra(bus, op);
+                6
+            }
+            0x6F => {
+                let op = self.op_abs(bus);
+                self.rra(bus, op);
+                6
+            }
+            0x7F => {
+                let op = self.op_abs_x(bus);
+                self.rra(bus, op);
+                7
+            }
+            0x7B => {
+                let op = self.op_abs_y(bus);
+                self.rra(bus, op);
+                7
+            }
+            0x63 => {
+                let op = self.op_ind_x(bus);
+                self.rra(bus, op);
+                8
+            }
+            0x73 => {
+                let op = self.op_ind_y(bus);
+                self.rra(bus, op);
+                8
+            }
 
             // ---- TAS / SHS (SP = A & X; store SP & (H+1)) --------------
             0x9B => {

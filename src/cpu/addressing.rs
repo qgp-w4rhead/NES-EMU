@@ -83,20 +83,23 @@ impl Cpu {
     /// Immediate: the operand byte follows the opcode. The effective
     /// "address" is PC itself; PC then advances past the byte. The opcode
     /// handler reads the operand from this address.
-    #[inline] fn am_immediate(&mut self) -> u16 {
+    #[inline]
+    fn am_immediate(&mut self) -> u16 {
         let addr = self.pc;
         self.pc = self.pc.wrapping_add(1);
         addr
     }
 
     /// Zero-page: the operand byte is a zero-page address (`$00..=$FF`).
-    #[inline] fn am_zero_page(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    fn am_zero_page(&mut self, bus: &mut Bus) -> u16 {
         self.fetch_byte(bus) as u16
     }
 
     /// Zero-page,X: `(operand + X) & 0xFF` — wraps within the zero page.
     /// `dummy` controls whether a dummy read fires at the unindexed base.
-    #[inline] pub(crate) fn am_zero_page_x(&mut self, bus: &mut Bus, dummy: Dummy) -> u16 {
+    #[inline]
+    pub(crate) fn am_zero_page_x(&mut self, bus: &mut Bus, dummy: Dummy) -> u16 {
         let base = self.fetch_byte(bus);
         if dummy != Dummy::None {
             let _ = bus.read(base as u16);
@@ -106,7 +109,8 @@ impl Cpu {
 
     /// Zero-page,Y: `(operand + Y) & 0xFF` — wraps within the zero page.
     /// `dummy` controls whether a dummy read fires at the unindexed base.
-    #[inline] pub(crate) fn am_zero_page_y(&mut self, bus: &mut Bus, dummy: Dummy) -> u16 {
+    #[inline]
+    pub(crate) fn am_zero_page_y(&mut self, bus: &mut Bus, dummy: Dummy) -> u16 {
         let base = self.fetch_byte(bus);
         if dummy != Dummy::None {
             let _ = bus.read(base as u16);
@@ -115,13 +119,15 @@ impl Cpu {
     }
 
     /// Absolute: the 16-bit operand is the effective address.
-    #[inline] pub(crate) fn am_absolute(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    pub(crate) fn am_absolute(&mut self, bus: &mut Bus) -> u16 {
         self.fetch_word(bus)
     }
 
     /// Absolute,X: `operand + X` (16-bit wraparound). Returns `(addr, page_cross)`.
     /// `dummy` controls dummy-read behaviour for read vs RMW/store opcodes.
-    #[inline] pub(crate) fn am_absolute_x(&mut self, bus: &mut Bus, dummy: Dummy) -> (u16, bool) {
+    #[inline]
+    pub(crate) fn am_absolute_x(&mut self, bus: &mut Bus, dummy: Dummy) -> (u16, bool) {
         let base = self.fetch_word(bus);
         let eff = base.wrapping_add(self.x as u16);
         let page_cross = (base & 0xFF00) != (eff & 0xFF00);
@@ -132,7 +138,8 @@ impl Cpu {
     }
 
     /// Absolute,Y: `operand + Y` (16-bit wraparound). Returns `(addr, page_cross)`.
-    #[inline] pub(crate) fn am_absolute_y(&mut self, bus: &mut Bus, dummy: Dummy) -> (u16, bool) {
+    #[inline]
+    pub(crate) fn am_absolute_y(&mut self, bus: &mut Bus, dummy: Dummy) -> (u16, bool) {
         let base = self.fetch_word(bus);
         let eff = base.wrapping_add(self.y as u16);
         let page_cross = (base & 0xFF00) != (eff & 0xFF00);
@@ -150,7 +157,8 @@ impl Cpu {
     /// (not `$3100`).
     ///
     /// See: https://www.nesdev.org/6502.txt — "JMP indirect" bug.
-    #[inline] pub(crate) fn am_indirect(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    pub(crate) fn am_indirect(&mut self, bus: &mut Bus) -> u16 {
         let ptr = self.fetch_word(bus);
         let lo = bus.read(ptr);
         // High byte comes from the same page (low byte wraps within it).
@@ -164,7 +172,8 @@ impl Cpu {
     /// The pointer location is `(operand + X) & 0xFF` (wraps in zero page).
     /// The 16-bit pointer is read from two consecutive zero-page addresses
     /// (the second also wraps within zero page).
-    #[inline] pub(crate) fn am_indirect_x(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    pub(crate) fn am_indirect_x(&mut self, bus: &mut Bus) -> u16 {
         let zp = self.fetch_byte(bus);
         let ptr = zp.wrapping_add(self.x);
         let lo = bus.read(ptr as u16);
@@ -173,7 +182,8 @@ impl Cpu {
     }
 
     /// Indirect,Y: `(operand),Y` — indirect indexed. Returns `(addr, page_cross)`.
-    #[inline] pub(crate) fn am_indirect_y(&mut self, bus: &mut Bus, dummy: Dummy) -> (u16, bool) {
+    #[inline]
+    pub(crate) fn am_indirect_y(&mut self, bus: &mut Bus, dummy: Dummy) -> (u16, bool) {
         let zp = self.fetch_byte(bus);
         let lo = bus.read(zp as u16);
         let hi = bus.read(zp.wrapping_add(1) as u16);
@@ -188,9 +198,9 @@ impl Cpu {
 
     /// Relative: branch target = PC (after fetching the offset byte) plus
     /// the signed offset. The offset is treated as a signed 8-bit value.
-    #[inline] pub(crate) fn am_relative(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    pub(crate) fn am_relative(&mut self, bus: &mut Bus) -> u16 {
         let offset = self.fetch_byte(bus) as i8;
         self.pc.wrapping_add(offset as u16)
     }
-
 }

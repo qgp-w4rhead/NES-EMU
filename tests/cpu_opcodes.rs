@@ -663,11 +663,43 @@ fn adc_results_identical_with_and_without_decimal_flag() {
         cpu1.set_carry(carry_in);
         cpu1.step(&mut bus1);
 
-        assert_eq!(cpu0.a, cpu1.a, "ADC result differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.carry(), cpu1.carry(), "carry differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.zero(), cpu1.zero(), "zero differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.negative(), cpu1.negative(), "negative differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.overflow(), cpu1.overflow(), "overflow differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(
+            cpu0.a, cpu1.a,
+            "ADC result differs for A={:#04X} M={:#04X} C={}",
+            a_val, m_val, carry_in
+        );
+        assert_eq!(
+            cpu0.carry(),
+            cpu1.carry(),
+            "carry differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
+        assert_eq!(
+            cpu0.zero(),
+            cpu1.zero(),
+            "zero differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
+        assert_eq!(
+            cpu0.negative(),
+            cpu1.negative(),
+            "negative differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
+        assert_eq!(
+            cpu0.overflow(),
+            cpu1.overflow(),
+            "overflow differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
     }
 }
 
@@ -701,11 +733,43 @@ fn sbc_results_identical_with_and_without_decimal_flag() {
         cpu1.set_carry(carry_in);
         cpu1.step(&mut bus1);
 
-        assert_eq!(cpu0.a, cpu1.a, "SBC result differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.carry(), cpu1.carry(), "carry differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.zero(), cpu1.zero(), "zero differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.negative(), cpu1.negative(), "negative differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
-        assert_eq!(cpu0.overflow(), cpu1.overflow(), "overflow differs for A={:#04X} M={:#04X} C={}", a_val, m_val, carry_in);
+        assert_eq!(
+            cpu0.a, cpu1.a,
+            "SBC result differs for A={:#04X} M={:#04X} C={}",
+            a_val, m_val, carry_in
+        );
+        assert_eq!(
+            cpu0.carry(),
+            cpu1.carry(),
+            "carry differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
+        assert_eq!(
+            cpu0.zero(),
+            cpu1.zero(),
+            "zero differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
+        assert_eq!(
+            cpu0.negative(),
+            cpu1.negative(),
+            "negative differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
+        assert_eq!(
+            cpu0.overflow(),
+            cpu1.overflow(),
+            "overflow differs for A={:#04X} M={:#04X} C={}",
+            a_val,
+            m_val,
+            carry_in
+        );
     }
 }
 

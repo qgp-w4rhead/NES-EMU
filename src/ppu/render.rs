@@ -112,7 +112,6 @@ pub(super) struct RenderPipeline {
     //
     // This means a mid-scanline CHR bank switch affects pixels 2 cycles
     // later than the renderer would otherwise predict.
-
     /// Ring buffer holding (pattern, pal_select) for the 2 most recent
     /// prefetches. `fetch_idx` points to the slot to read/output next;
     /// the other slot holds the newer prefetch.
@@ -382,7 +381,8 @@ impl Ppu {
     /// The universal background color (palette entry `$3F00`) as ARGB.
     /// Used to fill the framebuffer when background rendering is disabled
     /// or when the left 8 pixels are masked.
-    #[inline] pub fn universal_bg_argb(&self) -> u32 {
+    #[inline]
+    pub fn universal_bg_argb(&self) -> u32 {
         self.color_to_argb(self.read_palette(PAL_BASE))
     }
 
@@ -391,7 +391,8 @@ impl Ppu {
     /// [`PAL_PALETTE`]. When `use_inaccurate_palette` is set, the old
     /// inaccurate NTSC palette ([`NES_PALETTE_INACCURATE`]) is used instead
     /// for NTSC/Dendy, reproducing the yellow-pipes color bug.
-    #[inline] fn color_to_argb(&self, index: u8) -> u32 {
+    #[inline]
+    fn color_to_argb(&self, index: u8) -> u32 {
         let idx = (index & 0x3F) as usize;
         let [r, g, b] = if self.region.is_pal_palette() {
             PAL_PALETTE[idx]
@@ -599,11 +600,7 @@ impl Ppu {
                 let col_idx = row_base + px as usize;
                 let bg_opaque = self.bg_pattern[px as usize] != 0;
 
-                if !*sprite_zero_hit_set
-                    && oam_i == 0
-                    && px < SPRITE_ZERO_HIT_MAX_X
-                    && bg_opaque
-                {
+                if !*sprite_zero_hit_set && oam_i == 0 && px < SPRITE_ZERO_HIT_MAX_X && bg_opaque {
                     self.set_sprite_zero_hit(true);
                     *sprite_zero_hit_set = true;
                 }
@@ -763,7 +760,8 @@ impl Ppu {
     }
 
     /// Compute effective horizontal render position for pixel `px`.
-    #[inline] fn effective_render_x(&self, px: usize) -> (u16, u16, u8) {
+    #[inline]
+    fn effective_render_x(&self, px: usize) -> (u16, u16, u8) {
         let mut coarse_x = self.render.coarse_x_start;
         let mut nt_h = self.render.nt_h_start;
         let fine_x_start = self.render.fine_x_start as u16;

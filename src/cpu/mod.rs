@@ -12,8 +12,8 @@ pub mod unofficial;
 pub mod unofficial_rmw;
 pub mod unofficial_special;
 
-pub use addressing::{AddrMode, Operand};
 pub(crate) use addressing::Dummy;
+pub use addressing::{AddrMode, Operand};
 
 /// Status flag bit masks for the P register.
 ///
@@ -85,56 +85,69 @@ impl Cpu {
     // ---- flag helpers -------------------------------------------------
 
     /// Get the carry flag (bit 0).
-    #[inline] pub fn carry(&self) -> bool {
+    #[inline]
+    pub fn carry(&self) -> bool {
         (self.status & flags::C) != 0
     }
     /// Set or clear the carry flag.
-    #[inline] pub fn set_carry(&mut self, v: bool) {
+    #[inline]
+    pub fn set_carry(&mut self, v: bool) {
         self.set_flag(flags::C, v);
     }
     /// Get the zero flag (bit 1).
-    #[inline] pub fn zero(&self) -> bool {
+    #[inline]
+    pub fn zero(&self) -> bool {
         (self.status & flags::Z) != 0
     }
     /// Set or clear the zero flag.
-    #[inline] pub fn set_zero(&mut self, v: bool) {
+    #[inline]
+    pub fn set_zero(&mut self, v: bool) {
         self.set_flag(flags::Z, v);
     }
     /// Get the interrupt-disable flag (bit 2).
-    #[inline] pub fn interrupt_disable(&self) -> bool {
+    #[inline]
+    pub fn interrupt_disable(&self) -> bool {
         (self.status & flags::I) != 0
     }
     /// Set or clear the interrupt-disable flag.
-    #[inline] pub fn set_interrupt_disable(&mut self, v: bool) {
+    #[inline]
+    pub fn set_interrupt_disable(&mut self, v: bool) {
         self.set_flag(flags::I, v);
     }
     /// Get the decimal flag (bit 3 — no effect on the NES).
-    #[inline] pub fn decimal(&self) -> bool {
+    #[inline]
+    pub fn decimal(&self) -> bool {
         (self.status & flags::D) != 0
     }
     /// Set or clear the decimal flag.
-    #[inline] pub fn set_decimal(&mut self, v: bool) {
+    #[inline]
+    pub fn set_decimal(&mut self, v: bool) {
         self.set_flag(flags::D, v);
     }
     /// Get the overflow flag (bit 6).
-    #[inline] pub fn overflow(&self) -> bool {
+    #[inline]
+    pub fn overflow(&self) -> bool {
         (self.status & flags::V) != 0
     }
     /// Set or clear the overflow flag.
-    #[inline] pub fn set_overflow(&mut self, v: bool) {
+    #[inline]
+    pub fn set_overflow(&mut self, v: bool) {
         self.set_flag(flags::V, v);
     }
     /// Get the negative flag (bit 7).
-    #[inline] pub fn negative(&self) -> bool {
+    #[inline]
+    pub fn negative(&self) -> bool {
         (self.status & flags::N) != 0
     }
     /// Set or clear the negative flag.
-    #[inline] pub fn set_negative(&mut self, v: bool) {
+    #[inline]
+    pub fn set_negative(&mut self, v: bool) {
         self.set_flag(flags::N, v);
     }
 
     /// Set or clear a flag bit.
-    #[inline] pub(crate) fn set_flag(&mut self, flag: u8, v: bool) {
+    #[inline]
+    pub(crate) fn set_flag(&mut self, flag: u8, v: bool) {
         if v {
             self.status |= flag;
         } else {
@@ -146,7 +159,8 @@ impl Cpu {
     ///
     /// Used by loads, arithmetic, and logic instructions: N mirrors bit 7
     /// of the result, Z is set when the result is zero.
-    #[inline] pub fn set_nz(&mut self, value: u8) {
+    #[inline]
+    pub fn set_nz(&mut self, value: u8) {
         self.set_zero(value == 0);
         self.set_negative((value & 0x80) != 0);
     }
@@ -154,14 +168,16 @@ impl Cpu {
     // ---- operand fetch ------------------------------------------------
 
     /// Read a byte at PC and advance PC by one.
-    #[inline] pub(crate) fn fetch_byte(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn fetch_byte(&mut self, bus: &mut Bus) -> u8 {
         let b = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
         b
     }
 
     /// Read a little-endian 16-bit word at PC and advance PC by two.
-    #[inline] pub(crate) fn fetch_word(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    pub(crate) fn fetch_word(&mut self, bus: &mut Bus) -> u16 {
         let lo = self.fetch_byte(bus) as u16;
         let hi = self.fetch_byte(bus) as u16;
         lo | (hi << 8)
@@ -170,27 +186,31 @@ impl Cpu {
     // ---- stack access -------------------------------------------------
 
     /// Push a byte onto the stack (decrements SP, writes at `$0100+SP`).
-    #[inline] pub(crate) fn push(&mut self, bus: &mut Bus, value: u8) {
+    #[inline]
+    pub(crate) fn push(&mut self, bus: &mut Bus, value: u8) {
         let addr = 0x0100 | self.sp as u16;
         bus.write(addr, value);
         self.sp = self.sp.wrapping_sub(1);
     }
 
     /// Pull a byte from the stack (increments SP, reads at `$0100+SP`).
-    #[inline] pub(crate) fn pull(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn pull(&mut self, bus: &mut Bus) -> u8 {
         self.sp = self.sp.wrapping_add(1);
         let addr = 0x0100 | self.sp as u16;
         bus.read(addr)
     }
 
     /// Push the program counter (high byte first, then low).
-    #[inline] pub(crate) fn push_pc(&mut self, bus: &mut Bus, pc: u16) {
+    #[inline]
+    pub(crate) fn push_pc(&mut self, bus: &mut Bus, pc: u16) {
         self.push(bus, (pc >> 8) as u8);
         self.push(bus, (pc & 0xFF) as u8);
     }
 
     /// Pull a 16-bit program counter (low byte first, then high).
-    #[inline] pub(crate) fn pull_pc(&mut self, bus: &mut Bus) -> u16 {
+    #[inline]
+    pub(crate) fn pull_pc(&mut self, bus: &mut Bus) -> u16 {
         let lo = self.pull(bus) as u16;
         let hi = self.pull(bus) as u16;
         lo | (hi << 8)
@@ -199,7 +219,8 @@ impl Cpu {
     /// Push the status register to the stack. The pushed copy has the B and
     /// U bits set per the 6502 convention; `with_break` controls the B bit
     /// (set for BRK/PHP, clear for NMI/IRQ/RTI pushes from hardware).
-    #[inline] pub(crate) fn push_status(&mut self, bus: &mut Bus, with_break: bool) {
+    #[inline]
+    pub(crate) fn push_status(&mut self, bus: &mut Bus, with_break: bool) {
         let mut p = self.status | flags::U;
         if with_break {
             p |= flags::B;
@@ -211,7 +232,8 @@ impl Cpu {
 
     /// Pull the status register from the stack. The B bit is discarded (it
     /// is always re-read as 0 from a pull; only the U bit is forced to 1).
-    #[inline] pub(crate) fn pull_status(&mut self, bus: &mut Bus) {
+    #[inline]
+    pub(crate) fn pull_status(&mut self, bus: &mut Bus) {
         let p = self.pull(bus);
         self.status = (p & !flags::B) | flags::U;
     }
@@ -219,7 +241,8 @@ impl Cpu {
     // ---- operand read/write helpers ----------------------------------
 
     /// Read the operand value for an addressing result.
-    #[inline] pub(crate) fn read_operand(&self, bus: &mut Bus, op: Operand) -> u8 {
+    #[inline]
+    pub(crate) fn read_operand(&self, bus: &mut Bus, op: Operand) -> u8 {
         match op {
             Operand::None => 0,
             Operand::Accumulator => self.a,
@@ -228,7 +251,8 @@ impl Cpu {
     }
 
     /// Write a value to the operand location.
-    #[inline] pub(crate) fn write_operand(&mut self, bus: &mut Bus, op: Operand, value: u8) {
+    #[inline]
+    pub(crate) fn write_operand(&mut self, bus: &mut Bus, op: Operand, value: u8) {
         match op {
             Operand::None => {}
             Operand::Accumulator => self.a = value,
@@ -281,7 +305,11 @@ impl Cpu {
     /// Set or clear the halted flag. Used by KIL opcodes and by external
     /// reset logic to revive a jammed CPU.
     pub fn set_halted(&mut self, v: bool) {
-        if v { self.flags |= HALTED; } else { self.flags &= !HALTED; }
+        if v {
+            self.flags |= HALTED;
+        } else {
+            self.flags &= !HALTED;
+        }
     }
 
     /// Whether an NMI is pending.
@@ -291,7 +319,11 @@ impl Cpu {
 
     /// Set or clear the pending NMI flag.
     pub fn set_nmi_pending(&mut self, v: bool) {
-        if v { self.flags |= NMI_PENDING; } else { self.flags &= !NMI_PENDING; }
+        if v {
+            self.flags |= NMI_PENDING;
+        } else {
+            self.flags &= !NMI_PENDING;
+        }
     }
 
     /// Whether an IRQ is pending.
@@ -301,7 +333,11 @@ impl Cpu {
 
     /// Set or clear the pending IRQ flag.
     pub fn set_irq_pending(&mut self, v: bool) {
-        if v { self.flags |= IRQ_PENDING; } else { self.flags &= !IRQ_PENDING; }
+        if v {
+            self.flags |= IRQ_PENDING;
+        } else {
+            self.flags &= !IRQ_PENDING;
+        }
     }
 }
 

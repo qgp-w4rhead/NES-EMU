@@ -252,7 +252,8 @@ impl EmulatorState {
 
         loop {
             let prev_scanline = self.bus.ppu().scanline();
-            let (tick_cycles, frame_done) = self.step_one_cpu_tick(prev_scanline, cycles_per_sample, prerender);
+            let (tick_cycles, frame_done) =
+                self.step_one_cpu_tick(prev_scanline, cycles_per_sample, prerender);
             cpu_cycles += tick_cycles;
             if frame_done {
                 break;
@@ -283,7 +284,12 @@ impl EmulatorState {
     ///
     /// `prev_scanline` is the PPU scanline observed *before* this tick's
     /// CPU step; it is used to detect the 261→0 frame-boundary wrap.
-    fn step_one_cpu_tick(&mut self, prev_scanline: u16, cycles_per_sample: f32, prerender: u16) -> (u32, bool) {
+    fn step_one_cpu_tick(
+        &mut self,
+        prev_scanline: u16,
+        cycles_per_sample: f32,
+        prerender: u16,
+    ) -> (u32, bool) {
         let mut cpu_cycles: u32 = 0;
 
         let step_cycles = self.cpu.step(&mut self.bus) as u32;
@@ -358,7 +364,8 @@ impl EmulatorState {
         let prev_scanline = self.bus.ppu().scanline();
         let cycles_per_sample = self.region.cpu_cycles_per_sample();
         let prerender = self.region.scanline_prerender();
-        let (cycles, _frame_done) = self.step_one_cpu_tick(prev_scanline, cycles_per_sample, prerender);
+        let (cycles, _frame_done) =
+            self.step_one_cpu_tick(prev_scanline, cycles_per_sample, prerender);
         cycles
     }
 
@@ -464,7 +471,8 @@ impl EmulatorState {
             let pre_cpu = self.cpu.clone();
 
             let prev_scanline = self.bus.ppu().scanline();
-            let (tick_cycles, frame_done) = self.step_one_cpu_tick(prev_scanline, cycles_per_sample, prerender);
+            let (tick_cycles, frame_done) =
+                self.step_one_cpu_tick(prev_scanline, cycles_per_sample, prerender);
             cpu_cycles += tick_cycles;
 
             step(&pre_cpu, &self.bus, tick_cycles);
@@ -605,7 +613,7 @@ mod tests {
 
         // --- RESET handler at $C000 ---
         let reset = 0x0000; // offset in PRG (= $C000 in CPU space)
-        // SEI
+                            // SEI
         prg[reset] = 0x78;
         // LDA #$80
         prg[reset + 1] = 0xA9;
@@ -638,74 +646,117 @@ mod tests {
         let mut p = nmi;
 
         // PHA
-        prg[p] = 0x48; p += 1;
+        prg[p] = 0x48;
+        p += 1;
         // TXA; PHA
-        prg[p] = 0x8A; p += 1;
-        prg[p] = 0x48; p += 1;
+        prg[p] = 0x8A;
+        p += 1;
+        prg[p] = 0x48;
+        p += 1;
         // TYA; PHA
-        prg[p] = 0x98; p += 1;
-        prg[p] = 0x48; p += 1;
+        prg[p] = 0x98;
+        p += 1;
+        prg[p] = 0x48;
+        p += 1;
 
         // Set PPUADDR to $2000 (nametable 0 start).
         // LDA #$20
-        prg[p] = 0xA9; p += 1;
-        prg[p] = 0x20; p += 1;
+        prg[p] = 0xA9;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
         // STA $2006
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x06; p += 1;
-        prg[p] = 0x20; p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x06;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
         // LDA #$00
-        prg[p] = 0xA9; p += 1;
-        prg[p] = 0x00; p += 1;
+        prg[p] = 0xA9;
+        p += 1;
+        prg[p] = 0x00;
+        p += 1;
         // STA $2006
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x06; p += 1;
-        prg[p] = 0x20; p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x06;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
 
         // LDA #$24  (tile to fill)
-        prg[p] = 0xA9; p += 1;
-        prg[p] = 0x24; p += 1;
+        prg[p] = 0xA9;
+        p += 1;
+        prg[p] = 0x24;
+        p += 1;
 
         // Write 960 bytes to PPUDATA in a tight loop.
         // LDX #$C0  (192 iterations × 5 bytes per unrolled block = 960)
-        prg[p] = 0xA2; p += 1;
-        prg[p] = 0xC0; p += 1;
+        prg[p] = 0xA2;
+        p += 1;
+        prg[p] = 0xC0;
+        p += 1;
 
         // Loop label:
         let loop_start = p;
         // STA $2007  (4 cycles each)
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x07; p += 1;
-        prg[p] = 0x20; p += 1;
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x07; p += 1;
-        prg[p] = 0x20; p += 1;
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x07; p += 1;
-        prg[p] = 0x20; p += 1;
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x07; p += 1;
-        prg[p] = 0x20; p += 1;
-        prg[p] = 0x8D; p += 1;
-        prg[p] = 0x07; p += 1;
-        prg[p] = 0x20; p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x07;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x07;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x07;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x07;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
+        prg[p] = 0x8D;
+        p += 1;
+        prg[p] = 0x07;
+        p += 1;
+        prg[p] = 0x20;
+        p += 1;
         // DEX
-        prg[p] = 0xCA; p += 1;
+        prg[p] = 0xCA;
+        p += 1;
         // BNE loop_start
-        prg[p] = 0xD0; p += 1;
+        prg[p] = 0xD0;
+        p += 1;
         let rel = (loop_start as i32) - (p as i32 + 1) as i32;
-        prg[p] = rel as u8; p += 1;
+        prg[p] = rel as u8;
+        p += 1;
 
         // PLA; TAY
-        prg[p] = 0x68; p += 1;
-        prg[p] = 0xA8; p += 1;
+        prg[p] = 0x68;
+        p += 1;
+        prg[p] = 0xA8;
+        p += 1;
         // PLA; TAX
-        prg[p] = 0x68; p += 1;
-        prg[p] = 0xAA; p += 1;
+        prg[p] = 0x68;
+        p += 1;
+        prg[p] = 0xAA;
+        p += 1;
         // PLA
-        prg[p] = 0x68; p += 1;
+        prg[p] = 0x68;
+        p += 1;
         // RTI
-        prg[p] = 0x40; p += 1;
+        prg[p] = 0x40;
+        p += 1;
 
         // --- Vectors ---
         // NMI vector at $FFFA → $C100

@@ -81,38 +81,102 @@ impl Cpu {
             }
 
             // ---- LAX (load A and X) ------------------------------------
-            0xA7 => { let v = self.rd_zp(bus); self.lax(v); 3 }
-            0xB7 => { let v = self.rd_zp_y(bus); self.lax(v); 4 }
-            0xAF => { let v = self.rd_abs(bus); self.lax(v); 4 }
-            0xBF => { let (v, pc) = self.rd_abs_y(bus); self.lax(v); 4 + u8::from(pc) }
-            0xA3 => { let v = self.rd_ind_x(bus); self.lax(v); 6 }
-            0xB3 => { let (v, pc) = self.rd_ind_y(bus); self.lax(v); 5 + u8::from(pc) }
+            0xA7 => {
+                let v = self.rd_zp(bus);
+                self.lax(v);
+                3
+            }
+            0xB7 => {
+                let v = self.rd_zp_y(bus);
+                self.lax(v);
+                4
+            }
+            0xAF => {
+                let v = self.rd_abs(bus);
+                self.lax(v);
+                4
+            }
+            0xBF => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.lax(v);
+                4 + u8::from(pc)
+            }
+            0xA3 => {
+                let v = self.rd_ind_x(bus);
+                self.lax(v);
+                6
+            }
+            0xB3 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.lax(v);
+                5 + u8::from(pc)
+            }
 
             // ---- SAX (store A & X) -------------------------------------
-            0x87 => { self.wr_zp(bus, self.a & self.x); 3 }
-            0x97 => { self.wr_zp_y(bus, self.a & self.x); 4 }
-            0x8F => { self.wr_abs(bus, self.a & self.x); 4 }
-            0x83 => { self.wr_ind_x(bus, self.a & self.x); 6 }
+            0x87 => {
+                self.wr_zp(bus, self.a & self.x);
+                3
+            }
+            0x97 => {
+                self.wr_zp_y(bus, self.a & self.x);
+                4
+            }
+            0x8F => {
+                self.wr_abs(bus, self.a & self.x);
+                4
+            }
+            0x83 => {
+                self.wr_ind_x(bus, self.a & self.x);
+                6
+            }
 
             // ---- ANC (AND then copy N to C) ----------------------------
             // 0x0B and 0x2B are both ANC. A = A & imm; C = N = bit 7 of A.
-            0x0B | 0x2B => { let v = self.rd_imm(bus); self.anc(v); 2 }
+            0x0B | 0x2B => {
+                let v = self.rd_imm(bus);
+                self.anc(v);
+                2
+            }
 
             // ---- ALR (AND then LSR) ------------------------------------
             // A = (A & imm) >> 1; C = old bit 0 of (A & imm).
-            0x4B => { let v = self.rd_imm(bus); self.alr(v); 2 }
+            0x4B => {
+                let v = self.rd_imm(bus);
+                self.alr(v);
+                2
+            }
 
             // ---- ARR (AND then ROR, special V/C) -----------------------
-            0x6B => { let v = self.rd_imm(bus); self.arr(v); 2 }
+            0x6B => {
+                let v = self.rd_imm(bus);
+                self.arr(v);
+                2
+            }
 
             // ---- AXS / SBX (subtract imm from A&X, store in X) ---------
-            0xCB => { let v = self.rd_imm(bus); self.axs(v); 2 }
+            0xCB => {
+                let v = self.rd_imm(bus);
+                self.axs(v);
+                2
+            }
 
             // ---- XAA (unstable: A = (A | magic) & X & imm) -------------
-            0x8B => { let v = self.rd_imm(bus); self.xaa(v); 2 }
+            0x8B => {
+                let v = self.rd_imm(bus);
+                self.xaa(v);
+                2
+            }
 
             // ---- LAS / LAR (A = X = SP = M & SP) -----------------------
-            0xBB => { let (v, pc) = self.rd_abs_y(bus); let r = v & self.sp; self.a = r; self.x = r; self.sp = r; self.set_nz(r); 4 + u8::from(pc) }
+            0xBB => {
+                let (v, pc) = self.rd_abs_y(bus);
+                let r = v & self.sp;
+                self.a = r;
+                self.x = r;
+                self.sp = r;
+                self.set_nz(r);
+                4 + u8::from(pc)
+            }
 
             // ---- KIL / JAM / HLT (halt the CPU) ------------------------
             // 0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2,

@@ -50,47 +50,158 @@ impl Cpu {
     pub fn execute(&mut self, bus: &mut Bus, opcode: u8) -> u8 {
         match opcode {
             // ---- LDA ----------------------------------------------------
-            0xA9 => { let v = self.rd_imm(bus); self.lda(v); 2 }
-            0xA5 => { let v = self.rd_zp(bus); self.lda(v); 3 }
-            0xB5 => { let v = self.rd_zp_x(bus); self.lda(v); 4 }
-            0xAD => { let v = self.rd_abs(bus); self.lda(v); 4 }
-            0xBD => { let (v, pc) = self.rd_abs_x(bus); self.lda(v); 4 + u8::from(pc) }
-            0xB9 => { let (v, pc) = self.rd_abs_y(bus); self.lda(v); 4 + u8::from(pc) }
-            0xA1 => { let v = self.rd_ind_x(bus); self.lda(v); 6 }
-            0xB1 => { let (v, pc) = self.rd_ind_y(bus); self.lda(v); 5 + u8::from(pc) }
+            0xA9 => {
+                let v = self.rd_imm(bus);
+                self.lda(v);
+                2
+            }
+            0xA5 => {
+                let v = self.rd_zp(bus);
+                self.lda(v);
+                3
+            }
+            0xB5 => {
+                let v = self.rd_zp_x(bus);
+                self.lda(v);
+                4
+            }
+            0xAD => {
+                let v = self.rd_abs(bus);
+                self.lda(v);
+                4
+            }
+            0xBD => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.lda(v);
+                4 + u8::from(pc)
+            }
+            0xB9 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.lda(v);
+                4 + u8::from(pc)
+            }
+            0xA1 => {
+                let v = self.rd_ind_x(bus);
+                self.lda(v);
+                6
+            }
+            0xB1 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.lda(v);
+                5 + u8::from(pc)
+            }
 
             // ---- LDX ----------------------------------------------------
-            0xA2 => { let v = self.rd_imm(bus); self.ldx(v); 2 }
-            0xA6 => { let v = self.rd_zp(bus); self.ldx(v); 3 }
-            0xB6 => { let v = self.rd_zp_y(bus); self.ldx(v); 4 }
-            0xAE => { let v = self.rd_abs(bus); self.ldx(v); 4 }
-            0xBE => { let (v, pc) = self.rd_abs_y(bus); self.ldx(v); 4 + u8::from(pc) }
+            0xA2 => {
+                let v = self.rd_imm(bus);
+                self.ldx(v);
+                2
+            }
+            0xA6 => {
+                let v = self.rd_zp(bus);
+                self.ldx(v);
+                3
+            }
+            0xB6 => {
+                let v = self.rd_zp_y(bus);
+                self.ldx(v);
+                4
+            }
+            0xAE => {
+                let v = self.rd_abs(bus);
+                self.ldx(v);
+                4
+            }
+            0xBE => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.ldx(v);
+                4 + u8::from(pc)
+            }
 
             // ---- LDY ----------------------------------------------------
-            0xA0 => { let v = self.rd_imm(bus); self.ldy(v); 2 }
-            0xA4 => { let v = self.rd_zp(bus); self.ldy(v); 3 }
-            0xB4 => { let v = self.rd_zp_x(bus); self.ldy(v); 4 }
-            0xAC => { let v = self.rd_abs(bus); self.ldy(v); 4 }
-            0xBC => { let (v, pc) = self.rd_abs_x(bus); self.ldy(v); 4 + u8::from(pc) }
+            0xA0 => {
+                let v = self.rd_imm(bus);
+                self.ldy(v);
+                2
+            }
+            0xA4 => {
+                let v = self.rd_zp(bus);
+                self.ldy(v);
+                3
+            }
+            0xB4 => {
+                let v = self.rd_zp_x(bus);
+                self.ldy(v);
+                4
+            }
+            0xAC => {
+                let v = self.rd_abs(bus);
+                self.ldy(v);
+                4
+            }
+            0xBC => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.ldy(v);
+                4 + u8::from(pc)
+            }
 
             // ---- STA ----------------------------------------------------
-            0x85 => { self.wr_zp(bus, self.a); 3 }
-            0x95 => { self.wr_zp_x(bus, self.a); 4 }
-            0x8D => { self.wr_abs(bus, self.a); 4 }
-            0x9D => { self.wr_abs_x(bus, self.a); 5 }
-            0x99 => { self.wr_abs_y(bus, self.a); 5 }
-            0x81 => { self.wr_ind_x(bus, self.a); 6 }
-            0x91 => { self.wr_ind_y(bus, self.a); 6 }
+            0x85 => {
+                self.wr_zp(bus, self.a);
+                3
+            }
+            0x95 => {
+                self.wr_zp_x(bus, self.a);
+                4
+            }
+            0x8D => {
+                self.wr_abs(bus, self.a);
+                4
+            }
+            0x9D => {
+                self.wr_abs_x(bus, self.a);
+                5
+            }
+            0x99 => {
+                self.wr_abs_y(bus, self.a);
+                5
+            }
+            0x81 => {
+                self.wr_ind_x(bus, self.a);
+                6
+            }
+            0x91 => {
+                self.wr_ind_y(bus, self.a);
+                6
+            }
 
             // ---- STX ----------------------------------------------------
-            0x86 => { self.wr_zp(bus, self.x); 3 }
-            0x96 => { self.wr_zp_y(bus, self.x); 4 }
-            0x8E => { self.wr_abs(bus, self.x); 4 }
+            0x86 => {
+                self.wr_zp(bus, self.x);
+                3
+            }
+            0x96 => {
+                self.wr_zp_y(bus, self.x);
+                4
+            }
+            0x8E => {
+                self.wr_abs(bus, self.x);
+                4
+            }
 
             // ---- STY ----------------------------------------------------
-            0x84 => { self.wr_zp(bus, self.y); 3 }
-            0x94 => { self.wr_zp_x(bus, self.y); 4 }
-            0x8C => { self.wr_abs(bus, self.y); 4 }
+            0x84 => {
+                self.wr_zp(bus, self.y);
+                3
+            }
+            0x94 => {
+                self.wr_zp_x(bus, self.y);
+                4
+            }
+            0x8C => {
+                self.wr_abs(bus, self.y);
+                4
+            }
 
             // ---- register transfers ------------------------------------
             0xAA => {
@@ -138,86 +249,334 @@ impl Cpu {
             } // PLP
 
             // ---- logic --------------------------------------------------
-            0x29 => { let v = self.rd_imm(bus); self.and(v); 2 }
-            0x25 => { let v = self.rd_zp(bus); self.and(v); 3 }
-            0x35 => { let v = self.rd_zp_x(bus); self.and(v); 4 }
-            0x2D => { let v = self.rd_abs(bus); self.and(v); 4 }
-            0x3D => { let (v, pc) = self.rd_abs_x(bus); self.and(v); 4 + u8::from(pc) }
-            0x39 => { let (v, pc) = self.rd_abs_y(bus); self.and(v); 4 + u8::from(pc) }
-            0x21 => { let v = self.rd_ind_x(bus); self.and(v); 6 }
-            0x31 => { let (v, pc) = self.rd_ind_y(bus); self.and(v); 5 + u8::from(pc) }
+            0x29 => {
+                let v = self.rd_imm(bus);
+                self.and(v);
+                2
+            }
+            0x25 => {
+                let v = self.rd_zp(bus);
+                self.and(v);
+                3
+            }
+            0x35 => {
+                let v = self.rd_zp_x(bus);
+                self.and(v);
+                4
+            }
+            0x2D => {
+                let v = self.rd_abs(bus);
+                self.and(v);
+                4
+            }
+            0x3D => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.and(v);
+                4 + u8::from(pc)
+            }
+            0x39 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.and(v);
+                4 + u8::from(pc)
+            }
+            0x21 => {
+                let v = self.rd_ind_x(bus);
+                self.and(v);
+                6
+            }
+            0x31 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.and(v);
+                5 + u8::from(pc)
+            }
 
-            0x09 => { let v = self.rd_imm(bus); self.ora(v); 2 }
-            0x05 => { let v = self.rd_zp(bus); self.ora(v); 3 }
-            0x15 => { let v = self.rd_zp_x(bus); self.ora(v); 4 }
-            0x0D => { let v = self.rd_abs(bus); self.ora(v); 4 }
-            0x1D => { let (v, pc) = self.rd_abs_x(bus); self.ora(v); 4 + u8::from(pc) }
-            0x19 => { let (v, pc) = self.rd_abs_y(bus); self.ora(v); 4 + u8::from(pc) }
-            0x01 => { let v = self.rd_ind_x(bus); self.ora(v); 6 }
-            0x11 => { let (v, pc) = self.rd_ind_y(bus); self.ora(v); 5 + u8::from(pc) }
+            0x09 => {
+                let v = self.rd_imm(bus);
+                self.ora(v);
+                2
+            }
+            0x05 => {
+                let v = self.rd_zp(bus);
+                self.ora(v);
+                3
+            }
+            0x15 => {
+                let v = self.rd_zp_x(bus);
+                self.ora(v);
+                4
+            }
+            0x0D => {
+                let v = self.rd_abs(bus);
+                self.ora(v);
+                4
+            }
+            0x1D => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.ora(v);
+                4 + u8::from(pc)
+            }
+            0x19 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.ora(v);
+                4 + u8::from(pc)
+            }
+            0x01 => {
+                let v = self.rd_ind_x(bus);
+                self.ora(v);
+                6
+            }
+            0x11 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.ora(v);
+                5 + u8::from(pc)
+            }
 
-            0x49 => { let v = self.rd_imm(bus); self.eor(v); 2 }
-            0x45 => { let v = self.rd_zp(bus); self.eor(v); 3 }
-            0x55 => { let v = self.rd_zp_x(bus); self.eor(v); 4 }
-            0x4D => { let v = self.rd_abs(bus); self.eor(v); 4 }
-            0x5D => { let (v, pc) = self.rd_abs_x(bus); self.eor(v); 4 + u8::from(pc) }
-            0x59 => { let (v, pc) = self.rd_abs_y(bus); self.eor(v); 4 + u8::from(pc) }
-            0x41 => { let v = self.rd_ind_x(bus); self.eor(v); 6 }
-            0x51 => { let (v, pc) = self.rd_ind_y(bus); self.eor(v); 5 + u8::from(pc) }
+            0x49 => {
+                let v = self.rd_imm(bus);
+                self.eor(v);
+                2
+            }
+            0x45 => {
+                let v = self.rd_zp(bus);
+                self.eor(v);
+                3
+            }
+            0x55 => {
+                let v = self.rd_zp_x(bus);
+                self.eor(v);
+                4
+            }
+            0x4D => {
+                let v = self.rd_abs(bus);
+                self.eor(v);
+                4
+            }
+            0x5D => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.eor(v);
+                4 + u8::from(pc)
+            }
+            0x59 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.eor(v);
+                4 + u8::from(pc)
+            }
+            0x41 => {
+                let v = self.rd_ind_x(bus);
+                self.eor(v);
+                6
+            }
+            0x51 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.eor(v);
+                5 + u8::from(pc)
+            }
 
             // ---- BIT ----------------------------------------------------
-            0x24 => { let v = self.rd_zp(bus); self.bit(v); 3 }
-            0x2C => { let v = self.rd_abs(bus); self.bit(v); 4 }
+            0x24 => {
+                let v = self.rd_zp(bus);
+                self.bit(v);
+                3
+            }
+            0x2C => {
+                let v = self.rd_abs(bus);
+                self.bit(v);
+                4
+            }
 
             // ---- ADC ----------------------------------------------------
-            0x69 => { let v = self.rd_imm(bus); self.adc(v); 2 }
-            0x65 => { let v = self.rd_zp(bus); self.adc(v); 3 }
-            0x75 => { let v = self.rd_zp_x(bus); self.adc(v); 4 }
-            0x6D => { let v = self.rd_abs(bus); self.adc(v); 4 }
-            0x7D => { let (v, pc) = self.rd_abs_x(bus); self.adc(v); 4 + u8::from(pc) }
-            0x79 => { let (v, pc) = self.rd_abs_y(bus); self.adc(v); 4 + u8::from(pc) }
-            0x61 => { let v = self.rd_ind_x(bus); self.adc(v); 6 }
-            0x71 => { let (v, pc) = self.rd_ind_y(bus); self.adc(v); 5 + u8::from(pc) }
+            0x69 => {
+                let v = self.rd_imm(bus);
+                self.adc(v);
+                2
+            }
+            0x65 => {
+                let v = self.rd_zp(bus);
+                self.adc(v);
+                3
+            }
+            0x75 => {
+                let v = self.rd_zp_x(bus);
+                self.adc(v);
+                4
+            }
+            0x6D => {
+                let v = self.rd_abs(bus);
+                self.adc(v);
+                4
+            }
+            0x7D => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.adc(v);
+                4 + u8::from(pc)
+            }
+            0x79 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.adc(v);
+                4 + u8::from(pc)
+            }
+            0x61 => {
+                let v = self.rd_ind_x(bus);
+                self.adc(v);
+                6
+            }
+            0x71 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.adc(v);
+                5 + u8::from(pc)
+            }
 
             // ---- SBC ----------------------------------------------------
-            0xE9 => { let v = self.rd_imm(bus); self.sbc(v); 2 }
-            0xE5 => { let v = self.rd_zp(bus); self.sbc(v); 3 }
-            0xF5 => { let v = self.rd_zp_x(bus); self.sbc(v); 4 }
-            0xED => { let v = self.rd_abs(bus); self.sbc(v); 4 }
-            0xFD => { let (v, pc) = self.rd_abs_x(bus); self.sbc(v); 4 + u8::from(pc) }
-            0xF9 => { let (v, pc) = self.rd_abs_y(bus); self.sbc(v); 4 + u8::from(pc) }
-            0xE1 => { let v = self.rd_ind_x(bus); self.sbc(v); 6 }
-            0xF1 => { let (v, pc) = self.rd_ind_y(bus); self.sbc(v); 5 + u8::from(pc) }
+            0xE9 => {
+                let v = self.rd_imm(bus);
+                self.sbc(v);
+                2
+            }
+            0xE5 => {
+                let v = self.rd_zp(bus);
+                self.sbc(v);
+                3
+            }
+            0xF5 => {
+                let v = self.rd_zp_x(bus);
+                self.sbc(v);
+                4
+            }
+            0xED => {
+                let v = self.rd_abs(bus);
+                self.sbc(v);
+                4
+            }
+            0xFD => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.sbc(v);
+                4 + u8::from(pc)
+            }
+            0xF9 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.sbc(v);
+                4 + u8::from(pc)
+            }
+            0xE1 => {
+                let v = self.rd_ind_x(bus);
+                self.sbc(v);
+                6
+            }
+            0xF1 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.sbc(v);
+                5 + u8::from(pc)
+            }
 
             // ---- CMP ----------------------------------------------------
-            0xC9 => { let v = self.rd_imm(bus); self.cmp(self.a, v); 2 }
-            0xC5 => { let v = self.rd_zp(bus); self.cmp(self.a, v); 3 }
-            0xD5 => { let v = self.rd_zp_x(bus); self.cmp(self.a, v); 4 }
-            0xCD => { let v = self.rd_abs(bus); self.cmp(self.a, v); 4 }
-            0xDD => { let (v, pc) = self.rd_abs_x(bus); self.cmp(self.a, v); 4 + u8::from(pc) }
-            0xD9 => { let (v, pc) = self.rd_abs_y(bus); self.cmp(self.a, v); 4 + u8::from(pc) }
-            0xC1 => { let v = self.rd_ind_x(bus); self.cmp(self.a, v); 6 }
-            0xD1 => { let (v, pc) = self.rd_ind_y(bus); self.cmp(self.a, v); 5 + u8::from(pc) }
+            0xC9 => {
+                let v = self.rd_imm(bus);
+                self.cmp(self.a, v);
+                2
+            }
+            0xC5 => {
+                let v = self.rd_zp(bus);
+                self.cmp(self.a, v);
+                3
+            }
+            0xD5 => {
+                let v = self.rd_zp_x(bus);
+                self.cmp(self.a, v);
+                4
+            }
+            0xCD => {
+                let v = self.rd_abs(bus);
+                self.cmp(self.a, v);
+                4
+            }
+            0xDD => {
+                let (v, pc) = self.rd_abs_x(bus);
+                self.cmp(self.a, v);
+                4 + u8::from(pc)
+            }
+            0xD9 => {
+                let (v, pc) = self.rd_abs_y(bus);
+                self.cmp(self.a, v);
+                4 + u8::from(pc)
+            }
+            0xC1 => {
+                let v = self.rd_ind_x(bus);
+                self.cmp(self.a, v);
+                6
+            }
+            0xD1 => {
+                let (v, pc) = self.rd_ind_y(bus);
+                self.cmp(self.a, v);
+                5 + u8::from(pc)
+            }
 
             // ---- CPX / CPY ----------------------------------------------
-            0xE0 => { let v = self.rd_imm(bus); self.cmp(self.x, v); 2 }
-            0xE4 => { let v = self.rd_zp(bus); self.cmp(self.x, v); 3 }
-            0xEC => { let v = self.rd_abs(bus); self.cmp(self.x, v); 4 }
+            0xE0 => {
+                let v = self.rd_imm(bus);
+                self.cmp(self.x, v);
+                2
+            }
+            0xE4 => {
+                let v = self.rd_zp(bus);
+                self.cmp(self.x, v);
+                3
+            }
+            0xEC => {
+                let v = self.rd_abs(bus);
+                self.cmp(self.x, v);
+                4
+            }
 
-            0xC0 => { let v = self.rd_imm(bus); self.cmp(self.y, v); 2 }
-            0xC4 => { let v = self.rd_zp(bus); self.cmp(self.y, v); 3 }
-            0xCC => { let v = self.rd_abs(bus); self.cmp(self.y, v); 4 }
+            0xC0 => {
+                let v = self.rd_imm(bus);
+                self.cmp(self.y, v);
+                2
+            }
+            0xC4 => {
+                let v = self.rd_zp(bus);
+                self.cmp(self.y, v);
+                3
+            }
+            0xCC => {
+                let v = self.rd_abs(bus);
+                self.cmp(self.y, v);
+                4
+            }
 
             // ---- INC / DEC memory --------------------------------------
-            0xE6 => { self.rmw_zp(bus, Self::inc_value); 5 }
-            0xF6 => { self.rmw_zp_x(bus, Self::inc_value); 6 }
-            0xEE => { self.rmw_abs(bus, Self::inc_value); 6 }
-            0xFE => { self.rmw_abs_x(bus, Self::inc_value); 7 }
+            0xE6 => {
+                self.rmw_zp(bus, Self::inc_value);
+                5
+            }
+            0xF6 => {
+                self.rmw_zp_x(bus, Self::inc_value);
+                6
+            }
+            0xEE => {
+                self.rmw_abs(bus, Self::inc_value);
+                6
+            }
+            0xFE => {
+                self.rmw_abs_x(bus, Self::inc_value);
+                7
+            }
 
-            0xC6 => { self.rmw_zp(bus, Self::dec_value); 5 }
-            0xD6 => { self.rmw_zp_x(bus, Self::dec_value); 6 }
-            0xCE => { self.rmw_abs(bus, Self::dec_value); 6 }
-            0xDE => { self.rmw_abs_x(bus, Self::dec_value); 7 }
+            0xC6 => {
+                self.rmw_zp(bus, Self::dec_value);
+                5
+            }
+            0xD6 => {
+                self.rmw_zp_x(bus, Self::dec_value);
+                6
+            }
+            0xCE => {
+                self.rmw_abs(bus, Self::dec_value);
+                6
+            }
+            0xDE => {
+                self.rmw_abs_x(bus, Self::dec_value);
+                7
+            }
 
             // ---- INX/INY/DEX/DEY ---------------------------------------
             0xE8 => {
@@ -242,32 +601,96 @@ impl Cpu {
             } // DEY
 
             // ---- ASL ----------------------------------------------------
-            0x0A => { self.a = self.asl_value(self.a); self.set_nz(self.a); 2 }
-            0x06 => { self.rmw_zp(bus, Self::asl_value); 5 }
-            0x16 => { self.rmw_zp_x(bus, Self::asl_value); 6 }
-            0x0E => { self.rmw_abs(bus, Self::asl_value); 6 }
-            0x1E => { self.rmw_abs_x(bus, Self::asl_value); 7 }
+            0x0A => {
+                self.a = self.asl_value(self.a);
+                self.set_nz(self.a);
+                2
+            }
+            0x06 => {
+                self.rmw_zp(bus, Self::asl_value);
+                5
+            }
+            0x16 => {
+                self.rmw_zp_x(bus, Self::asl_value);
+                6
+            }
+            0x0E => {
+                self.rmw_abs(bus, Self::asl_value);
+                6
+            }
+            0x1E => {
+                self.rmw_abs_x(bus, Self::asl_value);
+                7
+            }
 
             // ---- LSR ----------------------------------------------------
-            0x4A => { self.a = self.lsr_value(self.a); self.set_nz(self.a); 2 }
-            0x46 => { self.rmw_zp(bus, Self::lsr_value); 5 }
-            0x56 => { self.rmw_zp_x(bus, Self::lsr_value); 6 }
-            0x4E => { self.rmw_abs(bus, Self::lsr_value); 6 }
-            0x5E => { self.rmw_abs_x(bus, Self::lsr_value); 7 }
+            0x4A => {
+                self.a = self.lsr_value(self.a);
+                self.set_nz(self.a);
+                2
+            }
+            0x46 => {
+                self.rmw_zp(bus, Self::lsr_value);
+                5
+            }
+            0x56 => {
+                self.rmw_zp_x(bus, Self::lsr_value);
+                6
+            }
+            0x4E => {
+                self.rmw_abs(bus, Self::lsr_value);
+                6
+            }
+            0x5E => {
+                self.rmw_abs_x(bus, Self::lsr_value);
+                7
+            }
 
             // ---- ROL ----------------------------------------------------
-            0x2A => { self.a = self.rol_value(self.a); self.set_nz(self.a); 2 }
-            0x26 => { self.rmw_zp(bus, Self::rol_value); 5 }
-            0x36 => { self.rmw_zp_x(bus, Self::rol_value); 6 }
-            0x2E => { self.rmw_abs(bus, Self::rol_value); 6 }
-            0x3E => { self.rmw_abs_x(bus, Self::rol_value); 7 }
+            0x2A => {
+                self.a = self.rol_value(self.a);
+                self.set_nz(self.a);
+                2
+            }
+            0x26 => {
+                self.rmw_zp(bus, Self::rol_value);
+                5
+            }
+            0x36 => {
+                self.rmw_zp_x(bus, Self::rol_value);
+                6
+            }
+            0x2E => {
+                self.rmw_abs(bus, Self::rol_value);
+                6
+            }
+            0x3E => {
+                self.rmw_abs_x(bus, Self::rol_value);
+                7
+            }
 
             // ---- ROR ----------------------------------------------------
-            0x6A => { self.a = self.ror_value(self.a); self.set_nz(self.a); 2 }
-            0x66 => { self.rmw_zp(bus, Self::ror_value); 5 }
-            0x76 => { self.rmw_zp_x(bus, Self::ror_value); 6 }
-            0x6E => { self.rmw_abs(bus, Self::ror_value); 6 }
-            0x7E => { self.rmw_abs_x(bus, Self::ror_value); 7 }
+            0x6A => {
+                self.a = self.ror_value(self.a);
+                self.set_nz(self.a);
+                2
+            }
+            0x66 => {
+                self.rmw_zp(bus, Self::ror_value);
+                5
+            }
+            0x76 => {
+                self.rmw_zp_x(bus, Self::ror_value);
+                6
+            }
+            0x6E => {
+                self.rmw_abs(bus, Self::ror_value);
+                6
+            }
+            0x7E => {
+                self.rmw_abs_x(bus, Self::ror_value);
+                7
+            }
 
             // ---- branches ----------------------------------------------
             0x10 => self.branch(bus, false, flags::N), // BPL
@@ -400,121 +823,157 @@ impl Cpu {
 
     // ---- addressing + read helpers (return value, page_cross) -----------
 
-    #[inline] pub(crate) fn rd_imm(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn rd_imm(&mut self, bus: &mut Bus) -> u8 {
         self.fetch_byte(bus)
     }
-    #[inline] pub(crate) fn rd_zp(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn rd_zp(&mut self, bus: &mut Bus) -> u8 {
         let op = self.resolve(bus, super::AddrMode::ZeroPage);
         self.read_operand(bus, op)
     }
-    #[inline] pub(crate) fn rd_zp_x(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn rd_zp_x(&mut self, bus: &mut Bus) -> u8 {
         let a = self.am_zero_page_x(bus, Dummy::Rmw);
         bus.read(a)
     }
-    #[inline] pub(crate) fn rd_zp_y(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn rd_zp_y(&mut self, bus: &mut Bus) -> u8 {
         let a = self.am_zero_page_y(bus, Dummy::Rmw);
         bus.read(a)
     }
-    #[inline] pub(crate) fn rd_abs(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn rd_abs(&mut self, bus: &mut Bus) -> u8 {
         let op = self.resolve(bus, super::AddrMode::Absolute);
         self.read_operand(bus, op)
     }
-    #[inline] pub(crate) fn rd_abs_x(&mut self, bus: &mut Bus) -> (u8, bool) {
+    #[inline]
+    pub(crate) fn rd_abs_x(&mut self, bus: &mut Bus) -> (u8, bool) {
         let (a, pc) = self.am_absolute_x(bus, Dummy::Read);
         (bus.read(a), pc)
     }
-    #[inline] pub(crate) fn rd_abs_y(&mut self, bus: &mut Bus) -> (u8, bool) {
+    #[inline]
+    pub(crate) fn rd_abs_y(&mut self, bus: &mut Bus) -> (u8, bool) {
         let (a, pc) = self.am_absolute_y(bus, Dummy::Read);
         (bus.read(a), pc)
     }
-    #[inline] pub(crate) fn rd_ind_x(&mut self, bus: &mut Bus) -> u8 {
+    #[inline]
+    pub(crate) fn rd_ind_x(&mut self, bus: &mut Bus) -> u8 {
         let a = self.am_indirect_x(bus);
         bus.read(a)
     }
-    #[inline] pub(crate) fn rd_ind_y(&mut self, bus: &mut Bus) -> (u8, bool) {
+    #[inline]
+    pub(crate) fn rd_ind_y(&mut self, bus: &mut Bus) -> (u8, bool) {
         let (a, pc) = self.am_indirect_y(bus, Dummy::Read);
         (bus.read(a), pc)
     }
 
     // ---- addressing + write helpers ------------------------------------
 
-    #[inline] pub(crate) fn wr_zp(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_zp(&mut self, bus: &mut Bus, v: u8) {
         let op = self.resolve(bus, super::AddrMode::ZeroPage);
         self.write_operand(bus, op, v);
     }
-    #[inline] pub(crate) fn wr_zp_x(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_zp_x(&mut self, bus: &mut Bus, v: u8) {
         let a = self.am_zero_page_x(bus, Dummy::Rmw);
         bus.write(a, v);
     }
-    #[inline] pub(crate) fn wr_zp_y(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_zp_y(&mut self, bus: &mut Bus, v: u8) {
         let a = self.am_zero_page_y(bus, Dummy::Rmw);
         bus.write(a, v);
     }
-    #[inline] pub(crate) fn wr_abs(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_abs(&mut self, bus: &mut Bus, v: u8) {
         let op = self.resolve(bus, super::AddrMode::Absolute);
         self.write_operand(bus, op, v);
     }
-    #[inline] pub(crate) fn wr_abs_x(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_abs_x(&mut self, bus: &mut Bus, v: u8) {
         let a = self.am_absolute_x(bus, Dummy::Rmw).0;
         bus.write(a, v);
     }
-    #[inline] pub(crate) fn wr_abs_y(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_abs_y(&mut self, bus: &mut Bus, v: u8) {
         let a = self.am_absolute_y(bus, Dummy::Rmw).0;
         bus.write(a, v);
     }
-    #[inline] pub(crate) fn wr_ind_x(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_ind_x(&mut self, bus: &mut Bus, v: u8) {
         let a = self.am_indirect_x(bus);
         bus.write(a, v);
     }
-    #[inline] pub(crate) fn wr_ind_y(&mut self, bus: &mut Bus, v: u8) {
+    #[inline]
+    pub(crate) fn wr_ind_y(&mut self, bus: &mut Bus, v: u8) {
         let a = self.am_indirect_y(bus, Dummy::Rmw).0;
         bus.write(a, v);
     }
 
     // ---- addressing + RMW helpers --------------------------------------
 
-    #[inline] fn rmw_zp<F>(&mut self, bus: &mut Bus, f: F)
-    where F: FnOnce(&mut Self, u8) -> u8 {
+    #[inline]
+    fn rmw_zp<F>(&mut self, bus: &mut Bus, f: F)
+    where
+        F: FnOnce(&mut Self, u8) -> u8,
+    {
         let op = self.resolve(bus, super::AddrMode::ZeroPage);
         self.rmw(bus, op, f);
     }
-    #[inline] fn rmw_zp_x<F>(&mut self, bus: &mut Bus, f: F)
-    where F: FnOnce(&mut Self, u8) -> u8 {
+    #[inline]
+    fn rmw_zp_x<F>(&mut self, bus: &mut Bus, f: F)
+    where
+        F: FnOnce(&mut Self, u8) -> u8,
+    {
         let a = self.am_zero_page_x(bus, Dummy::Rmw);
         self.rmw(bus, Operand::Address(a), f);
     }
-    #[inline] fn rmw_abs<F>(&mut self, bus: &mut Bus, f: F)
-    where F: FnOnce(&mut Self, u8) -> u8 {
+    #[inline]
+    fn rmw_abs<F>(&mut self, bus: &mut Bus, f: F)
+    where
+        F: FnOnce(&mut Self, u8) -> u8,
+    {
         let op = self.resolve(bus, super::AddrMode::Absolute);
         self.rmw(bus, op, f);
     }
-    #[inline] fn rmw_abs_x<F>(&mut self, bus: &mut Bus, f: F)
-    where F: FnOnce(&mut Self, u8) -> u8 {
+    #[inline]
+    fn rmw_abs_x<F>(&mut self, bus: &mut Bus, f: F)
+    where
+        F: FnOnce(&mut Self, u8) -> u8,
+    {
         let a = self.am_absolute_x(bus, Dummy::Rmw).0;
         self.rmw(bus, Operand::Address(a), f);
     }
 
     // ---- operand-resolving helpers (for unofficial combo opcodes) ------
 
-    #[inline] pub(crate) fn op_zp(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_zp(&mut self, bus: &mut Bus) -> Operand {
         self.resolve(bus, super::AddrMode::ZeroPage)
     }
-    #[inline] pub(crate) fn op_zp_x(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_zp_x(&mut self, bus: &mut Bus) -> Operand {
         Operand::Address(self.am_zero_page_x(bus, Dummy::Rmw))
     }
-    #[inline] pub(crate) fn op_abs(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_abs(&mut self, bus: &mut Bus) -> Operand {
         self.resolve(bus, super::AddrMode::Absolute)
     }
-    #[inline] pub(crate) fn op_abs_x(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_abs_x(&mut self, bus: &mut Bus) -> Operand {
         Operand::Address(self.am_absolute_x(bus, Dummy::Rmw).0)
     }
-    #[inline] pub(crate) fn op_abs_y(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_abs_y(&mut self, bus: &mut Bus) -> Operand {
         Operand::Address(self.am_absolute_y(bus, Dummy::Rmw).0)
     }
-    #[inline] pub(crate) fn op_ind_x(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_ind_x(&mut self, bus: &mut Bus) -> Operand {
         Operand::Address(self.am_indirect_x(bus))
     }
-    #[inline] pub(crate) fn op_ind_y(&mut self, bus: &mut Bus) -> Operand {
+    #[inline]
+    pub(crate) fn op_ind_y(&mut self, bus: &mut Bus) -> Operand {
         Operand::Address(self.am_indirect_y(bus, Dummy::Rmw).0)
     }
 
