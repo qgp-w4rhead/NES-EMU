@@ -159,6 +159,40 @@ void bus_step_apu(Bus* bus, uint32_t cpu_cycles);
  * (bus.rs `apu_irq_pending`.) */
 bool bus_apu_irq_pending(const Bus* bus);
 
+/* ---- Cartridge mapper integration (M4.4) ----------------------------- */
+
+/* Whether the cartridge mapper is asserting a CPU IRQ.
+ * (bus.rs `cart_irq_pending`.) */
+bool bus_cart_irq_pending(const Bus* bus);
+
+/* Advance cartridge mapper's CPU-clocked logic by `cpu_cycles`.
+ * (bus.rs `clock_cart_cpu`.) */
+void bus_clock_cart_cpu(Bus* bus, uint32_t cpu_cycles);
+
+/* Current expansion-audio sample [-1.0, 1.0] from the cartridge audio chip.
+ * (bus.rs `expansion_audio_sample`.) */
+float bus_expansion_audio_sample(const Bus* bus);
+
+/* Reset the cartridge mapper's scanline counter (called at prerender sl cyc1).
+ * (bus.rs `step_ppu` inner logic.) */
+void bus_cart_reset_scanline_counter(Bus* bus);
+
+/* ---- PPU stepping + rendering (M4.4) --------------------------------- */
+
+/* Advance PPU by `cycles` PPU cycles; returns true if NMI requested.
+ * Clocks the cartridge mapper IRQ at MMC3_IRQ_CLOCK_CYCLE (260) and resets
+ * the scanline counter at prerender scanline cycle 1.
+ * (bus.rs `step_ppu`.) */
+bool bus_step_ppu(Bus* bus, uint32_t cycles);
+
+/* Consume and return the pending PPU NMI request flag.
+ * (bus.rs `take_nmi_request`.) */
+bool bus_take_nmi_request(Bus* bus);
+
+/* Render full frame (background + sprites) into the PPU framebuffer, using
+ * the cartridge's CHR reader. (bus.rs `render_frame`.) */
+void bus_render_frame(Bus* bus);
+
 #ifdef __cplusplus
 }
 #endif

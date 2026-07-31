@@ -28,8 +28,14 @@
 #include "bus.h"
 #include "cartridge.h"
 #include "ppu.h"
+#include "ppu_render.h"
 #include "apu.h"
+#include "region.h"
 #include <string.h>
+
+/* PPU cycle at which MMC3 IRQ is clocked (A12 rising edge approximation).
+ * (bus.rs `MMC3_IRQ_CLOCK_CYCLE`.) */
+#define MMC3_IRQ_CLOCK_CYCLE 260u
 
 /* ---- Construction ----------------------------------------------------- */
 
@@ -218,18 +224,24 @@ static void oam_dma(Bus* bus, uint8_t page) {
     }
 }
 
-/* cart_read: cartridge space read. (bus.rs `cart_read`.) */
+/* cart_read: cartridge space read. Uses read_prg_mut so read side-effects
+ * fire (FDS disk-data read advances the read pointer, $4030 clears timer IRQ).
+ * (bus.rs `cart_read`, lines 704-710.) */
 static uint8_t cart_read(Bus* bus, uint16_t addr) {
     if (bus->cartridge) {
-        return cartridge_read_prg(bus->cartridge, addr);
+        return cartridge_read_prg_mut(bus->cartridge, addr);
     }
     return 0x00u;
 }
 
-/* cart_write: cartridge space write. (bus.rs `cart_write`.) */
+/* cart_write: cartridge space write. Re-syncs PPU mirroring from the
+ * cartridge after every write so runtime mirroring changes (MMC1 $8000,
+ * MMC3 $A000, AxROM bit 4, VRC6 $B003, FME-7 cmd 12, FDS $4025) take effect
+ * immediately. (bus.rs `cart_write`, lines 713-719.) */
 static void cart_write(Bus* bus, uint16_t addr, uint8_t value) {
     if (bus->cartridge) {
         cartridge_write_prg(bus->cartridge, addr, value);
+        ppu_set_mirroring(&bus->ppu, cartridge_mirror_mode(bus->cartridge));
     }
 }
 
@@ -466,5 +478,73 @@ void bus_step_apu(Bus* bus, uint32_t cpu_cycles) {
 
 bool bus_apu_irq_pending(const Bus* bus) {
     return apu_irq_pending(&bus->apu);
+}
+
+/* ---- Cartridge mapper integration (M4.4) ----------------------------- */
+
+bool bus_cart_irq_pending(const Bus* bus) {
+    return bus->cartridge ? cartridge_irq_pending(bus->cartridge) : false;
+}
+
+void bus_clock_cart_cpu(Bus* bus, uint32_t cpu_cycles) {
+    if (bus->cartridge) {
+        cartridge_clock_cpu(bus->cartridge, cpu_cycles);
+    }
+}
+
+float bus_expansion_audio_sample(const Bus* bus) {
+    return bus->cartridge ? cartridge_expansion_audio_sample(bus->cartridge) : 0.0f;
+}
+
+void bus_cart_reset_scanline_counter(Bus* bus) {
+    if (bus->cartridge) {
+        cartridge_reset_scanline_counter(bus->cartridge);
+    }
+}
+
+/* ---- PPU stepping + rendering (M4.4) --------------------------------- */
+
+/* ChrReader callback: reads CHR via the bus's cartridge. */
+static uint8_t bus_chr_read(void* ctx, uint16_t addr) {
+    Bus* bus = (Bus*)ctx;
+    return bus->cartridge ? cartridge_read_chr_latched(bus->cartridge, addr) : 0x00u;
+}
+
+bool bus_step_ppu(Bus* bus, uint32_t cycles) {
+    bool nmi = false;
+    uint16_t prerender = (uint16_t)region_scanline_prerender(bus->ppu.region);
+    bool rendering = ppu_is_rendering(&bus->ppu);
+    for (uint32_t i = 0; i < cycles; ++i) {
+        ChrReader chr = { bus, bus_chr_read };
+        if (ppu_step_rendered(&bus->ppu, &chr)) {
+            nmi = true;
+        }
+        uint16_t cyc = ppu_cycle(&bus->ppu);
+        uint16_t sl  = ppu_scanline(&bus->ppu);
+        /* Clock MMC3 IRQ at the A12 rising-edge approximation cycle. */
+        if (rendering
+            && cyc == MMC3_IRQ_CLOCK_CYCLE
+            && (sl < PPU_SCREEN_HEIGHT || sl == prerender)) {
+            if (bus->cartridge) {
+                cartridge_clock_irq(bus->cartridge);
+            }
+        }
+        /* Reset scanline counter at prerender scanline, cycle 1. */
+        if (sl == prerender && cyc == 1u) {
+            if (bus->cartridge) {
+                cartridge_reset_scanline_counter(bus->cartridge);
+            }
+        }
+    }
+    return nmi;
+}
+
+bool bus_take_nmi_request(Bus* bus) {
+    return ppu_take_nmi_request(&bus->ppu);
+}
+
+void bus_render_frame(Bus* bus) {
+    ChrReader chr = { bus, bus_chr_read };
+    ppu_render_frame(&bus->ppu, &chr);
 }
 

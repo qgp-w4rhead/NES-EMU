@@ -720,7 +720,7 @@ static void test_edge_cases(void) {
         rom[7] = 0;
         Cartridge cart;
         CHECK(cartridge_from_bytes(rom, sizeof(rom), &cart) == 0, "CHR-RAM cart parse succeeds");
-        CHECK(cart.chr_is_ram, "CHR-RAM cart: chr_is_ram == true");
+        CHECK(cartridge_chr_is_ram(&cart), "CHR-RAM cart: chr_is_ram == true");
 
         Bus bus;
         bus_init_with_cartridge(&bus, &cart);

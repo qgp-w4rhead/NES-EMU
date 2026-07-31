@@ -255,13 +255,9 @@ void ppu_set_open_bus(Ppu* p, uint8_t value) {
 
 /* Map a nametable address ($2000-$3EFF) to a VRAM byte index.
  * (mod.rs `Ppu::map_nametable`.) $3000-$3EFF mirrors $2000-$2EFF; the four
- * nametable slots collapse according to mirroring.
- *
- * NOTE: the C Mirroring enum (cartridge.h) lacks SingleScreen. The Rust
- * Mirroring::SingleScreen(nt) maps all four NTs to a single physical NT. For
- * M4.2 we only handle H/V/4-screen (the only modes NROM uses in M4.4); any
- * unknown value is treated as horizontal. This is documented and acceptable
- * for the M4.2 scope. */
+ * nametable slots collapse according to mirroring. Single-screen modes
+ * (MIRROR_SINGLE_SCREEN_0..3) map all four NTs to one physical NT, matching
+ * Rust's `Mirroring::SingleScreen(nt)`. */
 static uint16_t map_nametable(const Ppu* p, uint16_t addr) {
     uint16_t a = (uint16_t)(addr & 0x2FFFu);
     uint16_t local = (uint16_t)(a - 0x2000u);       /* 0..0xFFF */
@@ -269,10 +265,14 @@ static uint16_t map_nametable(const Ppu* p, uint16_t addr) {
     uint16_t offset = (uint16_t)(local & 0x03FFu);  /* byte within nametable */
     uint16_t phys;
     switch (p->mirroring) {
-        case MIRROR_HORIZONTAL:  phys = (uint16_t)(nt >> 1); break; /* NT 0,1->0; 2,3->1 */
-        case MIRROR_VERTICAL:    phys = (uint16_t)(nt & 1u);  break; /* NT 0,2->0; 1,3->1 */
-        case MIRROR_FOUR_SCREEN: phys = nt;                   break; /* all four unique */
-        default:                 phys = (uint16_t)(nt >> 1);  break; /* unknown -> horizontal */
+        case MIRROR_HORIZONTAL:        phys = (uint16_t)(nt >> 1); break; /* NT 0,1->0; 2,3->1 */
+        case MIRROR_VERTICAL:          phys = (uint16_t)(nt & 1u);  break; /* NT 0,2->0; 1,3->1 */
+        case MIRROR_FOUR_SCREEN:       phys = nt;                   break; /* all four unique */
+        case MIRROR_SINGLE_SCREEN_0:   phys = 0;                    break;
+        case MIRROR_SINGLE_SCREEN_1:   phys = 1;                    break;
+        case MIRROR_SINGLE_SCREEN_2:   phys = 2;                    break;
+        case MIRROR_SINGLE_SCREEN_3:   phys = 3;                    break;
+        default:                       phys = (uint16_t)(nt >> 1);  break; /* unknown -> horizontal */
     }
     return (uint16_t)(phys * 0x400u + offset);
 }
