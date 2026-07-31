@@ -42,6 +42,12 @@ secrets.local.example
 /cores/java/nes_core_java_dynamic.h
 /cores/java/graal_isolate.h
 /cores/java/graal_isolate_dynamic.h
+# Python/Cython build artifacts (M11)
+/cores/python/build/
+/cores/python/nes_core/__pycache__/
+/cores/python/test/__pycache__/
+/cores/python/nes_core/_core.c
+/cores/python/nes_core/*.pyd
 /bench/*.exe
 /bench/*.obj
 /bench/*.o
