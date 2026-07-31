@@ -74,6 +74,14 @@ typedef struct MapperVTable {
     float    (*expansion_audio_sample)(const void* state);
     /* Free heap-allocated PRG/CHR/state. NULL = no-op (no allocation). */
     void     (*destroy)(void* state);
+    /* Serialize mapper state into buf. If buf is NULL, return required size
+     * only. If buf is non-NULL, write state and return bytes written. NULL =
+     * no writable state (size 0). (M4.5 save state.) */
+    size_t   (*save_state)(const void* state, uint8_t* buf);
+    /* Restore mapper state from buf. Returns true on success. The mapper
+     * state already exists (created from the same ROM); buffers are valid.
+     * NULL = no writable state (no-op, returns true). (M4.5 save state.) */
+    bool     (*load_state)(void* state, const uint8_t* buf, size_t len);
 } MapperVTable;
 
 /* A loaded mapper: vtable + opaque state + iNES mapper number.

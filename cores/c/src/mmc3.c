@@ -235,11 +235,57 @@ static void mmc3_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(Mmc3State)] struct (includes embedded prg_ram[8192]) +
+ * [chr_size] CHR (only if chr_is_ram). */
+static size_t mmc3_save_state(const void* state, uint8_t* buf) {
+    const Mmc3State* s = (const Mmc3State*)state;
+    size_t total = sizeof(Mmc3State);
+    if (s->chr_is_ram) {
+        total += s->chr_size;
+    }
+    if (buf) {
+        memcpy(buf, s, sizeof(Mmc3State));
+        if (s->chr_is_ram && s->chr_size > 0u) {
+            memcpy(buf + sizeof(Mmc3State), s->chr, s->chr_size);
+        }
+    }
+    return total;
+}
+
+static bool mmc3_load_state(void* state, const uint8_t* buf, size_t len) {
+    Mmc3State* s = (Mmc3State*)state;
+    size_t need = sizeof(Mmc3State);
+    if (s->chr_is_ram) {
+        need += s->chr_size;
+    }
+    if (len < need) {
+        return false;
+    }
+    uint8_t* valid_prg = s->prg_rom;
+    uint8_t* valid_chr = s->chr;
+    uint32_t valid_prg_size = s->prg_size;
+    uint32_t valid_chr_size = s->chr_size;
+    bool valid_chr_is_ram = s->chr_is_ram;
+    memcpy(s, buf, sizeof(Mmc3State));
+    s->prg_rom = valid_prg;
+    s->prg_size = valid_prg_size;
+    s->chr = valid_chr;
+    s->chr_size = valid_chr_size;
+    s->chr_is_ram = valid_chr_is_ram;
+    if (s->chr_is_ram && s->chr_size > 0u) {
+        memcpy(s->chr, buf + sizeof(Mmc3State), s->chr_size);
+    }
+    return true;
+}
+
 static const MapperVTable MMC3_VTABLE = {
     mmc3_read_prg, NULL, mmc3_write_prg,
     mmc3_read_chr, NULL, mmc3_write_chr,
     mmc3_mirror_mode, mmc3_chr_is_ram, mmc3_has_battery,
-    mmc3_irq_pending, mmc3_clock_irq, NULL, NULL, NULL, mmc3_destroy
+    mmc3_irq_pending, mmc3_clock_irq, NULL, NULL, NULL, mmc3_destroy,
+    mmc3_save_state, mmc3_load_state
 };
 
 int mmc3_create(const uint8_t* prg, uint32_t prg_size,

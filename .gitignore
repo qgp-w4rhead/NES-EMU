@@ -14,6 +14,8 @@ secrets.local.example
 /cores/rust/target/
 /cores/c/*.lib
 /cores/c/*.exe
+/cores/c/*.dll
+/cores/c/*.exp
 /cores/c/src/*.obj
 /cores/c/tests/*.obj
 /cores/cpp/*.exe

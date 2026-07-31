@@ -134,6 +134,17 @@ void cartridge_clock_cpu(Cartridge* cart, uint32_t cpu_cycles);
  * expansion audio. (Mapper::expansion_audio_sample.) */
 float cartridge_expansion_audio_sample(const Cartridge* cart);
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Serialize the mapper state into buf. If buf is NULL, return the required
+ * size only. If buf is non-NULL, write state and return bytes written.
+ * Returns 0 if the mapper has no save_state vtable entry. */
+size_t cartridge_save_state(const Cartridge* cart, uint8_t* buf);
+
+/* Restore mapper state from buf. Returns true on success, false on failure
+ * (no load_state vtable entry, or buffer too small). */
+bool cartridge_load_state(Cartridge* cart, const uint8_t* buf, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -109,11 +109,56 @@ static void uxrom_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(UxromState)] struct + [chr_size] CHR (only if chr_is_ram). */
+static size_t uxrom_save_state(const void* state, uint8_t* buf) {
+    const UxromState* s = (const UxromState*)state;
+    size_t total = sizeof(UxromState);
+    if (s->chr_is_ram) {
+        total += s->chr_size;
+    }
+    if (buf) {
+        memcpy(buf, s, sizeof(UxromState));
+        if (s->chr_is_ram && s->chr_size > 0u) {
+            memcpy(buf + sizeof(UxromState), s->chr, s->chr_size);
+        }
+    }
+    return total;
+}
+
+static bool uxrom_load_state(void* state, const uint8_t* buf, size_t len) {
+    UxromState* s = (UxromState*)state;
+    size_t need = sizeof(UxromState);
+    if (s->chr_is_ram) {
+        need += s->chr_size;
+    }
+    if (len < need) {
+        return false;
+    }
+    uint8_t* valid_prg = s->prg_rom;
+    uint8_t* valid_chr = s->chr;
+    uint32_t valid_prg_size = s->prg_size;
+    uint32_t valid_chr_size = s->chr_size;
+    bool valid_chr_is_ram = s->chr_is_ram;
+    memcpy(s, buf, sizeof(UxromState));
+    s->prg_rom = valid_prg;
+    s->prg_size = valid_prg_size;
+    s->chr = valid_chr;
+    s->chr_size = valid_chr_size;
+    s->chr_is_ram = valid_chr_is_ram;
+    if (s->chr_is_ram && s->chr_size > 0u) {
+        memcpy(s->chr, buf + sizeof(UxromState), s->chr_size);
+    }
+    return true;
+}
+
 static const MapperVTable UXROM_VTABLE = {
     uxrom_read_prg, NULL, uxrom_write_prg,
     uxrom_read_chr, NULL, uxrom_write_chr,
     uxrom_mirror_mode, uxrom_chr_is_ram, uxrom_has_battery,
-    NULL, NULL, NULL, NULL, NULL, uxrom_destroy
+    NULL, NULL, NULL, NULL, NULL, uxrom_destroy,
+    uxrom_save_state, uxrom_load_state
 };
 
 int uxrom_create(const uint8_t* prg, uint32_t prg_size,

@@ -202,12 +202,58 @@ static void fme7_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(Fme7State)] struct (includes embedded prg_ram[8192] and
+ * the Ym2149 audio state) + [chr_size] CHR (only if chr_is_ram). */
+static size_t fme7_save_state(const void* state, uint8_t* buf) {
+    const Fme7State* s = (const Fme7State*)state;
+    size_t total = sizeof(Fme7State);
+    if (s->chr_is_ram) {
+        total += s->chr_size;
+    }
+    if (buf) {
+        memcpy(buf, s, sizeof(Fme7State));
+        if (s->chr_is_ram && s->chr_size > 0u) {
+            memcpy(buf + sizeof(Fme7State), s->chr, s->chr_size);
+        }
+    }
+    return total;
+}
+
+static bool fme7_load_state(void* state, const uint8_t* buf, size_t len) {
+    Fme7State* s = (Fme7State*)state;
+    size_t need = sizeof(Fme7State);
+    if (s->chr_is_ram) {
+        need += s->chr_size;
+    }
+    if (len < need) {
+        return false;
+    }
+    uint8_t* valid_prg = s->prg_rom;
+    uint8_t* valid_chr = s->chr;
+    uint32_t valid_prg_size = s->prg_size;
+    uint32_t valid_chr_size = s->chr_size;
+    bool valid_chr_is_ram = s->chr_is_ram;
+    memcpy(s, buf, sizeof(Fme7State));
+    s->prg_rom = valid_prg;
+    s->prg_size = valid_prg_size;
+    s->chr = valid_chr;
+    s->chr_size = valid_chr_size;
+    s->chr_is_ram = valid_chr_is_ram;
+    if (s->chr_is_ram && s->chr_size > 0u) {
+        memcpy(s->chr, buf + sizeof(Fme7State), s->chr_size);
+    }
+    return true;
+}
+
 static const MapperVTable FME7_VTABLE = {
     fme7_read_prg, NULL, fme7_write_prg,
     fme7_read_chr, NULL, fme7_write_chr,
     fme7_mirror_mode, fme7_chr_is_ram, fme7_has_battery,
     fme7_irq_pending, NULL, NULL, fme7_clock_cpu,
-    fme7_expansion_audio_sample, fme7_destroy
+    fme7_expansion_audio_sample, fme7_destroy,
+    fme7_save_state, fme7_load_state
 };
 
 int fme7_create(const uint8_t* prg, uint32_t prg_size,

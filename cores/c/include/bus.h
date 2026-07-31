@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include "ppu.h"
 #include "apu.h"
+#include "joypad.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +64,11 @@ typedef struct Bus {
      * (addr - 0x4000). Reads of write-only registers return the last written
      * value from this latch. (bus.rs `apu_open_bus`.) */
     uint8_t apu_open_bus[BUS_APU_IO_REG_COUNT];
+
+    /* The NES joypad state for two standard controllers. Owned by the bus
+     * (M4.5). $4016/$4017 reads return joypad bit 0 OR open-bus bits 1-7;
+     * $4016 writes set the strobe. (bus.rs `joypad`.) */
+    Joypad joypad;
 
     /* Loaded cartridge, if any. NULL when no cartridge is inserted. The Bus
      * does NOT own the cartridge (the caller owns it); this is a non-owning
@@ -136,6 +142,13 @@ uint8_t* bus_ram_mut(Bus* bus);
 
 const uint8_t* bus_apu_open_bus(const Bus* bus);
 uint8_t* bus_apu_open_bus_mut(Bus* bus);
+
+/* ---- Joypad direct access (M4.5) ------------------------------------- */
+
+/* Borrow the bus's owned Joypad. (The Bus owns the Joypad; this is the C
+ * equivalent of bus.rs `&mut self.joypad`.) */
+Joypad* bus_joypad(Bus* bus);
+const Joypad* bus_joypad_const(const Bus* bus);
 
 /* ---- PPU direct access (M4.2) ---------------------------------------- */
 

@@ -104,6 +104,54 @@ static void nrom_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(NromState)] struct + [chr_size] CHR (only if chr_is_ram).
+ * The struct memcpy captures prg_rom/chr pointers (stale after load); the
+ * load path restores the valid pointers before copying buffer contents. */
+static size_t nrom_save_state(const void* state, uint8_t* buf) {
+    const NromState* s = (const NromState*)state;
+    size_t total = sizeof(NromState);
+    if (s->chr_is_ram) {
+        total += s->chr_size;
+    }
+    if (buf) {
+        memcpy(buf, s, sizeof(NromState));
+        if (s->chr_is_ram && s->chr_size > 0u) {
+            memcpy(buf + sizeof(NromState), s->chr, s->chr_size);
+        }
+    }
+    return total;
+}
+
+static bool nrom_load_state(void* state, const uint8_t* buf, size_t len) {
+    NromState* s = (NromState*)state;
+    size_t need = sizeof(NromState);
+    if (s->chr_is_ram) {
+        need += s->chr_size;
+    }
+    if (len < need) {
+        return false;
+    }
+    /* Save valid pointers, memcpy the struct (overwrites pointers), then
+     * restore the valid pointers before copying buffer contents. */
+    uint8_t* valid_prg = s->prg_rom;
+    uint8_t* valid_chr = s->chr;
+    uint32_t valid_prg_size = s->prg_size;
+    uint32_t valid_chr_size = s->chr_size;
+    bool valid_chr_is_ram = s->chr_is_ram;
+    memcpy(s, buf, sizeof(NromState));
+    s->prg_rom = valid_prg;
+    s->prg_size = valid_prg_size;
+    s->chr = valid_chr;
+    s->chr_size = valid_chr_size;
+    s->chr_is_ram = valid_chr_is_ram;
+    if (s->chr_is_ram && s->chr_size > 0u) {
+        memcpy(s->chr, buf + sizeof(NromState), s->chr_size);
+    }
+    return true;
+}
+
 static const MapperVTable NROM_VTABLE = {
     nrom_read_prg,
     NULL,                  /* read_prg_mut */
@@ -119,7 +167,9 @@ static const MapperVTable NROM_VTABLE = {
     NULL,                  /* reset_scanline_counter */
     NULL,                  /* clock_cpu */
     NULL,                  /* expansion_audio_sample */
-    nrom_destroy
+    nrom_destroy,
+    nrom_save_state,
+    nrom_load_state
 };
 
 int nrom_create(const uint8_t* prg, uint32_t prg_size,

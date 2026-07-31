@@ -254,3 +254,19 @@ float cartridge_expansion_audio_sample(const Cartridge* cart) {
     }
     return 0.0f;
 }
+
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+size_t cartridge_save_state(const Cartridge* cart, uint8_t* buf) {
+    if (cart->mapper.vt && cart->mapper.vt->save_state) {
+        return cart->mapper.vt->save_state(cart->mapper.state, buf);
+    }
+    return 0u;
+}
+
+bool cartridge_load_state(Cartridge* cart, const uint8_t* buf, size_t len) {
+    if (cart->mapper.vt && cart->mapper.vt->load_state) {
+        return cart->mapper.vt->load_state(cart->mapper.state, buf, len);
+    }
+    return false;
+}

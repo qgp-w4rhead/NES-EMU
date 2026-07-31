@@ -310,12 +310,59 @@ static void vrc6_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(Vrc6State)] struct (includes embedded prg_ram[8192] and
+ * the PulseChannel/SawChannel audio state) + [chr_size] CHR (only if
+ * chr_is_ram). */
+static size_t vrc6_save_state(const void* state, uint8_t* buf) {
+    const Vrc6State* s = (const Vrc6State*)state;
+    size_t total = sizeof(Vrc6State);
+    if (s->chr_is_ram) {
+        total += s->chr_size;
+    }
+    if (buf) {
+        memcpy(buf, s, sizeof(Vrc6State));
+        if (s->chr_is_ram && s->chr_size > 0u) {
+            memcpy(buf + sizeof(Vrc6State), s->chr, s->chr_size);
+        }
+    }
+    return total;
+}
+
+static bool vrc6_load_state(void* state, const uint8_t* buf, size_t len) {
+    Vrc6State* s = (Vrc6State*)state;
+    size_t need = sizeof(Vrc6State);
+    if (s->chr_is_ram) {
+        need += s->chr_size;
+    }
+    if (len < need) {
+        return false;
+    }
+    uint8_t* valid_prg = s->prg_rom;
+    uint8_t* valid_chr = s->chr;
+    uint32_t valid_prg_size = s->prg_size;
+    uint32_t valid_chr_size = s->chr_size;
+    bool valid_chr_is_ram = s->chr_is_ram;
+    memcpy(s, buf, sizeof(Vrc6State));
+    s->prg_rom = valid_prg;
+    s->prg_size = valid_prg_size;
+    s->chr = valid_chr;
+    s->chr_size = valid_chr_size;
+    s->chr_is_ram = valid_chr_is_ram;
+    if (s->chr_is_ram && s->chr_size > 0u) {
+        memcpy(s->chr, buf + sizeof(Vrc6State), s->chr_size);
+    }
+    return true;
+}
+
 static const MapperVTable VRC6_VTABLE = {
     vrc6_read_prg, NULL, vrc6_write_prg,
     vrc6_read_chr, NULL, vrc6_write_chr,
     vrc6_mirror_mode, vrc6_chr_is_ram, vrc6_has_battery,
     vrc6_irq_pending, NULL, NULL, vrc6_clock_cpu,
-    vrc6_expansion_audio_sample, vrc6_destroy
+    vrc6_expansion_audio_sample, vrc6_destroy,
+    vrc6_save_state, vrc6_load_state
 };
 
 int vrc6_create(const uint8_t* prg, uint32_t prg_size,

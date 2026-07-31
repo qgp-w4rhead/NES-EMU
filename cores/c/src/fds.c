@@ -227,12 +227,51 @@ static void fds_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(FdsState)] struct (includes embedded prg_ram[32KB],
+ * chr_ram[8KB], and the FdsAudio state) + [disk_size] disk_data (writable
+ * disk side data). The struct memcpy captures bios/disk_data pointers
+ * (stale after load); the load path restores the valid pointers before
+ * copying disk_data contents. */
+static size_t fds_save_state(const void* state, uint8_t* buf) {
+    const FdsState* s = (const FdsState*)state;
+    size_t total = sizeof(FdsState) + s->disk_size;
+    if (buf) {
+        memcpy(buf, s, sizeof(FdsState));
+        if (s->disk_size > 0u) {
+            memcpy(buf + sizeof(FdsState), s->disk_data, s->disk_size);
+        }
+    }
+    return total;
+}
+
+static bool fds_load_state(void* state, const uint8_t* buf, size_t len) {
+    FdsState* s = (FdsState*)state;
+    size_t need = sizeof(FdsState) + s->disk_size;
+    if (len < need) {
+        return false;
+    }
+    uint8_t* valid_bios = s->bios;
+    uint8_t* valid_disk = s->disk_data;
+    uint32_t valid_disk_size = s->disk_size;
+    memcpy(s, buf, sizeof(FdsState));
+    s->bios = valid_bios;
+    s->disk_data = valid_disk;
+    s->disk_size = valid_disk_size;
+    if (s->disk_size > 0u) {
+        memcpy(s->disk_data, buf + sizeof(FdsState), s->disk_size);
+    }
+    return true;
+}
+
 static const MapperVTable FDS_VTABLE = {
     fds_read_prg, fds_read_prg_mut, fds_write_prg,
     fds_read_chr, NULL, fds_write_chr,
     fds_mirror_mode, fds_chr_is_ram, fds_has_battery,
     fds_irq_pending, NULL, NULL, fds_clock_cpu,
-    fds_expansion_audio_sample, fds_destroy
+    fds_expansion_audio_sample, fds_destroy,
+    fds_save_state, fds_load_state
 };
 
 int fds_create(const uint8_t* bios, size_t bios_len,

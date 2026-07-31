@@ -1,17 +1,22 @@
-; nes_core.def — Windows export definitions for the NES C core DLL.
+; nes_core.def - Windows export definitions for the NES C core DLL.
 ;
-; M4.1 placeholder: the M4.1 build produces a static library (nes_core_c.lib)
-; and a test executable only — no DLL exports yet. The core_api.c ABI shim
-; (cores/protocol.h) is M4.5. This file exists so the build infrastructure has
-; a stable home for export defs when the DLL target is added in M4.5.
-;
-; When M4.5 adds the DLL target, list the exported symbols here, e.g.:
-;   LIBRARY nes_core_c
-;   EXPORTS
-;       core_init
-;       core_reset
-;       core_step
-;       ...
+; Lists the 13 functions of the cores/protocol.h C ABI exported by
+; src/core_api.c (M4.5). The DLL target (nes_core_c.dll) links core_api.obj
+; against the static library nes_core_c.lib and exports these symbols
+; undecorated via this .def file.
 LIBRARY nes_core_c
 EXPORTS
+    nes_core_create
+    nes_core_destroy
+    nes_core_reset
+    nes_core_set_region
+    nes_core_step_frame
+    nes_core_step_instruction
+    nes_core_framebuffer
+    nes_core_take_audio
+    nes_core_save_state
+    nes_core_load_state
+    nes_core_mapper_number
+    nes_core_impl_name
+    nes_core_impl_version
 

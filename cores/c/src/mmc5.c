@@ -292,12 +292,65 @@ static void mmc5_destroy(void* state) {
     }
 }
 
+/* ---- Save / load state (M4.5) ---------------------------------------- */
+
+/* Layout: [sizeof(Mmc5State)] struct + [PRG_RAM_SIZE] prg_ram +
+ * [chr_size] CHR (only if chr_is_ram). The struct memcpy captures
+ * prg_rom/chr/prg_ram pointers (stale after load); the load path restores
+ * the valid pointers before copying buffer contents. */
+static size_t mmc5_save_state(const void* state, uint8_t* buf) {
+    const Mmc5State* s = (const Mmc5State*)state;
+    size_t total = sizeof(Mmc5State) + PRG_RAM_SIZE;
+    if (s->chr_is_ram) {
+        total += s->chr_size;
+    }
+    if (buf) {
+        memcpy(buf, s, sizeof(Mmc5State));
+        memcpy(buf + sizeof(Mmc5State), s->prg_ram, PRG_RAM_SIZE);
+        size_t off = sizeof(Mmc5State) + PRG_RAM_SIZE;
+        if (s->chr_is_ram && s->chr_size > 0u) {
+            memcpy(buf + off, s->chr, s->chr_size);
+        }
+    }
+    return total;
+}
+
+static bool mmc5_load_state(void* state, const uint8_t* buf, size_t len) {
+    Mmc5State* s = (Mmc5State*)state;
+    size_t need = sizeof(Mmc5State) + PRG_RAM_SIZE;
+    if (s->chr_is_ram) {
+        need += s->chr_size;
+    }
+    if (len < need) {
+        return false;
+    }
+    uint8_t* valid_prg = s->prg_rom;
+    uint8_t* valid_chr = s->chr;
+    uint8_t* valid_prg_ram = s->prg_ram;
+    uint32_t valid_prg_size = s->prg_size;
+    uint32_t valid_chr_size = s->chr_size;
+    bool valid_chr_is_ram = s->chr_is_ram;
+    memcpy(s, buf, sizeof(Mmc5State));
+    s->prg_rom = valid_prg;
+    s->prg_size = valid_prg_size;
+    s->chr = valid_chr;
+    s->chr_size = valid_chr_size;
+    s->chr_is_ram = valid_chr_is_ram;
+    s->prg_ram = valid_prg_ram;
+    memcpy(s->prg_ram, buf + sizeof(Mmc5State), PRG_RAM_SIZE);
+    if (s->chr_is_ram && s->chr_size > 0u) {
+        memcpy(s->chr, buf + sizeof(Mmc5State) + PRG_RAM_SIZE, s->chr_size);
+    }
+    return true;
+}
+
 static const MapperVTable MMC5_VTABLE = {
     mmc5_read_prg, NULL, mmc5_write_prg,
     mmc5_read_chr, NULL, mmc5_write_chr,
     mmc5_mirror_mode, mmc5_chr_is_ram, mmc5_has_battery,
     mmc5_irq_pending, mmc5_clock_irq, mmc5_reset_scanline_counter,
-    NULL, NULL, mmc5_destroy
+    NULL, NULL, mmc5_destroy,
+    mmc5_save_state, mmc5_load_state
 };
 
 int mmc5_create(const uint8_t* prg, uint32_t prg_size,

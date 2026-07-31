@@ -30,6 +30,7 @@
 #include "ppu.h"
 #include "ppu_render.h"
 #include "apu.h"
+#include "joypad.h"
 #include "region.h"
 #include <string.h>
 
@@ -44,6 +45,7 @@ void bus_init(Bus* bus) {
     ppu_init(&bus->ppu);
     apu_init(&bus->apu);
     memset(bus->apu_open_bus, 0, BUS_APU_IO_REG_COUNT);
+    joypad_init(&bus->joypad);
     bus->cartridge = NULL;
     bus->dma_stall_cycles = 0u;
     bus->cpu_cycle_count = 0u;
@@ -282,13 +284,19 @@ uint8_t bus_read(Bus* bus, uint16_t addr) {
         return apu_status_read(bus);
     }
     if (addr == 0x4016u) {
-        /* $4016: controller 1 + open-bus bits 1-7. M4.5: joypad device; until
-         * then return the open-bus latch (bit 0 = 0 = no button). */
-        return apu_read_open_bus(bus, 0x16u);
+        /* $4016: controller 1 bit 0 + open-bus bits 1-7. (bus.rs lines
+         * 393-396.) */
+        uint8_t ob = apu_read_open_bus(bus, 0x16u);
+        uint8_t jb = joypad_read(&bus->joypad, 0u);
+        return (uint8_t)((jb & 0x01u) | (ob & 0xFEu));
     }
     if (addr == 0x4017u) {
-        /* $4017: controller 2 + open-bus bits 1-7. M4.5: joypad device. */
-        return apu_read_open_bus(bus, 0x17u);
+        /* $4017: controller 2 bit 0 + open-bus bits 1-7. The APU frame
+         * counter is write-only on $4017; reads do not affect it.
+         * (bus.rs lines 399-402.) */
+        uint8_t ob = apu_read_open_bus(bus, 0x17u);
+        uint8_t jb = joypad_read(&bus->joypad, 1u);
+        return (uint8_t)((jb & 0x01u) | (ob & 0xFEu));
     }
     if (addr <= 0x401Fu) {
         /* $4018-$401F: APU/IO test mode — disabled, reads as open bus (0). */
@@ -351,9 +359,11 @@ void bus_write(Bus* bus, uint16_t addr, uint8_t value) {
         return;
     }
     if (addr == 0x4016u) {
-        /* $4016: controller strobe (bit 0). M4.5: joypad device; until then
-         * latch open bus only. */
+        /* $4016: controller strobe (bit 0) + open-bus latch. The strobe
+         * line is routed to the joypad device; the full byte is latched
+         * on the open bus. (bus.rs lines 384-387.) */
         bus->apu_open_bus[0x16u] = value;
+        joypad_write_strobe(&bus->joypad, value);
         return;
     }
     if (addr == 0x4017u) {
@@ -435,6 +445,16 @@ const uint8_t* bus_apu_open_bus(const Bus* bus) {
 
 uint8_t* bus_apu_open_bus_mut(Bus* bus) {
     return bus->apu_open_bus;
+}
+
+/* ---- Joypad direct access (M4.5) ------------------------------------- */
+
+Joypad* bus_joypad(Bus* bus) {
+    return &bus->joypad;
+}
+
+const Joypad* bus_joypad_const(const Bus* bus) {
+    return &bus->joypad;
 }
 
 /* ---- PPU direct access (M4.2) ---------------------------------------- */
