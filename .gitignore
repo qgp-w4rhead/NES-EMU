@@ -21,6 +21,10 @@ secrets.local.example
 /cores/cpp/*.exe
 /cores/cpp/*.lib
 /cores/cpp/*.o
+/cores/cpp/*.dll
+/cores/cpp/*.exp
+/cores/cpp/src/*.obj
+/cores/cpp/tests/*.obj
 /cores/zig/*.exe
 /cores/zig/*.lib
 /cores/zig/*.o

@@ -1,0 +1,22 @@
+; nes_core.def - Windows export definitions for the NES C++ core DLL.
+;
+; Lists the 13 functions of the cores/protocol.h C ABI exported by
+; src/core_api.cpp (M5). The DLL target (nes_core_cpp.dll) links core_api.obj
+; against the static library nes_core_cpp.lib and exports these symbols
+; undecorated via this .def file.
+LIBRARY nes_core_cpp
+EXPORTS
+    nes_core_create
+    nes_core_destroy
+    nes_core_reset
+    nes_core_set_region
+    nes_core_step_frame
+    nes_core_step_instruction
+    nes_core_framebuffer
+    nes_core_take_audio
+    nes_core_save_state
+    nes_core_load_state
+    nes_core_mapper_number
+    nes_core_impl_name
+    nes_core_impl_version
+
