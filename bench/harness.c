@@ -735,7 +735,7 @@ static int sub_recv_ok(subproc_t* sp, uint8_t* scratch, size_t scratch_cap) {
         uint8_t lenb[2];
         if (read_all(sp, lenb, 2)) return -1;
         uint16_t mlen = get_u16_le(lenb);
-        if (mlen > scratch_cap) return -1;
+        if (mlen >= scratch_cap) return -1;
         if (read_all(sp, scratch, mlen)) return -1;
         scratch[mlen] = '\0';
         return 0xFF;
@@ -922,6 +922,148 @@ done:
 }
 
 /* -------------------------------------------------------------------------
+ * Subprocess benchmark mode (--subprocess-bench <cmd>)
+ *
+ * Wraps the M3 binary protocol behind the same benchmark loop used for
+ * shared-library cores, but with BATCHED round-trips to amortize IPC
+ * overhead (M10/M11 spec: batch size 100 frames/instructions per
+ * round-trip, configurable via --subprocess-batch-size). Per-iteration
+ * sample = wall-clock time for ONE batch (includes IPC overhead, per M10
+ * acceptance: "Performance measured as wall-clock per batch"). Warm-up
+ * runs at least 100 frames before timing so V8 TurboFan / CPython JIT
+ * reach stable performance (M10 acceptance).
+ * ------------------------------------------------------------------------- */
+
+/* Drain one RESULT payload, optionally capturing the cycle count. Returns
+ * 0 on success, -1 on protocol error. fb/audio payloads are discarded into
+ * `scratch`. */
+static int sub_recv_result_drain(subproc_t* sp, uint8_t* scratch, size_t scratch_cap,
+                                 uint32_t* out_cycles) {
+    uint8_t hdr[12];
+    if (read_all(sp, hdr, 12)) return -1;
+    if (out_cycles) *out_cycles = get_u32_le(hdr);
+    uint32_t fb_len = get_u32_le(hdr + 4);
+    uint32_t au_len = get_u32_le(hdr + 8);
+    size_t fb_bytes = (size_t)fb_len * 4;
+    if (fb_bytes > scratch_cap) return -1;
+    if (fb_bytes && read_all(sp, scratch, fb_bytes)) return -1;
+    size_t au_bytes = (size_t)au_len * 2;
+    if (au_bytes > scratch_cap) return -1;
+    if (au_bytes && read_all(sp, scratch, au_bytes)) return -1;
+    return 0;
+}
+
+/* Run one benchmark against a spawned subprocess. `name` selects the
+ * benchmark. Fills `out`. Returns 0 on success. */
+static int sub_bench_one(subproc_t* sp, const uint8_t* rom, size_t rom_len,
+                         const char* name, uint32_t frames, uint32_t instructions,
+                         uint32_t batch, bench_result* out) {
+    static uint8_t scratch[1 << 20]; /* 1 MiB; fb=256*240*4=245760 fits */
+    uint8_t save_blob[1 << 16];
+    size_t save_len = 0;
+    int is_frame = (strcmp(name, "step_frame") == 0 || strcmp(name, "render_frame") == 0);
+    int is_cpu   = (strcmp(name, "cpu_step") == 0);
+    int is_save  = (strcmp(name, "save_state") == 0);
+    if (!is_frame && !is_cpu && !is_save) {
+        fprintf(stderr, "harness: subprocess: unknown benchmark '%s'\n", name);
+        return 1;
+    }
+
+    /* RESET before each benchmark for a clean state. */
+    if (sub_send_reset(sp)) return 1;
+    if (sub_recv_ok(sp, scratch, sizeof(scratch)) != 0) {
+        fprintf(stderr, "harness: subprocess: RESET failed for '%s'\n", name);
+        return 1;
+    }
+
+    if (is_save) {
+        /* 1 warm-up frame so the core has rendered something to serialize. */
+        if (sub_send_step_frame(sp, 1)) return 1;
+        if (sub_recv_result_drain(sp, scratch, sizeof(scratch), NULL)) return 1;
+
+        /* Probe save blob size once. */
+        if (sub_send_save_state(sp)) return 1;
+        save_len = 0;
+        if (sub_recv_save_result(sp, scratch, sizeof(scratch), &save_len)) return 1;
+        if (save_len > sizeof(save_blob)) {
+            fprintf(stderr, "harness: subprocess: save blob %zu too large\n", save_len);
+            return 1;
+        }
+        memcpy(save_blob, scratch, save_len);
+        if (sub_send_load_state(sp, save_blob, save_len)) return 1;
+        if (sub_recv_ok(sp, scratch, sizeof(scratch)) != 0) return 1;
+
+        uint64_t iters = frames; /* save_state uses `frames` as iter count */
+        uint64_t warm = warmup_count(iters);
+        for (uint64_t i = 0; i < warm; ++i) {
+            if (sub_send_save_state(sp)) return 1;
+            size_t n = 0;
+            if (sub_recv_save_result(sp, scratch, sizeof(scratch), &n)) return 1;
+            if (sub_send_load_state(sp, scratch, n)) return 1;
+            if (sub_recv_ok(sp, scratch, sizeof(scratch)) != 0) return 1;
+        }
+
+        int64_t* samples = (int64_t*)malloc((size_t)iters * sizeof(int64_t));
+        if (!samples) return 1;
+        for (uint64_t i = 0; i < iters; ++i) {
+            int64_t t0 = now_ns();
+            if (sub_send_save_state(sp)) { free(samples); return 1; }
+            size_t n = 0;
+            if (sub_recv_save_result(sp, scratch, sizeof(scratch), &n)) { free(samples); return 1; }
+            if (sub_send_load_state(sp, scratch, n)) { free(samples); return 1; }
+            if (sub_recv_ok(sp, scratch, sizeof(scratch)) != 0) { free(samples); return 1; }
+            int64_t t1 = now_ns();
+            samples[i] = t1 - t0;
+        }
+        stats_compute(samples, iters, &out->stats);
+        free(samples);
+        out->name = "save_state";
+        out->iterations = iters;
+        return 0;
+    }
+
+    /* step_frame / render_frame / cpu_step: batched round-trips. */
+    uint32_t total = is_cpu ? instructions : frames;
+    if (batch == 0) batch = 100;
+    uint32_t iters = total / batch;            /* timed batches */
+    if (iters == 0) iters = 1;
+    uint32_t covered = iters * batch;          /* frames/instr actually timed */
+
+    /* Warm-up: at least 100 frames (M10) OR 10% of total, whichever is
+     * larger, sent in batches and discarded. */
+    uint32_t warm_frames = total / WARMUP_FRACTION;
+    if (warm_frames < 100) warm_frames = 100;
+    /* Send warm-up in batch-sized chunks. */
+    while (warm_frames > 0) {
+        uint32_t n = (warm_frames >= batch) ? batch : warm_frames;
+        if (is_cpu) { if (sub_send_step_instr(sp, n)) return 1; }
+        else        { if (sub_send_step_frame(sp, n)) return 1; }
+        if (sub_recv_result_drain(sp, scratch, sizeof(scratch), NULL)) return 1;
+        warm_frames -= n;
+    }
+
+    int64_t* samples = (int64_t*)malloc((size_t)iters * sizeof(int64_t));
+    if (!samples) return 1;
+    for (uint32_t i = 0; i < iters; ++i) {
+        int64_t t0 = now_ns();
+        if (is_cpu) { if (sub_send_step_instr(sp, batch)) { free(samples); return 1; } }
+        else        { if (sub_send_step_frame(sp, batch)) { free(samples); return 1; } }
+        if (sub_recv_result_drain(sp, scratch, sizeof(scratch), NULL)) { free(samples); return 1; }
+        int64_t t1 = now_ns();
+        samples[i] = t1 - t0; /* per-batch wall-clock (includes IPC overhead) */
+    }
+    stats_compute(samples, iters, &out->stats);
+    free(samples);
+    out->name = name;
+    out->iterations = iters;
+    (void)covered;
+    (void)rom; (void)rom_len;
+    return 0;
+}
+
+/* subprocess_bench_run is defined after cli_opts + ALL_BENCHES (below). */
+
+/* -------------------------------------------------------------------------
  * CLI
  * ------------------------------------------------------------------------- */
 
@@ -934,6 +1076,8 @@ typedef struct {
     int         csv;                /* --csv                               */
     int         verbose;            /* --verbose                           */
     const char* subprocess_cmd;     /* --subprocess-test <cmd>             */
+    const char* subprocess_bench_cmd; /* --subprocess-bench <cmd>          */
+    const char* subprocess_name;    /* --subprocess-name <name> (optional) */
     uint32_t    subprocess_batch;   /* --subprocess-batch-size (default 100) */
 } cli_opts;
 
@@ -946,6 +1090,8 @@ static void cli_defaults(cli_opts* o) {
     o->csv = 0;
     o->verbose = 0;
     o->subprocess_cmd = NULL;
+    o->subprocess_bench_cmd = NULL;
+    o->subprocess_name = NULL;
     o->subprocess_batch = 100;
 }
 
@@ -991,6 +1137,12 @@ static int cli_parse(cli_opts* o, int argc, char** argv) {
         } else if (strcmp(a, "--subprocess-test") == 0) {
             if (!val) { if (++i >= argc) return 1; val = argv[i]; }
             o->subprocess_cmd = val;
+        } else if (strcmp(a, "--subprocess-bench") == 0) {
+            if (!val) { if (++i >= argc) return 1; val = argv[i]; }
+            o->subprocess_bench_cmd = val;
+        } else if (strcmp(a, "--subprocess-name") == 0) {
+            if (!val) { if (++i >= argc) return 1; val = argv[i]; }
+            o->subprocess_name = val;
         } else if (strcmp(a, "--subprocess-batch-size") == 0) {
             if (!val) { if (++i >= argc) return 1; val = argv[i]; }
             o->subprocess_batch = (uint32_t)strtoul(val, NULL, 10);
@@ -1005,6 +1157,8 @@ static int cli_parse(cli_opts* o, int argc, char** argv) {
                 "  --csv               Also output CSV summary\n"
                 "  --verbose           Per-iteration timing\n"
                 "  --subprocess-test <cmd>   Run subprocess protocol echo test\n"
+                "  --subprocess-bench <cmd>  Run all 4 benchmarks against a subprocess core\n"
+                "  --subprocess-name <name>  Override subprocess core display name\n"
                 "  --subprocess-batch-size N (default 100)\n");
             exit(0);
         } else if (starts_with(a, "--")) {
@@ -1031,6 +1185,7 @@ static const char** collect_core_paths(int argc, char** argv, int* out_n) {
                 (strcmp(a, "--core") == 0 || strcmp(a, "--bench") == 0 ||
                  strcmp(a, "--frames") == 0 || strcmp(a, "--instructions") == 0 ||
                  strcmp(a, "--output") == 0 || strcmp(a, "--subprocess-test") == 0 ||
+                 strcmp(a, "--subprocess-bench") == 0 || strcmp(a, "--subprocess-name") == 0 ||
                  strcmp(a, "--subprocess-batch-size") == 0)) {
                 ++i; /* consume value */
             }
@@ -1070,6 +1225,121 @@ static void core_display_name(const char* path, char* out, size_t cap) {
 
 static const char* ALL_BENCHES[4] = { "step_frame", "cpu_step", "save_state", "render_frame" };
 
+/* Full definition of subprocess_bench_run (forward-declared earlier). Runs
+ * all selected benchmarks against a subprocess core via the M3 binary
+ * protocol with batched round-trips, and emits JSON/CSV results. */
+static int subprocess_bench_run(const char* cmdline, const char* display_name,
+                                const cli_opts* opts, const uint8_t* rom, size_t rom_len) {
+    subproc_t sp;
+    if (sub_spawn(&sp, cmdline)) {
+        fprintf(stderr, "harness: subprocess-bench: spawn failed for '%s'\n", cmdline);
+        return 1;
+    }
+    printf("[subprocess-bench] spawning: %s\n", cmdline);
+
+    /* INIT with the NOP ROM. */
+    if (sub_send_init(&sp, rom, rom_len)) {
+        fprintf(stderr, "  INIT send FAILED\n");
+        sub_close(&sp);
+        return 1;
+    }
+    static uint8_t ok_scratch[256];
+    if (sub_recv_ok(&sp, ok_scratch, sizeof(ok_scratch)) != 0) {
+        fprintf(stderr, "  INIT recv FAILED\n");
+        sub_close(&sp);
+        return 1;
+    }
+    printf("  INIT -> OK\n");
+
+    /* Determine which benchmarks to run. */
+    const char* benches[4];
+    uint32_t n_benches = 0;
+    if (opts->bench_filter) {
+        benches[n_benches++] = opts->bench_filter;
+    } else {
+        for (int i = 0; i < 4; ++i) benches[n_benches++] = ALL_BENCHES[i];
+    }
+
+    /* Derive a display name. */
+    char name[64];
+    if (display_name && display_name[0]) {
+        strncpy(name, display_name, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    } else {
+        const char* hint = "subprocess";
+        if (strstr(cmdline, "typescript") || strstr(cmdline, "main.js")) hint = "typescript-nes";
+        else if (strstr(cmdline, "python") || strstr(cmdline, ".py")) hint = "python-nes";
+        strncpy(name, hint, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    }
+
+    core_result cr;
+    memset(&cr, 0, sizeof(cr));
+    strncpy(cr.name, name, sizeof(cr.name) - 1);
+    strncpy(cr.version, "0.1.0", sizeof(cr.version) - 1);
+    cr.mapper = 0; /* NOP ROM is mapper 0 */
+
+    printf("[harness] core=%s version=%s mapper=%u — running %u benchmark(s) (batch=%u)\n",
+           cr.name, cr.version, (unsigned)cr.mapper, n_benches, opts->subprocess_batch);
+
+    int rc = 0;
+    for (uint32_t b = 0; b < n_benches; ++b) {
+        bench_result* br = &cr.results[cr.n_results];
+        if (sub_bench_one(&sp, rom, rom_len, benches[b],
+                          opts->frames, opts->instructions,
+                          opts->subprocess_batch, br)) {
+            fprintf(stderr, "  benchmark '%s' FAILED\n", benches[b]);
+            rc = 1;
+            continue;
+        }
+        cr.n_results++;
+        /* Per-batch wall-clock (includes IPC). Also print per-unit for
+         * comparison with shared-library cores. */
+        double per_unit_us = br->stats.mean_ns / 1000.0 / (double)opts->subprocess_batch;
+        if (strcmp(br->name, "cpu_step") == 0) {
+            double per_unit_ns = br->stats.mean_ns / (double)opts->subprocess_batch;
+            printf("  %-12s batches=%-8llu mean=%.3f us/batch  per-instr=%.1f ns  p50=%.3f us  std=%.3f\n",
+                   br->name, (unsigned long long)br->iterations,
+                   br->stats.mean_ns / 1000.0, per_unit_ns,
+                   br->stats.p50_ns / 1000.0, br->stats.stddev_ns / 1000.0);
+        } else if (strcmp(br->name, "save_state") == 0) {
+            printf("  %-12s iters=%-8llu  mean=%.3f us/round-trip  p50=%.3f us  std=%.3f\n",
+                   br->name, (unsigned long long)br->iterations,
+                   br->stats.mean_ns / 1000.0,
+                   br->stats.p50_ns / 1000.0, br->stats.stddev_ns / 1000.0);
+        } else {
+            printf("  %-12s batches=%-8llu mean=%.3f us/batch  per-frame=%.3f us  p50=%.3f us  std=%.3f\n",
+                   br->name, (unsigned long long)br->iterations,
+                   br->stats.mean_ns / 1000.0, per_unit_us,
+                   br->stats.p50_ns / 1000.0, br->stats.stddev_ns / 1000.0);
+        }
+        if (opts->verbose) {
+            printf("    p95=%.3f us/batch  p99=%.3f us/batch\n",
+                   br->stats.p95_ns / 1000.0, br->stats.p99_ns / 1000.0);
+        }
+    }
+
+    sub_close(&sp);
+
+    /* Output JSON/CSV. */
+    FILE* out = stdout;
+    if (opts->output) {
+        out = fopen(opts->output, "w");
+        if (!out) {
+            fprintf(stderr, "harness: cannot open --output '%s' (%s); using stdout\n",
+                    opts->output, strerror(errno));
+            out = stdout;
+        }
+    }
+    print_json(out, &cr, 1);
+    if (opts->csv) {
+        print_csv(stdout, &cr, 1);
+    }
+    if (out != stdout) fclose(out);
+
+    return rc;
+}
+
 int main(int argc, char** argv) {
     cli_opts opts;
     if (cli_parse(&opts, argc, argv)) {
@@ -1082,6 +1352,13 @@ int main(int argc, char** argv) {
     /* Subprocess echo test mode: verify protocol framing, then exit. */
     if (opts.subprocess_cmd) {
         return subprocess_echo_test(opts.subprocess_cmd, rom, rom_len);
+    }
+
+    /* Subprocess benchmark mode: run all 4 benchmarks against a subprocess
+     * core via the M3 binary protocol with batched round-trips. */
+    if (opts.subprocess_bench_cmd) {
+        return subprocess_bench_run(opts.subprocess_bench_cmd, opts.subprocess_name,
+                                    &opts, rom, rom_len);
     }
 
     int n_paths = 0;
