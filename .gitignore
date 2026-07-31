@@ -1,12 +1,34 @@
 # Agent / tooling artifacts
 /.devin/
 /.agent/
+/AGENT/
+/tasklist
 /context/
 secrets.local
 secrets.local.example
 
 # Rust build artifacts
 /target/
+
+# Polyglot core build artifacts (M4+)
+/cores/rust/target/
+/cores/c/*.lib
+/cores/c/*.exe
+/cores/c/src/*.obj
+/cores/c/tests/*.obj
+/cores/cpp/*.exe
+/cores/cpp/*.lib
+/cores/cpp/*.o
+/cores/zig/*.exe
+/cores/zig/*.lib
+/cores/zig/*.o
+/cores/go/*.exe
+/cores/go/*.lib
+/cores/csharp/*.dll
+/cores/csharp/*.obj
+/bench/*.exe
+/bench/*.obj
+/bench/*.o
 
 # Emulator runtime artifacts
 *.nessav
@@ -18,3 +40,16 @@ secrets.local.example
 
 # Emulator Test Rom
 /tests/real_roms/
+
+# Added by nes-emulator-engineer co-agent runner
+.devin/config.local.json
+.agent/_cycles/
+agent-log.md
+.agent/pause
+.agent/daemon.pid
+.agent/journal.md
+agent.readme.md
+AGENTS.md
+role-context.md
+tech-stack.md
+.gitignore
