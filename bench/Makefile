@@ -1,28 +1,63 @@
-# bench/Makefile — build the cross-language benchmark harness (scaffold).
+# bench/Makefile — build the cross-language benchmark harness.
 #
-# Full targets land in M3. For now this verifies the harness compiles under a
-# C compiler against cores/protocol.h.
+# Builds bench/harness(.exe) which loads any core shared library
+# implementing cores/protocol.h and runs the M3 benchmark suite.
+#
+# Windows (MSVC, via vcvarsall):
+#   nmake /f Makefile            # build harness.exe
+#   nmake /f Makefile clean
+#   (or use ..\build-harness.ps1 which calls vcvarsall for you)
+#
+# Linux / macOS (GNU make + cc):
+#   make                         # build harness
+#   make clean
+#
+# The Makefile auto-detects Windows via the OS environment variable and
+# selects cl/nmake-style flags; otherwise it falls back to cc/GNU make.
 
-CC      ?= cc
-CFLAGS  ?= -std=c99 -Wall -Wextra -O2 -I.
+!IF "$(OS)" == "Windows_NT"
+# ---- Windows / MSVC (nmake) ----
+CC      = cl
+CFLAGS  = /nologo /std:c11 /O2 /W3 /wd4996 /D_CRT_SECURE_NO_WARNINGS /I.
+LDFLAGS = /nologo
+HARNESS = harness.exe
+OBJ     = obj
+LINK    = $(CC) /Fe:$(HARNESS) $(LDFLAGS)
+RM      = -del 2>NUL
+!ELSE
+# ---- POSIX (GNU make + cc) ----
+CC     ?= cc
+CFLAGS ?= -std=c11 -O2 -Wall -Wextra -I.
 LDFLAGS ?=
+HARNESS = harness
+OBJ    = o
+LINK   = $(CC) -o $(HARNESS) $(LDFLAGS)
+RM     = rm -f
+!ENDIF
 
-HARNESS_SRC = harness.c
-GENROM_SRC  = gen_rom.c
+HEADERS = harness.h gen_rom.h ../cores/protocol.h
+OBJS    = harness.$(OBJ) gen_rom.$(OBJ)
 
-.PHONY: all clean check
+.PHONY: all clean check rust-core
 
-all: harness
+all: $(HARNESS)
 
-harness: $(HARNESS_SRC) harness.h ../cores/protocol.h
-	$(CC) $(CFLAGS) -o $@ $(HARNESS_SRC) $(LDFLAGS)
+$(HARNESS): $(OBJS)
+	$(LINK) $(OBJS)
 
-gen_rom: $(GENROM_SRC) ../cores/protocol.h
-	$(CC) $(CFLAGS) -c -o $@.o $(GENROM_SRC)
+harness.$(OBJ): harness.c $(HEADERS)
+	$(CC) $(CFLAGS) /c harness.c /Fo:harness.$(OBJ)
 
-# Compile-only check used by M1 acceptance: header must parse under C.
-check: harness.h ../cores/protocol.h
-	$(CC) $(CFLAGS) -fsyntax-only $(HARNESS_SRC)
+gen_rom.$(OBJ): gen_rom.c gen_rom.h ../cores/protocol.h
+	$(CC) $(CFLAGS) /c gen_rom.c /Fo:gen_rom.$(OBJ)
+
+# Compile-only check (header parses under C).
+check: $(HEADERS)
+	$(CC) $(CFLAGS) /c harness.c /Fo:NUL
+
+# Build the reference Rust cdylib (invokes cargo in cores/rust).
+rust-core:
+	cd ..\cores\rust && cargo build --release
 
 clean:
-	rm -f harness gen_rom.o
+	$(RM) $(HARNESS) $(OBJS)
