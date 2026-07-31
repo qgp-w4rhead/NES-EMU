@@ -32,6 +32,16 @@ secrets.local.example
 /cores/go/*.lib
 /cores/csharp/*.dll
 /cores/csharp/*.obj
+/cores/java/classes/
+/cores/java/test-classes/
+/cores/java/*.dll
+/cores/java/*.obj
+/cores/java/*.lib
+/cores/java/*.exp
+/cores/java/nes_core_java.h
+/cores/java/nes_core_java_dynamic.h
+/cores/java/graal_isolate.h
+/cores/java/graal_isolate_dynamic.h
 /bench/*.exe
 /bench/*.obj
 /bench/*.o
