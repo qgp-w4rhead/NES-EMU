@@ -1,19 +1,13 @@
 /*
  * bus.h — CPU memory bus: address-space routing + mirroring.
  *
- * Port of src/bus.rs to C (M4.1). The Bus struct owns 2 KB RAM, the APU/IO
- * open-bus latch array (0x18 bytes covering $4000-$4017), an optional
- * Cartridge pointer, the OAM-DMA stall counter, and the CPU cycle counter.
- *
- * IMPORTANT (M4.1 scope): The PPU and APU devices are NOT ported yet
- * (PPU = M4.2, APU = M4.3). The address-space ROUTING/DECODE here is complete
- * and matches bus.rs read()/write() EXACTLY, but PPU register accesses
- * ($2000-$3FFF) and APU register accesses ($4000-$4017) route to the
- * `apu_open_bus` latch (open-bus behaviour) for now. This is the correct
- * behaviour for a system with no PPU/APU device attached and is exactly what
- * the NOP ROM test requires. When M4.2/M4.3 plug in real devices, the device
- * calls inside ppu_read/ppu_write/apu_*_write will be filled in — the routing
- * switch itself does not change.
+ * Port of src/bus.rs to C. M4.1 introduced the address-space routing/decode
+ * with PPU/APU devices routed to the open-bus latch (no real devices yet).
+ * M4.2 plugs in a real PPU: the Bus now owns a `Ppu` struct (like Rust's Bus
+ * owns Ppu), PPU register reads/writes ($2000-$3FFF) route to the PPU, and
+ * OAM-DMA ($4014) copies 256 bytes into the PPU's OAM. The APU device is still
+ * M4.3 — APU register accesses ($4000-$4017) continue to route to the
+ * `apu_open_bus` latch.
  *
  * See: https://www.nesdev.org/wiki/CPU_memory_map
  */
@@ -22,6 +16,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "ppu.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,12 +43,16 @@ extern "C" {
 
 struct Cartridge; /* forward decl from cartridge.h */
 
-/* The CPU memory bus — owns RAM, APU/IO open-bus latch, optional cartridge,
- * OAM-DMA stall counter, and CPU cycle counter. (bus.rs `struct Bus`, minus
- * the PPU/APU/Joypad devices which are M4.2/M4.3.) */
+/* The CPU memory bus — owns RAM, the PPU, APU/IO open-bus latch, optional
+ * cartridge, OAM-DMA stall counter, and CPU cycle counter. (bus.rs `struct
+ * Bus`; the Bus owns the Ppu like Rust's Bus owns Ppu — M4.2.) */
 typedef struct Bus {
     /* 2 KB internal CPU RAM ($0000-$07FF). */
     uint8_t ram[BUS_RAM_SIZE];
+
+    /* The Picture Processing Unit. Owned by the bus (M4.2). PPU register
+     * accesses ($2000-$3FFF) and OAM-DMA ($4014) route here. (bus.rs `ppu`.) */
+    Ppu ppu;
 
     /* Open-bus latch for the APU/IO register window ($4000-$4017). Indexed by
      * (addr - 0x4000). Reads of write-only registers return the last written
@@ -132,6 +131,13 @@ uint8_t* bus_ram_mut(Bus* bus);
 
 const uint8_t* bus_apu_open_bus(const Bus* bus);
 uint8_t* bus_apu_open_bus_mut(Bus* bus);
+
+/* ---- PPU direct access (M4.2) ---------------------------------------- */
+
+/* Borrow the bus's owned PPU. (The Bus owns the Ppu; this is the C equivalent
+ * of bus.rs `&mut self.ppu`.) */
+Ppu* bus_ppu(Bus* bus);
+const Ppu* bus_ppu_const(const Bus* bus);
 
 #ifdef __cplusplus
 }

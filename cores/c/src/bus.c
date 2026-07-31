@@ -1,41 +1,40 @@
 /*
  * bus.c — CPU memory bus address-space routing + mirroring.
  *
- * Port of src/bus.rs to C (M4.1). The address decode in bus_read / bus_write
- * matches bus.rs `read()` / `write()` EXACTLY, region for region:
+ * Port of src/bus.rs to C. M4.1 introduced the address-space routing/decode
+ * with PPU/APU devices routed to the open-bus latch. M4.2 plugs in a real PPU:
+ * PPU register reads/writes ($2000-$3FFF) route to the bus's owned Ppu, with
+ * PPUDATA (reg 7) handled here for CHR routing through the cartridge
+ * (ppu_read_ppudata / ppu_write_ppudata, matching bus.rs:433-499). OAM-DMA
+ * ($4014) now copies 256 bytes into the PPU's OAM via ppu_oam_dma. The APU
+ * device is still M4.3 — APU register accesses ($4000-$4017) continue to
+ * route to the `apu_open_bus` latch.
+ *
+ * Address decode in bus_read / bus_write matches bus.rs `read()` / `write()`
+ * exactly, region for region:
  *   $0000-$1FFF: 2 KB RAM (mirrored 3x via RAM_MASK)
- *   $2000-$3FFF: PPU registers (mirrored every 8 bytes)
- *   $4000-$4007: pulse channel regs (open-bus latch in M4.1)
- *   $4008-$400B: triangle channel regs (open-bus latch in M4.1)
- *   $400C-$400F: noise channel regs (open-bus latch in M4.1)
- *   $4010-$4013: DMC channel regs (open-bus latch in M4.1)
- *   $4014:       OAMDMA — write triggers 256-byte DMA + 512/513 cycle stall
- *   $4015:       APU status (open-bus latch in M4.1)
- *   $4016:       controller 1 strobe (open-bus latch in M4.1)
- *   $4017:       controller 2 / frame counter (open-bus latch in M4.1)
+ *   $2000-$3FFF: PPU registers (mirrored every 8 bytes) -> Ppu (M4.2)
+ *   $4000-$4007: pulse channel regs (open-bus latch; APU = M4.3)
+ *   $4008-$400B: triangle channel regs (open-bus latch; APU = M4.3)
+ *   $400C-$400F: noise channel regs (open-bus latch; APU = M4.3)
+ *   $4010-$4013: DMC channel regs (open-bus latch; APU = M4.3)
+ *   $4014:       OAMDMA — write triggers 256-byte DMA into PPU OAM + 512/513 stall
+ *   $4015:       APU status (open-bus latch; APU = M4.3)
+ *   $4016:       controller 1 strobe (open-bus latch; joypad = M4.5)
+ *   $4017:       controller 2 / frame counter (open-bus latch; APU = M4.3)
  *   $4018-$401F: disabled test region (reads 0, writes ignored)
  *   $4020-$FFFF: cartridge space (PRG-RAM / PRG-ROM / mapper regs)
- *
- * M4.1 SCOPE: PPU and APU devices are not ported yet (PPU = M4.2, APU = M4.3).
- * PPU register reads/writes ($2000-$3FFF) route to the apu_open_bus latch
- * (open-bus behaviour) — this is the correct behaviour for a system with no
- * PPU/APU device attached and is what the NOP ROM test needs. The routing
- * decode itself is complete and correct; M4.2/M4.3 will plug in real device
- * calls inside ppu_read/ppu_write/apu_*_write without changing the switch.
- *
- * OAM-DMA: in M4.1 there is no PPU OAM to copy into, so the 256-byte copy is
- * performed into a local buffer (matching the read side-effect sequence) and
- * the 512/513-cycle stall is recorded. The PPU device (M4.2) will consume the
- * buffer; for M4.1 the stall accounting is what the test exercises.
  */
 #include "bus.h"
 #include "cartridge.h"
+#include "ppu.h"
 #include <string.h>
 
 /* ---- Construction ----------------------------------------------------- */
 
 void bus_init(Bus* bus) {
     memset(bus->ram, 0, BUS_RAM_SIZE);
+    ppu_init(&bus->ppu);
     memset(bus->apu_open_bus, 0, BUS_APU_IO_REG_COUNT);
     bus->cartridge = NULL;
     bus->dma_stall_cycles = 0u;
@@ -45,11 +44,17 @@ void bus_init(Bus* bus) {
 void bus_init_with_cartridge(Bus* bus, struct Cartridge* cartridge) {
     bus_init(bus);
     bus->cartridge = cartridge;
+    if (cartridge) {
+        ppu_set_mirroring(&bus->ppu, cartridge_mirror_mode(cartridge));
+    }
 }
 
 struct Cartridge* bus_insert_cartridge(Bus* bus, struct Cartridge* cartridge) {
     struct Cartridge* prev = bus->cartridge;
     bus->cartridge = cartridge;
+    if (cartridge) {
+        ppu_set_mirroring(&bus->ppu, cartridge_mirror_mode(cartridge));
+    }
     return prev;
 }
 
@@ -65,24 +70,81 @@ struct Cartridge* bus_cartridge(const Bus* bus) {
 
 /* ---- Internal helpers (mirror bus.rs private fn names) --------------- */
 
-/* ppu_read: PPU register read. In M4.1 (no PPU device) this returns the
- * APU/IO open-bus latch indexed by the de-mirrored register. This models the
- * "open bus" behaviour of a system with no PPU attached. (bus.rs `ppu_read`
- * delegates to Ppu::read_register; here we route to the shared open-bus latch
- * so the read is non-crashing and deterministic.) */
-static uint8_t ppu_read(Bus* bus, uint16_t reg) {
-    /* reg is already de-mirrored to 0..=7. We do NOT have a PPU open-bus
-     * latch separate from the APU one in M4.1; route to apu_open_bus[reg] so
-     * writes to $2000 are visible to reads of $2000 (matching the
-     * ppu_write_only_register_read_returns_open_bus test in bus.rs, which
-     * expects the last written value to come back). */
-    return bus->apu_open_bus[reg & 0x07u];
+/* ppu_read_ppudata: PPUDATA ($2007) read with buffered-read semantics and CHR
+ * routing through the cartridge. (bus.rs `ppu_read_ppudata`, lines 433-480.)
+ * See: https://www.nesdev.org/wiki/PPU_registers#PPUDATA */
+static uint8_t ppu_read_ppudata(Bus* bus) {
+    uint16_t addr = ppu_vram_addr(&bus->ppu);
+
+    if (addr >= 0x3F00u) {
+        /* Palette: returned value comes from palette RAM directly (bypassing
+         * the stale buffer), but the buffer is still loaded with the
+         * nametable byte at v & 0x2FFF per NESdev. Upper two bits of the
+         * value placed on the CPU bus come from the PPU open-bus latch. */
+        uint8_t pal = ppu_read_palette(&bus->ppu, addr);
+        uint8_t val = (uint8_t)((pal & 0x3Fu) | (ppu_open_bus(&bus->ppu) & 0xC0u));
+        uint16_t nt_addr = (uint16_t)(addr & 0x2FFFu);
+        uint8_t buffered_fill;
+        if (nt_addr < 0x2000u) {
+            buffered_fill = bus->cartridge ? cartridge_read_chr(bus->cartridge, nt_addr) : 0u;
+        } else {
+            buffered_fill = ppu_read_nametable(&bus->ppu, nt_addr);
+        }
+        ppu_set_ppudata_buffer(&bus->ppu, buffered_fill);
+        ppu_advance_vram_addr(&bus->ppu);
+        ppu_set_open_bus(&bus->ppu, val);
+        return val;
+    }
+
+    /* Buffered read: return the stale buffer, store the fresh value. */
+    uint8_t buffered = ppu_ppudata_buffer(&bus->ppu);
+    uint8_t raw;
+    if (addr < 0x2000u) {
+        raw = bus->cartridge ? cartridge_read_chr(bus->cartridge, addr) : 0u;
+    } else {
+        raw = ppu_read_nametable(&bus->ppu, addr);
+    }
+    ppu_set_ppudata_buffer(&bus->ppu, raw);
+    ppu_advance_vram_addr(&bus->ppu);
+    ppu_set_open_bus(&bus->ppu, buffered);
+    return buffered;
 }
 
-/* ppu_write: PPU register write. In M4.1 (no PPU device) this latches the
- * value on the shared open-bus slot so subsequent reads return it. */
+/* ppu_write_ppudata: PPUDATA ($2007) write with CHR routing and auto-increment.
+ * (bus.rs `ppu_write_ppudata`, lines 483-499.) */
+static void ppu_write_ppudata(Bus* bus, uint8_t value) {
+    uint16_t addr = ppu_vram_addr(&bus->ppu);
+    if (addr >= 0x3F00u) {
+        ppu_write_palette(&bus->ppu, addr, value);
+    } else if (addr < 0x2000u) {
+        if (bus->cartridge) {
+            cartridge_write_chr(bus->cartridge, addr, value);
+        }
+    } else {
+        ppu_write_nametable(&bus->ppu, addr, value);
+    }
+    /* Update open-bus latch (consistent with other PPU register writes). */
+    ppu_write_register(&bus->ppu, 7u, value); /* latches open_bus; reg 7 no-op */
+    ppu_advance_vram_addr(&bus->ppu);
+}
+
+/* ppu_read: PPU register read. Reg 7 (PPUDATA) is handled here for CHR
+ * routing; all other regs delegate to ppu_read_register. (bus.rs `ppu_read`.) */
+static uint8_t ppu_read(Bus* bus, uint16_t reg) {
+    if ((reg & 0x07u) == 7u) {
+        return ppu_read_ppudata(bus);
+    }
+    return ppu_read_register(&bus->ppu, reg);
+}
+
+/* ppu_write: PPU register write. Reg 7 (PPUDATA) is handled here for CHR
+ * routing; all other regs delegate to ppu_write_register. (bus.rs `ppu_write`.) */
 static void ppu_write(Bus* bus, uint16_t reg, uint8_t value) {
-    bus->apu_open_bus[reg & 0x07u] = value;
+    if ((reg & 0x07u) == 7u) {
+        ppu_write_ppudata(bus, value);
+        return;
+    }
+    ppu_write_register(&bus->ppu, reg, value);
 }
 
 /* apu_read: APU/IO register open-bus read. offset = addr - 0x4000 in 0..=0x17. */
@@ -95,30 +157,26 @@ static void apu_write(Bus* bus, uint16_t offset, uint8_t value) {
     bus->apu_open_bus[offset] = value;
 }
 
-/* oam_dma: copy 256 bytes from CPU page (page<<8) into a local buffer (M4.1:
- * no PPU OAM to receive). Latches the page on the open bus and records the
- * 512/513-cycle stall. The read side-effects fire in sequence, matching
- * bus.rs. (bus.rs `oam_dma`.) */
+/* oam_dma: copy 256 bytes from CPU page (page<<8) into the PPU's OAM via
+ * ppu_oam_dma. Latches the page on the open bus and records the 512/513-cycle
+ * stall. The read side-effects fire in sequence, matching bus.rs.
+ * (bus.rs `oam_dma`, lines 509-547.) */
 static void oam_dma(Bus* bus, uint8_t page) {
     uint16_t base = (uint16_t)((uint16_t)page << 8);
     uint8_t data[256];
     for (uint16_t i = 0; i < 256u; ++i) {
         data[i] = bus_read(bus, (uint16_t)(base + i));
     }
-    /* M4.1: no PPU OAM to write into; data is discarded but the read
-     * side-effects have fired. M4.2 will route this into ppu.oam_dma(&data). */
-    (void)data;
+    ppu_oam_dma(&bus->ppu, data);
     /* Latch the DMA page on the APU/IO open bus for $4014 reads. */
     bus->apu_open_bus[0x14u] = page;
     /* Any CPU bus write updates the shared open bus latch; writing $4014
-     * (outside PPU reg space) still updates the PPU open bus on real HW. We
-     * mirror that by writing into the PPU open-bus slot (apu_open_bus[0..7]). */
-    bus->apu_open_bus[0x00u] = page;
+     * (outside PPU reg space) still updates the PPU open bus on real HW. */
+    ppu_set_open_bus(&bus->ppu, page);
     /* OAM-DMA stalls the CPU for 512 cycles; +1 if the write to $4014 lands
      * on an odd CPU cycle (alignment to next even). (bus.rs `oam_dma`.) */
     uint32_t stall = (bus->cpu_cycle_count & 1u) ? 513u : 512u;
-    /* Saturating add (matches bus.rs:546 saturating_add). u32 overflow is
-     * practically impossible but we mirror Rust's defensive behaviour. */
+    /* Saturating add (matches bus.rs:546 saturating_add). */
     if (bus->dma_stall_cycles > 0xFFFFFFFFu - stall) {
         bus->dma_stall_cycles = 0xFFFFFFFFu;
     } else {
@@ -321,5 +379,15 @@ const uint8_t* bus_apu_open_bus(const Bus* bus) {
 
 uint8_t* bus_apu_open_bus_mut(Bus* bus) {
     return bus->apu_open_bus;
+}
+
+/* ---- PPU direct access (M4.2) ---------------------------------------- */
+
+Ppu* bus_ppu(Bus* bus) {
+    return &bus->ppu;
+}
+
+const Ppu* bus_ppu_const(const Bus* bus) {
+    return &bus->ppu;
 }
 
