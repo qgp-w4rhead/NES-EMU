@@ -1,0 +1,20 @@
+[package]
+name = "nes_core_rust"
+version = "0.1.0"
+edition = "2021"
+description = "Rust FFI wrapper exposing the nes-emu core behind the C ABI defined in cores/protocol.h"
+license = "MIT"
+publish = false
+
+[lib]
+name = "nes_core_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+nes-emu = { path = "../../" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
