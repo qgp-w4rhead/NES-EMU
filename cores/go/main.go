@@ -11,7 +11,6 @@ import "C"
 
 import (
 	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"nes-core-go/internal/bus"
@@ -58,7 +57,8 @@ var (
 func registerEmulator(e *Emulator) unsafe.Pointer {
 	handleMu.Lock()
 	defer handleMu.Unlock()
-	h := atomic.AddUintptr(&handleNext, 1)
+	handleNext++
+	h := handleNext
 	handles[h] = e
 	return unsafe.Pointer(h)
 }
@@ -193,6 +193,9 @@ func (e *Emulator) stepInstruction() uint32 {
 	cyclesPerSample := region.CPUCyclesPerSample(e.Region)
 	prerender := region.ScanlinePrerender(e.Region)
 	cycles, _ := e.stepOneCpuTick(prevScanline, cyclesPerSample, prerender)
+	// Keep the C-allocated framebuffer in sync so nes_core_framebuffer
+	// returns current data even after single-instruction steps.
+	e.syncFramebuffer()
 	return cycles
 }
 
@@ -223,9 +226,11 @@ func nes_core_create(romData *byte, romLen C.size_t) unsafe.Pointer {
 	e := newEmulator(region.NTSC)
 	e.Cart = cart
 	e.Bus.InsertCartridge(cart)
-	// Allocate a C-heap framebuffer so its address can be returned to C.
+	// Allocate a zeroed C-heap framebuffer so its address can be returned
+	// to C. calloc (not malloc) ensures deterministic bytes if the harness
+	// reads the framebuffer before the first step_frame call.
 	fbSize := C.size_t(ppu.FramebufferSize * 4)
-	e.cFramebuffer = unsafe.Pointer(C.malloc(fbSize))
+	e.cFramebuffer = unsafe.Pointer(C.calloc(fbSize, 1))
 	if e.cFramebuffer == nil {
 		return nil
 	}
@@ -325,23 +330,44 @@ func nes_core_take_audio(handle unsafe.Pointer, outBuf *C.int16_t, cap C.size_t)
 		if s < -1.0 {
 			s = -1.0
 		}
-		out[i] = C.int16_t(s * 32767.0)
+		// Asymmetric saturation matching C core_api.c: positive *32767,
+		// negative *32768, so -1.0 maps to -32768 (full-scale negative).
+		var v int32
+		if s >= 0.0 {
+			v = int32(s * 32767.0)
+			if v > 32767 {
+				v = 32767
+			}
+		} else {
+			v = int32(s * 32768.0)
+			if v < -32768 {
+				v = -32768
+			}
+		}
+		out[i] = C.int16_t(v)
 	}
-	e.AudioBuf = e.AudioBuf[n:]
+	// Reset the audio buffer to length 0, reusing the same backing array.
+	// This avoids heap allocations on subsequent append in pushAudio (the
+	// C reference does audio_buffer_count = 0 in emulator.c:240). Using
+	// e.AudioBuf[n:] would advance the slice window and eventually force
+	// a reallocation when append exceeds the remaining capacity.
+	e.AudioBuf = e.AudioBuf[:0]
 	return n
 }
 
 //export nes_core_save_state
 func nes_core_save_state(handle unsafe.Pointer, outBuf *byte, cap C.size_t) C.size_t {
+	// Match the C reference (core_api.c:144): NULL/zero-cap buffer is an
+	// error, not a size query. Callers allocate a generously-sized buffer.
+	if outBuf == nil || cap == 0 {
+		return 0
+	}
 	e := lookupEmulator(handle)
 	if e == nil {
 		return 0
 	}
 	st := e.saveState()
 	required := C.size_t(savestate.RequiredSize(st))
-	if outBuf == nil {
-		return required
-	}
 	if cap < required {
 		return 0
 	}

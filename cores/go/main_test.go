@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime"
 	"testing"
 	"unsafe"
 
@@ -116,6 +117,42 @@ func TestAudioDrain(t *testing.T) {
 	if len(e.AudioBuf) == 0 {
 		t.Fatal("no audio samples produced after one frame")
 	}
+}
+
+// TestNoHeapAllocInStepFrame verifies the M7 acceptance criterion: no heap
+// allocations during step_frame. We run a few warm-up frames, capture
+// runtime.MemStats, run 10 more frames, then check that HeapAlloc did not
+// grow (within a tiny tolerance for GC bookkeeping). The audio buffer is
+// pre-allocated and reused; the framebuffer is a fixed array. The only
+// allowed allocation growth is from the audio buffer capacity expansion
+// during early frames, which is why we warm up first.
+func TestNoHeapAllocInStepFrame(t *testing.T) {
+	e := newEmuFromRom(t)
+	e.Cpu.Reset(&e.Bus)
+	// Warm up: let the audio buffer settle to its steady-state capacity.
+	for i := 0; i < 5; i++ {
+		e.stepFrame()
+		e.AudioBuf = e.AudioBuf[:0]
+	}
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < 10; i++ {
+		e.stepFrame()
+		e.AudioBuf = e.AudioBuf[:0]
+	}
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	// Allow a tiny tolerance for GC bookkeeping, but HeapAlloc should not
+	// grow meaningfully across 10 frames in steady state.
+	growth := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	if growth > 1024 {
+		t.Fatalf("HeapAlloc grew by %d bytes across 10 step_frame calls "+
+			"(before=%d after=%d) — heap allocations during step_frame",
+			growth, before.HeapAlloc, after.HeapAlloc)
+	}
+	t.Logf("HeapAlloc growth across 10 frames: %d bytes (before=%d after=%d)",
+		growth, before.HeapAlloc, after.HeapAlloc)
 }
 
 // keep unsafe import used
