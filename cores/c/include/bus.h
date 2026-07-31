@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "ppu.h"
+#include "apu.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,10 @@ typedef struct Bus {
     /* The Picture Processing Unit. Owned by the bus (M4.2). PPU register
      * accesses ($2000-$3FFF) and OAM-DMA ($4014) route here. (bus.rs `ppu`.) */
     Ppu ppu;
+
+    /* The Audio Processing Unit. Owned by the bus (M4.3). APU register
+     * accesses ($4000-$4017) route here. (bus.rs `apu`.) */
+    Apu apu;
 
     /* Open-bus latch for the APU/IO register window ($4000-$4017). Indexed by
      * (addr - 0x4000). Reads of write-only registers return the last written
@@ -138,6 +143,21 @@ uint8_t* bus_apu_open_bus_mut(Bus* bus);
  * of bus.rs `&mut self.ppu`.) */
 Ppu* bus_ppu(Bus* bus);
 const Ppu* bus_ppu_const(const Bus* bus);
+
+/* ---- APU direct access (M4.3) ---------------------------------------- */
+
+/* Borrow the bus's owned APU. (The Bus owns the Apu; this is the C equivalent
+ * of bus.rs `&mut self.apu`.) */
+Apu* bus_apu(Bus* bus);
+const Apu* bus_apu_const(const Bus* bus);
+
+/* Advance APU by `cpu_cycles` (DMC DMA reads from RAM/cartridge).
+ * (bus.rs `step_apu`.) */
+void bus_step_apu(Bus* bus, uint32_t cpu_cycles);
+
+/* Whether the APU has a pending IRQ (frame counter or DMC).
+ * (bus.rs `apu_irq_pending`.) */
+bool bus_apu_irq_pending(const Bus* bus);
 
 #ifdef __cplusplus
 }

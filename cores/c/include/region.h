@@ -55,6 +55,46 @@ uint16_t region_scanline_prerender(Region r);
  * (src/region.rs `Region::is_pal_palette`.) */
 bool region_is_pal_palette(Region r);
 
+/* ---- M4.3: APU frame-counter region accessors (src/region.rs 87-208) - */
+
+/* CPU clock rate in Hz. NTSC/Dendy = 1789773.0, PAL = 1662607.0.
+ * (src/region.rs `Region::cpu_clock_hz`.) */
+float region_cpu_clock_hz(Region r);
+
+/* CPU cycles per audio sample at 44.1 kHz = cpu_clock_hz / 44100.
+ * (src/region.rs `Region::cpu_cycles_per_sample`.) */
+float region_cpu_cycles_per_sample(Region r);
+
+/* A frame-counter threshold: cycle position + quarter/half flags.
+ * (src/region.rs `(u32, bool, bool)` tuple.) */
+typedef struct ApuFrameThreshold {
+    uint32_t threshold;
+    bool quarter;
+    bool half;
+} ApuFrameThreshold;
+
+/* APU frame-counter 4-step mode thresholds in CPU cycles.
+ * NTSC/Dendy: 7457, 14913, 22371, 29828 (IRQ at 29828).
+ * PAL:        8314, 16627, 24941, 33255 (IRQ at 33255).
+ * (src/region.rs `Region::apu_4step_thresholds`.) */
+void region_apu_4step_thresholds(Region r, ApuFrameThreshold out[4]);
+
+/* APU frame-counter 5-step mode thresholds in CPU cycles.
+ * NTSC/Dendy: 7457, 14913, 22371, 37281.
+ * PAL:        8314, 16627, 24941, 41568.
+ * (src/region.rs `Region::apu_5step_thresholds`.) */
+void region_apu_5step_thresholds(Region r, ApuFrameThreshold out[4]);
+
+/* APU frame-counter reset point in CPU cycles (end of period).
+ * NTSC/Dendy: 5step=37282, 4step=29830. PAL: 5step=41570, 4step=33257.
+ * (src/region.rs `Region::apu_reset_at`.) */
+uint32_t region_apu_reset_at(Region r, bool mode_5step);
+
+/* APU 4-step mode IRQ threshold (the 4th step where IRQ is raised when not
+ * inhibited). NTSC/Dendy = 29828, PAL = 33255.
+ * (src/region.rs `Region::apu_4step_irq_threshold`.) */
+uint32_t region_apu_4step_irq_threshold(Region r);
+
 #ifdef __cplusplus
 }
 #endif

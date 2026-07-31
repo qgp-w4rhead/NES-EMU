@@ -28,6 +28,7 @@
 #include "bus.h"
 #include "cartridge.h"
 #include "ppu.h"
+#include "apu.h"
 #include <string.h>
 
 /* ---- Construction ----------------------------------------------------- */
@@ -35,6 +36,7 @@
 void bus_init(Bus* bus) {
     memset(bus->ram, 0, BUS_RAM_SIZE);
     ppu_init(&bus->ppu);
+    apu_init(&bus->apu);
     memset(bus->apu_open_bus, 0, BUS_APU_IO_REG_COUNT);
     bus->cartridge = NULL;
     bus->dma_stall_cycles = 0u;
@@ -147,14 +149,46 @@ static void ppu_write(Bus* bus, uint16_t reg, uint8_t value) {
     ppu_write_register(&bus->ppu, reg, value);
 }
 
-/* apu_read: APU/IO register open-bus read. offset = addr - 0x4000 in 0..=0x17. */
-static uint8_t apu_read(const Bus* bus, uint16_t offset) {
+/* apu_read_open_bus: APU/IO register open-bus read. offset = addr - 0x4000
+ * in 0..=0x17. (bus.rs `apu_read`.) */
+static uint8_t apu_read_open_bus(const Bus* bus, uint16_t offset) {
     return bus->apu_open_bus[offset];
 }
 
-/* apu_write: APU/IO register open-bus latch write. */
-static void apu_write(Bus* bus, uint16_t offset, uint8_t value) {
-    bus->apu_open_bus[offset] = value;
+/* apu_pulse_write: route a pulse register write. offset = addr - 0x4000 in
+ * 0..=7: offsets 0-3 -> pulse 1, offsets 4-7 -> pulse 2.
+ * (bus.rs `apu_pulse_write`.) */
+static void apu_pulse_write(Bus* bus, uint16_t offset, uint8_t value) {
+    if (offset < 4u) {
+        pulse_write_register(&bus->apu.pulse1, (uint8_t)offset, value);
+    } else {
+        pulse_write_register(&bus->apu.pulse2, (uint8_t)(offset - 4u), value);
+    }
+}
+
+/* apu_triangle_write: route a triangle register write. offset = addr - 0x4000
+ * in 8..=0xB: reg = offset - 8. (bus.rs `apu_triangle_write`.) */
+static void apu_triangle_write(Bus* bus, uint16_t offset, uint8_t value) {
+    triangle_write_register(&bus->apu.triangle, (uint8_t)(offset - 0x08u), value);
+}
+
+/* apu_noise_write: route a noise register write. offset = addr - 0x4000 in
+ * 0xC..=0xF: reg = offset - 0xC. (bus.rs `apu_noise_write`.) */
+static void apu_noise_write(Bus* bus, uint16_t offset, uint8_t value) {
+    noise_write_register(&bus->apu.noise, (uint8_t)(offset - 0x0Cu), value);
+}
+
+/* apu_dmc_write: route a DMC register write. offset = addr - 0x4000 in
+ * 0x10..=0x13: reg = offset - 0x10. (bus.rs `apu_dmc_write`.) */
+static void apu_dmc_write(Bus* bus, uint16_t offset, uint8_t value) {
+    dmc_write_register(&bus->apu.dmc, (uint8_t)(offset - 0x10u), value);
+}
+
+/* apu_status_read: read $4015 APU status (channel bits + IRQ flags; clears
+ * IRQs). Bit 5 is open bus. (bus.rs `apu_status_read`.) */
+static uint8_t apu_status_read(Bus* bus) {
+    uint8_t status = apu_read_status(&bus->apu);
+    return (uint8_t)((status & 0xDFu) | (bus->apu_open_bus[0x15u] & 0x20u));
 }
 
 /* oam_dma: copy 256 bytes from CPU page (page<<8) into the PPU's OAM via
@@ -211,40 +245,38 @@ uint8_t bus_read(Bus* bus, uint16_t addr) {
         return ppu_read(bus, addr & BUS_PPU_REG_MASK);
     }
     if (addr <= 0x4007u) {
-        /* $4000-$4007: pulse channel regs (open-bus latch in M4.1). */
-        return apu_read(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
+        /* $4000-$4007: pulse channel regs (write-only; reads return open bus). */
+        return apu_read_open_bus(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
     }
     if (addr <= 0x400Bu) {
-        /* $4008-$400B: triangle channel regs (open-bus latch in M4.1). */
-        return apu_read(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
+        /* $4008-$400B: triangle channel regs (write-only; reads return open bus). */
+        return apu_read_open_bus(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
     }
     if (addr <= 0x400Fu) {
-        /* $400C-$400F: noise channel regs (open-bus latch in M4.1). */
-        return apu_read(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
+        /* $400C-$400F: noise channel regs (write-only; reads return open bus). */
+        return apu_read_open_bus(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
     }
     if (addr <= 0x4013u) {
-        /* $4010-$4013: DMC channel regs (open-bus latch in M4.1). */
-        return apu_read(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
+        /* $4010-$4013: DMC channel regs (write-only; reads return open bus). */
+        return apu_read_open_bus(bus, (uint16_t)(addr - BUS_APU_IO_BASE));
     }
     if (addr == 0x4014u) {
-        /* $4014: OAMDMA — write-only; reads return open bus. */
-        return apu_read(bus, 0x14u);
+        /* $4014: OAMDMA - write-only; reads return open bus. */
+        return apu_read_open_bus(bus, 0x14u);
     }
     if (addr == 0x4015u) {
-        /* $4015: APU status. In M4.1 (no APU device) return the open-bus
-         * latch (matching the write-then-read round trip). M4.3 will compute
-         * the real status bits here. */
-        return apu_read(bus, 0x15u);
+        /* $4015: APU status - channel bits + IRQ flags; bit 5 is open bus.
+         * Reading clears both IRQ flags. (bus.rs `apu_status_read`.) */
+        return apu_status_read(bus);
     }
     if (addr == 0x4016u) {
-        /* $4016: controller 1 + open-bus bits 1-7. M4.1: no joypad device;
-         * return the open-bus latch (bit 0 = 0 = no button). */
-        return apu_read(bus, 0x16u);
+        /* $4016: controller 1 + open-bus bits 1-7. M4.5: joypad device; until
+         * then return the open-bus latch (bit 0 = 0 = no button). */
+        return apu_read_open_bus(bus, 0x16u);
     }
     if (addr == 0x4017u) {
-        /* $4017: controller 2 + open-bus bits 1-7. M4.1: no joypad device;
-         * return the open-bus latch. */
-        return apu_read(bus, 0x17u);
+        /* $4017: controller 2 + open-bus bits 1-7. M4.5: joypad device. */
+        return apu_read_open_bus(bus, 0x17u);
     }
     if (addr <= 0x401Fu) {
         /* $4018-$401F: APU/IO test mode — disabled, reads as open bus (0). */
@@ -266,25 +298,32 @@ void bus_write(Bus* bus, uint16_t addr, uint8_t value) {
         return;
     }
     if (addr <= 0x4007u) {
+        /* $4000-$4007: pulse channel regs. Routed to APU pulse channels;
+         * also latched on the open bus. (bus.rs lines 340-344.) */
         uint16_t offset = (uint16_t)(addr - BUS_APU_IO_BASE);
-        /* M4.1: no APU pulse device; latch open bus only. M4.3 will call
-         * apu_pulse_write(offset, value) here. */
-        apu_write(bus, offset, value);
+        apu_pulse_write(bus, offset, value);
+        bus->apu_open_bus[offset] = value;
         return;
     }
     if (addr <= 0x400Bu) {
+        /* $4008-$400B: triangle channel regs. (bus.rs lines 347-351.) */
         uint16_t offset = (uint16_t)(addr - BUS_APU_IO_BASE);
-        apu_write(bus, offset, value);
+        apu_triangle_write(bus, offset, value);
+        bus->apu_open_bus[offset] = value;
         return;
     }
     if (addr <= 0x400Fu) {
+        /* $400C-$400F: noise channel regs. (bus.rs lines 354-358.) */
         uint16_t offset = (uint16_t)(addr - BUS_APU_IO_BASE);
-        apu_write(bus, offset, value);
+        apu_noise_write(bus, offset, value);
+        bus->apu_open_bus[offset] = value;
         return;
     }
     if (addr <= 0x4013u) {
+        /* $4010-$4013: DMC channel regs. (bus.rs lines 362-366.) */
         uint16_t offset = (uint16_t)(addr - BUS_APU_IO_BASE);
-        apu_write(bus, offset, value);
+        apu_dmc_write(bus, offset, value);
+        bus->apu_open_bus[offset] = value;
         return;
     }
     if (addr == 0x4014u) {
@@ -293,18 +332,23 @@ void bus_write(Bus* bus, uint16_t addr, uint8_t value) {
         return;
     }
     if (addr == 0x4015u) {
-        /* $4015: APU status. M4.1: latch open bus only (no APU device). */
-        apu_write(bus, 0x15u, value);
+        /* $4015: APU status — enables/disables all 5 channels (bits 0-4).
+         * Also latched on the open bus for bit 5 preservation. */
+        bus->apu_open_bus[0x15u] = value;
+        apu_write_status(&bus->apu, value);
         return;
     }
     if (addr == 0x4016u) {
-        /* $4016: controller strobe (bit 0). M4.1: latch open bus only. */
-        apu_write(bus, 0x16u, value);
+        /* $4016: controller strobe (bit 0). M4.5: joypad device; until then
+         * latch open bus only. */
+        bus->apu_open_bus[0x16u] = value;
         return;
     }
     if (addr == 0x4017u) {
-        /* $4017: APU frame counter control. M4.1: latch open bus only. */
-        apu_write(bus, 0x17u, value);
+        /* $4017: APU frame counter control. Routed to the APU frame counter;
+         * also latched on the open bus. (bus.rs lines 388-391.) */
+        bus->apu_open_bus[0x17u] = value;
+        apu_write_frame_counter(&bus->apu, value);
         return;
     }
     if (addr <= 0x401Fu) {
@@ -389,5 +433,38 @@ Ppu* bus_ppu(Bus* bus) {
 
 const Ppu* bus_ppu_const(const Bus* bus) {
     return &bus->ppu;
+}
+
+/* ---- APU direct access (M4.3) ---------------------------------------- */
+
+/* dmc_read_cb: DMC DMA read callback. Reads from CPU RAM ($0000-$1FFF,
+ * mirrored) or cartridge PRG space ($8000-$FFFF); other ranges return 0.
+ * (bus.rs `step_apu` closure, lines 172-184.) */
+static uint8_t dmc_read_cb(uint16_t addr, void* ctx) {
+    Bus* bus = (Bus*)ctx;
+    if (addr <= 0x1FFFu) {
+        return bus->ram[addr & BUS_RAM_MASK];
+    }
+    if (addr >= 0x8000u) {
+        return bus->cartridge ? cartridge_read_prg(bus->cartridge, addr) : 0x00u;
+    }
+    return 0x00u;
+}
+
+Apu* bus_apu(Bus* bus) {
+    return &bus->apu;
+}
+
+const Apu* bus_apu_const(const Bus* bus) {
+    return &bus->apu;
+}
+
+void bus_step_apu(Bus* bus, uint32_t cpu_cycles) {
+    /* DMC DMA reads from RAM/cartridge via dmc_read_cb. (bus.rs `step_apu`.) */
+    apu_step(&bus->apu, cpu_cycles, dmc_read_cb, bus);
+}
+
+bool bus_apu_irq_pending(const Bus* bus) {
+    return apu_irq_pending(&bus->apu);
 }
 

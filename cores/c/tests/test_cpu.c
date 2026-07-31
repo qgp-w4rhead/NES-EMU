@@ -95,9 +95,12 @@ static void test_bus_routing(void) {
     bus_write(&bus, 0x2000, 0x5A);
     CHECK_EQ_U8(bus_read(&bus, 0x2000), 0x5A, "PPU reg $2000 open-bus round-trip");
 
-    /* Write to $4015 (APU status) — must not crash. */
+    /* Write to $4015 (APU status) — must not crash. M4.3 routes $4015 to the
+     * real APU: writing 0x0F enables pulse1/2/triangle/noise but loads no
+     * length counters, so reading $4015 returns 0x00 (no channel active, no
+     * IRQ, bit 5 open bus = 0x0F & 0x20 = 0). */
     bus_write(&bus, 0x4015, 0x0F);
-    CHECK_EQ_U8(bus_read(&bus, 0x4015), 0x0F, "APU status $4015 open-bus round-trip");
+    CHECK_EQ_U8(bus_read(&bus, 0x4015), 0x00, "APU status $4015 read reflects real APU (M4.3)");
 
     /* Cartridge space: load NOP ROM, read $8000 -> 0xEA, $C000 -> 0xEA
      * (NROM-128 mirror), $FFFC -> 0x00, $FFFD -> 0xC0 (RESET vector). */
