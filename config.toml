@@ -2,6 +2,7 @@ audio_volume = 1.0
 window_scale = 3
 region = "auto"
 recent_roms = [
+    '.\tests\real_roms\Mega-Man.NES',
     '.\tests\real_roms\MarioBros.NES',
     'C:\Users\W4RHEAD\Documents\PROJECTS\TOKENCRAPPING\NES-EMU\tests\real_roms\Zelda.NES',
     'C:\Users\W4RHEAD\Documents\Downloads\MarioBros.NES',
@@ -45,6 +46,6 @@ dmc = 1.0
 
 [debug]
 slant_corruption = false
-ring_buffer_trace = true
+ring_buffer_trace = false
 use_inaccurate_palette = false
 nmi_retrigger = false

@@ -12,6 +12,7 @@ secrets.local.example
 
 # Polyglot core build artifacts (M4+)
 /cores/rust/target/
+/cores/rust/Cargo.lock
 /cores/c/*.lib
 /cores/c/*.exe
 /cores/c/*.dll
@@ -28,10 +29,19 @@ secrets.local.example
 /cores/zig/*.exe
 /cores/zig/*.lib
 /cores/zig/*.o
+/cores/zig/.zig-cache/
+/cores/zig/zig-out/
 /cores/go/*.exe
 /cores/go/*.lib
+/cores/go/*.dll
+/cores/go/*.h
 /cores/csharp/*.dll
 /cores/csharp/*.obj
+/cores/csharp/bin/
+/cores/csharp/obj/
+/cores/csharp/tests/bin/
+/cores/csharp/tests/obj/
+/cores/csharp/harness_out.txt
 /cores/java/classes/
 /cores/java/test-classes/
 /cores/java/*.dll
@@ -42,6 +52,11 @@ secrets.local.example
 /cores/java/nes_core_java_dynamic.h
 /cores/java/graal_isolate.h
 /cores/java/graal_isolate_dynamic.h
+# TypeScript compiled output
+/cores/typescript/dist/
+/cores/typescript/test/run_tests.js
+/cores/typescript/node_modules/
+
 # Python/Cython build artifacts (M11)
 /cores/python/build/
 /cores/python/nes_core/__pycache__/
@@ -51,6 +66,10 @@ secrets.local.example
 /bench/*.exe
 /bench/*.obj
 /bench/*.o
+
+# Root-level build artifacts
+/*.obj
+/UTF8
 
 # Emulator runtime artifacts
 *.nessav
