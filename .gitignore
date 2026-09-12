@@ -82,6 +82,9 @@ secrets.local.example
 # Emulator Test Rom
 /tests/real_roms/
 
+# GitHub CI (using Woodpecker instead)
+/.github/workflows/
+
 # Added by nes-emulator-engineer co-agent runner
 .devin/config.local.json
 .agent/_cycles/
