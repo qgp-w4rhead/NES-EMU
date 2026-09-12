@@ -54,7 +54,6 @@ secrets.local.example
 /cores/java/graal_isolate_dynamic.h
 # TypeScript compiled output
 /cores/typescript/dist/
-/cores/typescript/test/run_tests.js
 /cores/typescript/node_modules/
 
 # Python/Cython build artifacts (M11)

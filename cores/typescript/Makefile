@@ -4,10 +4,14 @@
 TSFLAGS =
 SRC = src
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all:
 	tsc $(TSFLAGS)
+
+test:
+	tsc -p tsconfig.test.json
+	node dist/test/run_tests.js
 
 clean:
 	@node -e "require('fs').rmSync('dist',{recursive:true,force:true})"
